@@ -1,0 +1,94 @@
+{
+  "name": "local-addon-kinsta",
+  "productName": "Kinsta Sync",
+  "version": "1.1.12",
+  "description": "Sync WordPress sites between Local and Kinsta hosting",
+  "author": "Lucas",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/landerss0n/local-addon-kinsta.git"
+  },
+  "bugs": {
+    "url": "https://github.com/landerss0n/local-addon-kinsta/issues"
+  },
+  "homepage": "https://github.com/landerss0n/local-addon-kinsta#readme",
+  "keywords": [
+    "local-addon"
+  ],
+  "slug": "local-addon-kinsta",
+  "bgColor": "#181516",
+  "icon": "icon.svg",
+  "engines": {
+    "local-by-flywheel": "^5.0.0"
+  },
+  "main": "lib/main/index.js",
+  "renderer": "lib/renderer/index.js",
+  "files": [
+    "lib",
+    "icon.svg",
+    "README.md"
+  ],
+  "bundledDependencies": [
+    "axios"
+  ],
+  "scripts": {
+    "build": "npm run build:main && npm run build:renderer",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.renderer.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "build:main": "tsc",
+    "build:renderer": "webpack --config webpack.config.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "watch": "npm run watch:main & npm run watch:renderer",
+    "watch:main": "tsc --watch",
+    "watch:renderer": "webpack --watch --config webpack.config.js",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,mjs,cjs}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@getflywheel/local": "^9.2.9",
+    "@getflywheel/local-components": "^17.8.1",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@types/react-router-dom": "^5.3.3",
+    "css-loader": "^6.8.0",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^17.6.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.7",
+    "lodash": "^4.18.1",
+    "prettier": "^3.8.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^5.3.4",
+    "style-loader": "^3.3.0",
+    "ts-loader": "^9.5.0",
+    "typescript": "^5.3.0",
+    "typescript-eslint": "^8.60.1",
+    "vitest": "^4.1.8",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.0"
+  },
+  "localAddonSettings": {
+    "siteMenu": true
+  }
+}
