@@ -979,13 +979,19 @@ describe('control dir cleanup', () => {
     const stale = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
     const fresh = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
     const other = fs.mkdtempSync(path.join(tmp, 'not-ours-'));
+    const foreign = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    fs.writeFileSync(path.join(foreign, 'someone-elses.txt'), 'x');
+    fs.writeFileSync(path.join(stale, 'askpass.sh'), '#!/bin/sh');
     const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
     fs.utimesSync(stale, old, old);
     fs.utimesSync(other, old, old);
+    fs.utimesSync(foreign, old, old);
     sweepStaleControlDirs();
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(fresh)).toBe(true);
     expect(fs.existsSync(other)).toBe(true);
+    expect(fs.existsSync(foreign)).toBe(true); // same prefix, not our content
+    fs.rmSync(foreign, { recursive: true });
     fs.rmSync(fresh, { recursive: true });
     fs.rmSync(other, { recursive: true });
   });
