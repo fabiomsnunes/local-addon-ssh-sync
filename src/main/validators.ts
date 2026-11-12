@@ -21,8 +21,9 @@ export function isValidPort(port: string): boolean {
 }
 
 export function isValidUsername(user: string): boolean {
-  // SSH usernames: alphanumeric, underscores, hyphens
-  return /^[a-zA-Z0-9_-]+$/.test(user);
+  // SSH usernames: alphanumeric, underscores, hyphens, dots; never a leading
+  // `-`, which ssh would read as an option
+  return /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/.test(user);
 }
 
 export function isValidDomain(domain: string): boolean {

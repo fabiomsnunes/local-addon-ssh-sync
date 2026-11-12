@@ -112,7 +112,10 @@ export function prunePushBackups(
 ): void {
   const prefix = `${localSiteId}-${environmentId}-`;
   const backups = (dfs.readdirSync(backupsDir) as string[])
-    .filter((f) => f.startsWith(prefix) && f.endsWith('.sql'))
+    // The timestamp right after the prefix keeps environment `a` from matching
+    // the backups of environment `a-b`.
+    .filter((f) => f.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}T/.test(f.slice(prefix.length)))
+    .filter((f) => f.endsWith('.sql'))
     .sort()
     .reverse();
   for (const old of backups.slice(PUSH_BACKUPS_TO_KEEP)) {
