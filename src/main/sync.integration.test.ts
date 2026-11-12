@@ -46,7 +46,11 @@ function describeStep(cmd: string, args: string[], opts: RunOptions): string {
     if (/DROP TABLE/i.test(sql)) return 'mysql-drop-tables';
     return 'mysql-import';
   }
-  if (base === 'php') return args.includes('search-replace') ? 'local-search-replace' : 'php';
+  if (base === 'php') {
+    if (args.includes('search-replace')) return 'local-search-replace';
+    if (String(args[0]).endsWith('ssh-sync-neutralize.php')) return 'local-neutralize';
+    return 'php';
+  }
   if (base === 'scp') return 'scp';
   if (base === 'ssh') {
     const remote = args[args.length - 1] || '';
@@ -85,6 +89,8 @@ interface FakeRunnerConfig {
   // SQL materialized at the local destination of an scp *download* (the remote
   // dump on pull) — lets a test assert transforms applied before the import.
   pullDumpSql?: string | Buffer;
+  // JSON the neutralize script prints (safe clone)
+  neutralizeOutput?: string;
 }
 
 interface RecordedCall {
@@ -154,6 +160,9 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     if (step === 'remote-config-prefix' && opts.onStdout) {
       opts.onStdout(`${cfg.remotePrefix ?? ''}\n`);
     }
+    if (step === 'local-neutralize' && opts.onStdout) {
+      opts.onStdout(cfg.neutralizeOutput ?? '{"deactivated":[],"stripe":false}\n');
+    }
     // Local table list after import (pull reconciliation).
     if (step === 'mysql-show-tables' && opts.onStdout) {
       opts.onStdout(`${(cfg.localTables ?? []).join('\n')}\n`);
@@ -195,7 +204,7 @@ beforeEach(() => {
   fs.mkdirSync(publicPath, { recursive: true });
   fs.writeFileSync(
     path.join(publicPath, 'wp-config.php'),
-    "<?php\ndefine('DB_HOST', 'localhost');\n",
+    "<?php\ndefine('DB_HOST', 'localhost');\n$table_prefix = 'wp_';\n",
   );
 });
 
@@ -325,7 +334,11 @@ describe('executePull', () => {
     const { deps, calls, progress, notify, recordSync } = makeDeps();
     const result = await executePull(pullParams(), deps);
 
-    expect(result).toEqual({ success: true, warning: null });
+    expect(result).toEqual({
+      success: true,
+      warning: null,
+      note: expect.stringContaining('Made the copy safe'),
+    });
 
     const labels = steps(calls);
     expect(labels).toContain('rsync');
@@ -353,6 +366,69 @@ describe('executePull', () => {
     expect(wpConfig).toContain("define('DB_HOST', 'localhost')");
     expect(wpConfig).not.toContain(socketPath);
     expect(deps.activeSyncs.size).toBe(0); // unregistered in finally
+  });
+
+  it('makes the copy safe after the import: plugins, Stripe, mu-plugin, environment type', async () => {
+    const runner = makeFakeRunner({
+      neutralizeOutput:
+        '{"deactivated":["updraftplus/updraftplus.php","fluent-smtp/fluent-smtp.php"],"stripe":true}\n',
+    });
+    const { deps } = makeDeps({ runner });
+    const result = await executePull(pullParams(), deps);
+
+    expect(result.success).toBe(true);
+    expect(result.note).toBe(
+      'Made the copy safe: deactivated updraftplus, fluent-smtp; put Stripe in test mode; blocked outgoing requests and email.',
+    );
+    const labels = steps(runner.calls);
+    expect(labels.indexOf('local-neutralize')).toBeGreaterThan(labels.indexOf('mysql-import'));
+    const neutralize = runner.calls.find((c) => c.step === 'local-neutralize')!;
+    expect(neutralize.args.slice(1, 6)).toEqual([socketPath, 'root', 'root', 'local', 'wp_']);
+    expect(JSON.parse(neutralize.args[6])).toContain('updraftplus');
+    // The script is a temp file, removed afterwards
+    expect(fs.existsSync(neutralize.args[0])).toBe(false);
+
+    const publicPath = path.join(sitePath, 'app', 'public');
+    const muPlugin = path.join(publicPath, 'wp-content', 'mu-plugins', 'ssh-sync-local-safety.php');
+    expect(fs.readFileSync(muPlugin, 'utf8')).toContain("add_filter( 'pre_wp_mail'");
+    expect(fs.readFileSync(path.join(publicPath, 'wp-config.php'), 'utf8')).toContain(
+      "define( 'WP_ENVIRONMENT_TYPE', 'local' );",
+    );
+  });
+
+  it('neutralizes with the adopted remote prefix', async () => {
+    const runner = makeFakeRunner({
+      remotePrefix: 'wp0x_',
+      localTables: ['wp0x_options', 'wp_options'],
+    });
+    const { deps } = makeDeps({ runner });
+    await executePull(pullParams(), deps);
+    const neutralize = runner.calls.find((c) => c.step === 'local-neutralize')!;
+    expect(neutralize.args[5]).toBe('wp0x_');
+  });
+
+  it('rolls the database back when the copy cannot be made safe', async () => {
+    const runner = makeFakeRunner({ failAt: 'local-neutralize' });
+    const { deps } = makeDeps({ runner });
+    const result = await executePull(pullParams(), deps);
+    expect(result.success).toBe(false);
+    expect(steps(runner.calls)).toContain('mysql-restore');
+  });
+
+  it('a files-only pull still installs the mu-plugin, without touching the database', async () => {
+    const runner = makeFakeRunner();
+    const { deps } = makeDeps({ runner });
+    const result = await executePull(pullParams({ includeDatabase: false }), deps);
+    expect(result.note).toBe('Made the copy safe: blocked outgoing requests and email.');
+    expect(steps(runner.calls)).not.toContain('local-neutralize');
+  });
+
+  it('skips the safety step when makeSafe is false', async () => {
+    const runner = makeFakeRunner();
+    const { deps } = makeDeps({ runner });
+    const result = await executePull(pullParams({ includeDatabase: true, makeSafe: false }), deps);
+    expect(result.note).toBeNull();
+    expect(steps(runner.calls)).not.toContain('local-neutralize');
   });
 
   it('removes the remote dump and closes the connection, even when the download fails', async () => {

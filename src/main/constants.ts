@@ -53,6 +53,8 @@ export const EXCLUDE_PATTERNS = [
   'wp-content/advanced-cache.php',
   // Local-generated helper file in the webroot — never part of the WP site
   'local-xdebuginfo.php',
+  // Our own safety mu-plugin for pulled copies (safeClone.ts): never pushed
+  'wp-content/mu-plugins/ssh-sync-local-safety.php',
 ];
 
 export const HISTORY_LIMIT = 10;

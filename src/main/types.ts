@@ -65,6 +65,9 @@ export interface SyncOptions {
   // the remote domain typed back by the user.
   migrationMode?: boolean;
   confirmDomain?: string;
+  // Pull only, on unless false: neutralize the copy before WordPress loads
+  // (see safeClone.ts)
+  makeSafe?: boolean;
 }
 
 // The subset of Local.SiteJSON we actually use (full object arrives over IPC)
@@ -151,6 +154,8 @@ export interface SyncResult {
   cancelled?: boolean;
   error?: string;
   warning?: string | null;
+  // What the sync did besides the transfer, for the user (e.g. the safe-clone summary)
+  note?: string | null;
 }
 
 // Every environment-touching dependency executePull/executePush rely on. The

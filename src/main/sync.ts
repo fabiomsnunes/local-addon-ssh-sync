@@ -44,6 +44,15 @@ import {
   REMOTE_MKTEMP,
 } from './ssh';
 import { prunePushBackups } from './config';
+import {
+  SAFETY_MU_PLUGIN_PATH,
+  SAFETY_MU_PLUGIN_SOURCE,
+  NEUTRALIZE_SCRIPT,
+  UNSAFE_PLUGIN_FOLDERS,
+  parseNeutralizeOutput,
+  ensureLocalEnvironmentType,
+  describeSafeClone,
+} from './safeClone';
 
 // ---------------------------------------------------------------------------
 // Pull / push orchestration (extracted from the IPC handlers so it can be
@@ -145,6 +154,64 @@ async function importDatabaseOnServer(
   } finally {
     await removeRemoteFile(run, connection, remoteFile);
   }
+}
+
+// Neutralize a pulled copy before WordPress loads (see safeClone.ts): the
+// safety mu-plugin and WP_ENVIRONMENT_TYPE=local always, and when the database
+// was pulled, the unsafe plugins deactivated and Stripe put in test mode.
+async function makeCloneSafe(
+  deps: PullPushDeps,
+  sync: ActiveSync,
+  publicPath: string,
+  database: {
+    phpBin: string;
+    socketPath: string;
+    db: { user: string; password: string; database: string };
+  } | null,
+): Promise<string> {
+  const dfs = deps.fs;
+  const muPluginFile = path.join(publicPath, ...SAFETY_MU_PLUGIN_PATH.split('/'));
+  dfs.mkdirSync(path.dirname(muPluginFile), { recursive: true });
+  dfs.writeFileSync(muPluginFile, SAFETY_MU_PLUGIN_SOURCE);
+
+  const wpConfigPath = path.join(publicPath, 'wp-config.php');
+  const wpConfig = dfs.readFileSync(wpConfigPath, 'utf8');
+  dfs.writeFileSync(wpConfigPath, ensureLocalEnvironmentType(wpConfig));
+
+  if (!database) return describeSafeClone({ deactivated: [], stripe: false });
+
+  // The prefix the site reads now, after any prefix adoption
+  const prefix = normalizeTablePrefix(
+    parseTablePrefix(dfs.readFileSync(wpConfigPath, 'utf8')) || '',
+  );
+  if (!prefix) throw new Error('Could not read the table prefix to make the local copy safe.');
+
+  const scriptPath = path.join(deps.tempDir, 'ssh-sync-neutralize.php');
+  dfs.writeFileSync(scriptPath, NEUTRALIZE_SCRIPT);
+  let output = '';
+  try {
+    await deps.runCommand(
+      sync,
+      database.phpBin,
+      [
+        scriptPath,
+        database.socketPath,
+        database.db.user,
+        database.db.password,
+        database.db.database,
+        prefix,
+        JSON.stringify(UNSAFE_PLUGIN_FOLDERS),
+      ],
+      { onStdout: (chunk) => (output += chunk) },
+    );
+  } finally {
+    try {
+      dfs.unlinkSync(scriptPath);
+    } catch {}
+  }
+  const result = parseNeutralizeOutput(output);
+  if (!result) throw new Error('Could not make the local copy safe: unexpected output.');
+  return describeSafeClone(result);
 }
 
 // Sage/Acorn (and other Laravel-based) themes COMPILE their Blade views and
@@ -565,6 +632,23 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       }
     }
 
+    // 3. Make the copy safe before anything can load it. A failure here rolls
+    //    the database back (catch below): an unsafe copy is worse than none.
+    let safeCloneNote: string | null = null;
+    if (options.makeSafe !== false) {
+      sendProgress({ stage: 'safety', progress: 98, message: 'Making the local copy safe...' });
+      const phpBin = deps.findServiceBinary(['php-'], 'php');
+      if (options.includeDatabase && !phpBin) {
+        throw new Error("Could not find PHP binary in Local's lightning-services");
+      }
+      safeCloneNote = await makeCloneSafe(
+        deps,
+        sync,
+        publicPath,
+        options.includeDatabase ? { phpBin: phpBin!, socketPath, db } : null,
+      );
+    }
+
     // Clear compiled Sage/Acorn caches that bake absolute server paths (see
     // clearCompiledFrameworkCaches). Runs for every pull — the compiled views
     // are files, synced regardless of the database option — and is best-effort:
@@ -584,13 +668,14 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       progress: 100,
       message: fileWarning ? `Pull complete — ${fileWarning}` : 'Pull complete!',
     });
+    if (safeCloneNote) console.log(`[SSH Sync] ${safeCloneNote}`);
     deps.notify(
       PRODUCT_NAME,
       fileWarning
         ? `Pull complete for ${site.name || site.domain} — some files were skipped (legacy filenames)`
         : `Pull complete for ${site.name || site.domain}`,
     );
-    return { success: true, warning: fileWarning };
+    return { success: true, warning: fileWarning, note: safeCloneNote };
   } catch (error: any) {
     // The local DB was (partially) overwritten — a half-imported or
     // half-search-replaced database is unusable, so roll back to the
