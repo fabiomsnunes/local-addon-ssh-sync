@@ -284,6 +284,23 @@ function defaultPullPushDeps(sendProgress: (progress: SyncProgress) => void): Pu
   };
 }
 
+// Every sync ends with a final progress event, whatever path it returned by
+// (a refusal before the work starts sends none of its own): listeners such as
+// the status badge clear their state on `done`, `error` or `cancelled`.
+export function endProgress<T extends { success: boolean; cancelled?: boolean; error?: string }>(
+  result: T,
+  sendProgress: (progress: SyncProgress) => void,
+): T {
+  if (!result.success) {
+    sendProgress(
+      result.cancelled
+        ? { stage: 'cancelled', progress: 0, message: 'Sync cancelled' }
+        : { stage: 'error', progress: 0, message: result.error || 'Sync failed' },
+    );
+  }
+  return result;
+}
+
 // Environments arrive from the renderer: keep only known fields, give new ones
 // an id, and reject the whole save on the first invalid entry.
 export function normalizeEnvironments(
@@ -792,9 +809,12 @@ export default function (context: AddonMainContext): void {
         event.sender.send('sshsync:syncProgress', { ...progress, siteId: localSiteId, mode });
       };
       const execute = mode === 'pull' ? executePull : executePush;
-      return execute(
-        { localSiteId, site, environment, options: options || {} },
-        defaultPullPushDeps(sendProgress),
+      return endProgress(
+        await execute(
+          { localSiteId, site, environment, options: options || {} },
+          defaultPullPushDeps(sendProgress),
+        ),
+        sendProgress,
       );
     };
 
@@ -834,9 +854,12 @@ export default function (context: AddonMainContext): void {
           mode: 'push',
         });
       };
-      return executeUndoPush(
-        { localSiteId, site, environment, confirmDomain, acceptSiteUrl },
-        defaultPullPushDeps(sendProgress),
+      return endProgress(
+        await executeUndoPush(
+          { localSiteId, site, environment, confirmDomain, acceptSiteUrl },
+          defaultPullPushDeps(sendProgress),
+        ),
+        sendProgress,
       );
     },
   );

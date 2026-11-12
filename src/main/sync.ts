@@ -1096,6 +1096,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   let restoreWarning: string | null = null;
   let prefixReconciled = true;
   let pushManifest: PushManifest | null = null;
+  let previousMarker: string | null = null;
   let remotePrefixBefore: string | null = null;
   let cancelledLate = false;
   let remoteBackupPath: string | null = null;
@@ -1122,6 +1123,19 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         `Another push to ${environment.label} is running${lockResult.owner ? `: ${lockResult.owner}` : ''}. Try again when it finishes.`,
       );
     }
+    // The marker as it was before this push: an undo puts it back, so the
+    // push before this one becomes the newest again (and only that one)
+    let markerBefore = '';
+    await run(
+      sync,
+      'ssh',
+      sshArgs(
+        connection,
+        `cat ${shellQuote(lastPushMarker(connection.remoteHome, connection.remoteRoot))} 2>/dev/null; true`,
+      ),
+      { onStdout: (c) => (markerBefore += c) },
+    );
+    previousMarker = markerBefore.trim().split('\n')[0] || null;
     const heldLock = lock;
     lockHeartbeat = setInterval(() => {
       run(freshSync(), 'ssh', sshArgs(connection, refreshLockCommand(heldLock, lockToken))).catch(
@@ -1283,6 +1297,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
         hasFilesBackup: Boolean(localFilesBackup),
         hasDatabaseBackup: Boolean(options.includeDatabase),
+        previousMarker,
       };
       writePushManifest(deps, backupBase, pushManifest);
     }
@@ -1811,13 +1826,18 @@ export async function executeUndoPush(
         // non-fatal, as after a push
       }
     }
-    // Undone once: the backups stay until pruned, the manifest and the
-    // server's newest-push marker go
+    // Undone once: the backups stay until pruned, the manifest goes
     deps.fs.unlinkSync(`${latest.base}.json`);
+    // The push before this one is the newest again. With none recorded, an
+    // "undone" placeholder keeps any older push on any computer from being
+    // undone over what is on the server now.
     await deps.runCommand(
       freshSync(),
       'ssh',
-      sshArgs(connection, `rm -f -- ${shellQuote(marker)}`),
+      sshArgs(
+        connection,
+        `printf '%s\\n' ${shellQuote(manifest.previousMarker || `undone ${manifest.stamp}`)} > ${shellQuote(marker)}`,
+      ),
     );
     sendProgress({ stage: 'done', progress: 100, message: 'Push undone!' });
     const warning =

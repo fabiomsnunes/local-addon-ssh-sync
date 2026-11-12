@@ -1239,6 +1239,36 @@ describe('executePush', () => {
     expect(steps(undoRunner.calls)).toContain('remote-db-restore');
   });
 
+  it('undo puts back the marker of the push before, so only that one can be undone next', async () => {
+    const previous = '2026-11-01T10-00-00-000Z other-mac (site) since x';
+    const push = makeDeps({ runner: makeFakeRunner({ marker: `${previous}\n` }) });
+    await executePush(pushParams({ includeDatabase: false, deletions: ['old.php'] }), push.deps);
+    const manifest = latestPushManifest(backupsDir, SITE_ID, 'staging')!.manifest as any;
+    expect(manifest.previousMarker).toBe(previous);
+
+    const undoRunner = makeFakeRunner({ marker: `${manifest.stamp} me\n` });
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: undoRunner }).deps,
+    );
+    expect(result.success).toBe(true);
+    const write = undoRunner.calls.find((c) => c.step === 'remote-write-marker')!;
+    expect(write.args[write.args.length - 1]).toContain(`'${previous}'`);
+  });
+
+  it('undo of a first push leaves an "undone" marker that blocks older undos', async () => {
+    const push = makeDeps({ runner: makeFakeRunner() });
+    await executePush(pushParams({ includeDatabase: false, deletions: ['old.php'] }), push.deps);
+    const stamp = (latestPushManifest(backupsDir, SITE_ID, 'staging')!.manifest as any).stamp;
+    const undoRunner = makeFakeRunner();
+    await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: undoRunner }).deps,
+    );
+    const write = undoRunner.calls.find((c) => c.step === 'remote-write-marker')!;
+    expect(write.args[write.args.length - 1]).toContain(`'undone ${stamp}'`);
+  });
+
   it('undo of a production database push needs the typed domain', async () => {
     const { deps } = makeDeps({ runner: makeFakeRunner() });
     await executePush(

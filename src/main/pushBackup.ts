@@ -22,6 +22,8 @@ export interface PushManifest {
   deleted?: string[];
   hasFilesBackup: boolean;
   hasDatabaseBackup: boolean;
+  // The server's last-push marker before this push (undo writes it back)
+  previousMarker?: string | null;
   // The server's table prefix before a database push changed it (undo sets
   // it back; wp-config.php itself is never synced or backed up)
   remotePrefixBefore?: string;

@@ -57,6 +57,7 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
+  endProgress,
   siteUrlMismatch,
   parseAddedFromOutFormat,
   moveListedToBackupCommand,
@@ -1129,5 +1130,19 @@ describe("changedSinceCommand (run for real with this machine's sh)", () => {
       'SSHSYNC_CHANGED|edited.php',
     ]);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('endProgress', () => {
+  it('ends a failed or cancelled sync with a final event, leaves successes alone', () => {
+    const events: any[] = [];
+    const send = (p: any) => events.push(p);
+    endProgress({ success: true }, send);
+    endProgress({ success: false, error: 'Could not connect' }, send);
+    endProgress({ success: false, cancelled: true }, send);
+    expect(events).toEqual([
+      { stage: 'error', progress: 0, message: 'Could not connect' },
+      { stage: 'cancelled', progress: 0, message: 'Sync cancelled' },
+    ]);
   });
 });
