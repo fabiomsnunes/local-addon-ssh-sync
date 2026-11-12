@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
 import { spawn, spawnSync } from 'child_process';
+import * as net from 'net';
 
 import { REMOTE_TEMP_PREFIX } from './constants';
 import { ActiveSync, RemoteConnection, RunOptions, ServerEnvironment } from './types';
@@ -204,6 +205,25 @@ function masterIsReady(target: string, controlPath: string): boolean {
 // `ControlPersist` (common in `Host *`), which would otherwise fork the master
 // into the background, out of our reach, and leave it running after the sync.
 export function masterSshArgs(environment: ServerEnvironment, controlPath: string): string[] {
+  const authOptions =
+    environment.auth === 'password'
+      ? [
+          // The password arrives through SSH_ASKPASS (see askpassEnvironment);
+          // one attempt only, so a wrong password fails fast instead of
+          // counting towards the server's fail2ban limit.
+          '-o',
+          'PubkeyAuthentication=no',
+          '-o',
+          'PreferredAuthentications=password,keyboard-interactive',
+          '-o',
+          'NumberOfPasswordPrompts=1',
+        ]
+      : [
+          // Key auth never prompts: a missing key or unknown passphrase fails
+          // fast instead of hanging on a prompt nobody can see.
+          '-o',
+          'BatchMode=yes',
+        ];
   return [
     ...baseSshOptions(environment),
     '-o',
@@ -214,13 +234,50 @@ export function masterSshArgs(environment: ServerEnvironment, controlPath: strin
     'ControlPersist=no',
     '-o',
     'ConnectTimeout=15',
-    // Key auth never prompts: a missing key or unknown passphrase fails fast
-    // instead of hanging on a prompt nobody can see.
-    '-o',
-    'BatchMode=yes',
+    ...authOptions,
     '-N',
     sshTarget(environment),
   ];
+}
+
+// The SSH_ASKPASS helper ssh runs when it needs the password. It holds no
+// secret: it reads the password from a one-shot unix socket the main process
+// serves in the private control dir, so the password never appears in argv,
+// in an environment variable or in a file.
+const ASKPASS_SCRIPT = `#!/bin/sh
+ELECTRON_RUN_AS_NODE=1 exec "$SSHSYNC_ASKPASS_NODE" -e 'const s=require("net").connect(process.env.SSHSYNC_ASKPASS_SOCKET);s.pipe(process.stdout);s.on("error",()=>process.exit(1))'
+`;
+
+export function askpassHelperPath(): string {
+  const helper = path.join(getControlDir(), 'askpass.sh');
+  if (!fs.existsSync(helper)) {
+    fs.writeFileSync(helper, ASKPASS_SCRIPT, { mode: 0o700 });
+  }
+  return helper;
+}
+
+export function askpassEnvironment(helper: string, socketPath: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    SSH_ASKPASS: helper,
+    // OpenSSH >= 8.4: use the helper even with no display or a terminal
+    SSH_ASKPASS_REQUIRE: 'force',
+    DISPLAY: process.env.DISPLAY || ':0',
+    SSHSYNC_ASKPASS_NODE: process.execPath,
+    SSHSYNC_ASKPASS_SOCKET: socketPath,
+  };
+}
+
+// Answers the helper with the password, at most `maxAnswers` times, then closes.
+export function serveAskpass(socketPath: string, password: string, maxAnswers = 2): net.Server {
+  let answers = 0;
+  const server = net.createServer((socket) => {
+    answers += 1;
+    socket.end(`${password}\n`);
+    if (answers >= maxAnswers) server.close();
+  });
+  server.listen(socketPath);
+  return server;
 }
 
 // Start the multiplexed master for this sync as our own child process, wait
@@ -228,12 +285,36 @@ export function masterSshArgs(environment: ServerEnvironment, controlPath: strin
 export async function openRemoteConnection(
   environment: ServerEnvironment,
   runCommand: RunCommand,
+  password: string | null = null,
 ): Promise<RemoteConnection> {
   const target = sshTarget(environment);
-  const controlPath = path.join(getControlDir(), `cm-${randomBytes(4).toString('hex')}`);
+  if (environment.auth === 'password' && !password) {
+    throw new Error(
+      `No password saved for ${environment.label}. Edit the environment and enter it.`,
+    );
+  }
+  const connectionId = randomBytes(4).toString('hex');
+  const controlPath = path.join(getControlDir(), `cm-${connectionId}`);
   const masterArgs = masterSshArgs(environment, controlPath);
 
-  const master = spawn('ssh', masterArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let askpassServer: net.Server | null = null;
+  let masterEnv: NodeJS.ProcessEnv = process.env;
+  if (environment.auth === 'password') {
+    const askpassSocket = path.join(getControlDir(), `ap-${connectionId}`);
+    askpassServer = serveAskpass(askpassSocket, password!);
+    masterEnv = askpassEnvironment(askpassHelperPath(), askpassSocket);
+  }
+  const stopAskpass = () => {
+    askpassServer?.close();
+    askpassServer = null;
+  };
+
+  const master = spawn('ssh', masterArgs, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: masterEnv,
+    // No controlling terminal, so ssh can never fall back to prompting on a tty
+    detached: environment.auth === 'password',
+  });
   let masterStderr = '';
   let masterExited = false;
   master.stderr!.on('data', (d: Buffer) => {
@@ -251,6 +332,7 @@ export async function openRemoteConnection(
   // may still be alive elsewhere if ssh forked it after all.
   let registered: RemoteConnection | null = null;
   const close = async (): Promise<void> => {
+    stopAskpass();
     if (registered) openConnections.delete(registered);
     spawnSync('ssh', ['-o', `ControlPath=${controlPath}`, '-O', 'exit', target], {
       stdio: 'ignore',
@@ -272,6 +354,8 @@ export async function openRemoteConnection(
     }
     await sleep(200);
   }
+  // Authenticated: the password is no longer needed by anyone
+  stopAskpass();
 
   const connection: RemoteConnection = {
     target,

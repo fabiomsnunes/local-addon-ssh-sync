@@ -13,7 +13,13 @@ import {
   deleteProfile,
   recordSync,
   prunePushBackups,
+  savePassword,
+  getPassword,
+  hasPassword,
+  prunePasswords,
+  canStorePasswords,
 } from './config';
+import type { SafeStorage } from 'electron';
 import { HISTORY_LIMIT, PUSH_BACKUPS_TO_KEEP } from './constants';
 import { ServerEnvironment } from './types';
 
@@ -139,5 +145,40 @@ describe('prunePushBackups', () => {
     expect(left).toContain('site-1-staging-2026-11-01T10-00-00-000Z.sql');
     expect(left).toContain('site-1-production-eu-2026-10-01T10-00-00-000Z.sql');
     expect(left).toContain('site-2-production-2026-11-01T10-00-00-000Z.sql');
+  });
+});
+
+const fakeSafeStorage = (available = true): SafeStorage =>
+  ({
+    isEncryptionAvailable: () => available,
+    encryptString: (v: string) => Buffer.from('enc:' + v, 'utf8'),
+    decryptString: (b: Buffer) => b.toString('utf8').replace(/^enc:/, ''),
+  }) as unknown as SafeStorage;
+
+describe('passwords', () => {
+  it('round-trips an encrypted password, never stored in plain text', () => {
+    initConfig(sandbox, fakeSafeStorage());
+    expect(savePassword('env-1', 's3cret')).toBe(true);
+    expect(getPassword('env-1')).toBe('s3cret');
+    expect(hasPassword('env-1')).toBe(true);
+    const file = path.join(sandbox, 'addons-data', 'ssh-sync', 'secrets.json');
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('s3cret');
+    expect(fs.statSync(file).mode & 0o077).toBe(0);
+  });
+
+  it('refuses to save when the OS cannot encrypt', () => {
+    initConfig(sandbox, fakeSafeStorage(false));
+    expect(canStorePasswords()).toBe(false);
+    expect(savePassword('env-1', 's3cret')).toBe(false);
+    expect(hasPassword('env-1')).toBe(false);
+  });
+
+  it('prunes passwords of environments that are gone', () => {
+    initConfig(sandbox, fakeSafeStorage());
+    savePassword('keep', 'a');
+    savePassword('drop', 'b');
+    prunePasswords(new Set(['keep']));
+    expect(hasPassword('keep')).toBe(true);
+    expect(hasPassword('drop')).toBe(false);
   });
 });

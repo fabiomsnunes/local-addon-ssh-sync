@@ -15,6 +15,8 @@ export interface ServerEnvironment {
   cacheCommand?: string;
   extraExcludes: string[];
   isProduction: boolean;
+  // Set by the main process: a password is saved for this environment
+  hasPassword?: boolean;
 }
 
 export interface SyncHistoryEntry {
