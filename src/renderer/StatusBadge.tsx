@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { useState, useEffect } from 'react';
-import KinstaIcon from './KinstaIcon';
+import SyncIcon from './SyncIcon';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -11,22 +11,22 @@ interface ActiveSyncState {
 
 interface Props {
   site: any;
-  // Navigate to the Kinsta page (events.send('goToRoute', ...) from index.tsx)
+  // Navigate to the SSH Sync page (events.send('goToRoute', ...) from index.tsx)
   onOpen: () => void;
 }
 
 // Always-visible status badge in the site view's top-right corner
 // (SiteInfo_Top_TopRight hook). Shows link status at a glance and live sync
 // progress even when the sync drawer is closed or another tab is active.
-// Renders nothing for unlinked sites — zero noise.
-const KinstaStatusBadge: React.FC<Props> = ({ site, onOpen }) => {
+// Renders nothing for sites without environments — zero noise.
+const StatusBadge: React.FC<Props> = ({ site, onOpen }) => {
   const [linked, setLinked] = useState(false);
   const [sync, setSync] = useState<ActiveSyncState | null>(null);
   const [hover, setHover] = useState(false);
 
   const refresh = async () => {
-    const link = await ipcRenderer.invoke('kinsta:getSiteLink', site.id);
-    setLinked(!!link);
+    const profile = await ipcRenderer.invoke('sshsync:getProfile', site.id);
+    setLinked(!!profile && profile.environments.length > 0);
   };
 
   useEffect(() => {
@@ -35,14 +35,14 @@ const KinstaStatusBadge: React.FC<Props> = ({ site, onOpen }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh() only reads site.id; re-run on site change
   }, [site.id]);
 
-  // Stay in sync with link/unlink from the page and drawers
+  // Stay in sync with environment changes from the page and drawers
   useEffect(() => {
     const handler = (e: Event) => {
       const { siteId } = (e as CustomEvent).detail || {};
       if (!siteId || siteId === site.id) refresh();
     };
-    window.addEventListener('kinsta:state-changed', handler);
-    return () => window.removeEventListener('kinsta:state-changed', handler);
+    window.addEventListener('sshsync:state-changed', handler);
+    return () => window.removeEventListener('sshsync:state-changed', handler);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once per site; handler reads the current site.id closure
   }, [site.id]);
 
@@ -57,9 +57,9 @@ const KinstaStatusBadge: React.FC<Props> = ({ site, onOpen }) => {
         setSync({ mode: p.mode, progress: p.progress || 0 });
       }
     };
-    ipcRenderer.on('kinsta:syncProgress', handler);
+    ipcRenderer.on('sshsync:syncProgress', handler);
     return () => {
-      ipcRenderer.removeListener('kinsta:syncProgress', handler);
+      ipcRenderer.removeListener('sshsync:syncProgress', handler);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- subscribe once per site; handler reads the current site.id closure
   }, [site.id]);
@@ -71,7 +71,7 @@ const KinstaStatusBadge: React.FC<Props> = ({ site, onOpen }) => {
       onClick={onOpen}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      title="Open Kinsta"
+      title="Open SSH Sync"
       style={{
         display: 'inline-flex',
         alignItems: 'center',
@@ -88,16 +88,16 @@ const KinstaStatusBadge: React.FC<Props> = ({ site, onOpen }) => {
         userSelect: 'none',
       }}
     >
-      <KinstaIcon size={18} />
+      <SyncIcon size={18} />
       {sync ? (
         <span>
           {sync.mode === 'pull' ? 'Pulling' : 'Pushing'}… {sync.progress}%
         </span>
       ) : (
-        <span>Linked to Kinsta</span>
+        <span>SSH Sync</span>
       )}
     </div>
   );
 };
 
-export default KinstaStatusBadge;
+export default StatusBadge;

@@ -2,13 +2,13 @@
 import type { AddonMainContext } from '@getflywheel/local/main';
 import * as path from 'path';
 import * as fs from 'fs';
+import { randomBytes } from 'crypto';
 import { spawn } from 'child_process';
 import type { IpcMainInvokeEvent } from 'electron';
 
 import { EXCLUDE_PATTERNS } from './constants';
 import {
-  SiteLink,
-  EnvironmentInfo,
+  ServerEnvironment,
   SyncProgress,
   SyncOptions,
   SiteInfo,
@@ -16,46 +16,43 @@ import {
   ActiveSync,
   RunOptions,
   PullPushDeps,
+  RemoteConnection,
 } from './types';
-import { validateEnvironmentInfo } from './validators';
-import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, rsyncSshContext } from './rsync';
-import { getKinstaClient, createKinstaBackup, clearKinstaCaches } from './kinstaApi';
+import { validateEnvironment } from './validators';
+import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, localPublicPath } from './rsync';
+import { openRemoteConnection, listSshConfigHosts, rsyncRemoteShell, rsyncRemoteRoot } from './ssh';
 import { executePull, executePush } from './sync';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
 import {
   initConfig,
   getTempDir,
-  migrateLegacyConfig,
+  getBackupsDir,
   ensureConfigDir,
-  loadConfig,
-  saveConfig,
-  getApiKey,
-  saveApiKey,
-  deleteApiKey,
-  loadSiteLinks,
-  saveSiteLinks,
+  getProfile,
+  findEnvironment,
+  saveEnvironments,
+  deleteProfile,
   recordSync,
   cleanupTempFiles,
 } from './config';
 
 // Re-export the public API from the extracted modules so existing imports
-// `from './index'` (the test suite, the renderer IPC types) keep resolving.
+// `from './index'` (the test suite) keep resolving.
 export * from './types';
 export * from './validators';
 export * from './rsync';
-export * from './kinstaApi';
+export * from './ssh';
 export * from './sync';
 export * from './localPaths';
 export * from './config';
 export {
-  KINSTA_API_BASE,
-  LEGACY_CONFIG_DIR,
+  PRODUCT_NAME,
+  DATA_DIR_NAME,
   EXCLUDE_PATTERNS,
   HISTORY_LIMIT,
   MIN_DUMP_BYTES,
-  KINSTA_BACKUP_TAG,
-  MANUAL_BACKUP_LIMIT,
-  REMOTE_PUSH_BACKUP,
+  PUSH_BACKUPS_TO_KEEP,
+  REMOTE_TEMP_PREFIX,
 } from './constants';
 
 // Set from context in the exported entry point
@@ -152,29 +149,6 @@ function runCommand(
   });
 }
 
-// Fail-fast pre-flight: confirm SSH + remote WP-CLI + the public dir are reachable
-// BEFORE any destructive step. Without it a bad key / unreachable host only surfaces
-// mid-sync as a cryptic rsync/ssh failure (after backups have already run). Returns
-// null on success or a user-facing error message. ConnectTimeout bounds a dead host.
-async function preflightRemote(envInfo: EnvironmentInfo): Promise<string | null> {
-  const probe: ActiveSync = { cancelled: false, child: null };
-  try {
-    await runCommand(probe, 'ssh', [
-      '-p',
-      envInfo.sshPort,
-      '-o',
-      'StrictHostKeyChecking=accept-new',
-      '-o',
-      'ConnectTimeout=15',
-      `${envInfo.sshUser}@${envInfo.sshHost}`,
-      'cd ~/public && wp --version',
-    ]);
-    return null;
-  } catch (e: any) {
-    return `Could not reach Kinsta over SSH (or WP-CLI failed on the server). Check that your SSH key is added in MyKinsta and the environment has SSH access enabled. Details: ${e.message}`;
-  }
-}
-
 function notify(title: string, message: string): void {
   try {
     notifier?.notify({ title, message });
@@ -203,15 +177,22 @@ function watchRendererBundle(electron: AddonMainContext['electron']): void {
           for (const win of electron.BrowserWindow.getAllWindows()) {
             win.webContents.reloadIgnoringCache();
           }
-          console.log('[Kinsta] Renderer bundle changed — reloaded Local windows');
+          console.log('[SSH Sync] Renderer bundle changed — reloaded Local windows');
         } catch (e) {
-          console.error('[Kinsta] Renderer reload failed:', e);
+          console.error('[SSH Sync] Renderer reload failed:', e);
         }
       }, 400);
     });
   } catch (e) {
-    console.error('[Kinsta] Could not watch renderer bundle:', e);
+    console.error('[SSH Sync] Could not watch renderer bundle:', e);
   }
+}
+
+async function connectRemote(environment: ServerEnvironment): Promise<RemoteConnection> {
+  if (environment.auth === 'password') {
+    throw new Error('Password authentication is not available yet. Use an SSH key for now.');
+  }
+  return openRemoteConnection(environment, runCommand);
 }
 
 // Wire the orchestration seams to the real implementations. Called per IPC
@@ -222,23 +203,53 @@ function defaultPullPushDeps(sendProgress: (progress: SyncProgress) => void): Pu
     runCommand,
     activeSyncs,
     activePreviews,
-    loadSiteLinks,
-    validateEnvironmentInfo,
+    connectRemote,
     getMysqlSocketPath,
-    preflightRemote,
     resolveRsync,
     findServiceBinary,
     findWpCliPhar,
-    getApiKey,
-    getKinstaClient,
-    createKinstaBackup,
-    clearKinstaCaches,
     recordSync,
     notify,
     ensureConfigDir,
     tempDir: getTempDir(),
+    backupsDir: getBackupsDir(),
     sendProgress,
   };
+}
+
+// Environments arrive from the renderer: keep only known fields, give new ones
+// an id, and reject the whole save on the first invalid entry.
+export function normalizeEnvironments(
+  input: Partial<ServerEnvironment>[],
+): { environments: ServerEnvironment[] } | { error: string } {
+  const environments: ServerEnvironment[] = [];
+  for (const raw of input) {
+    const environment: ServerEnvironment = {
+      id: raw.id && /^[a-z0-9-]+$/.test(raw.id) ? raw.id : randomBytes(6).toString('hex'),
+      label: String(raw.label || '').trim(),
+      sshAlias: raw.sshAlias ? String(raw.sshAlias).trim() : undefined,
+      sshHost: raw.sshAlias ? undefined : String(raw.sshHost || '').trim(),
+      sshUser: raw.sshAlias ? undefined : String(raw.sshUser || '').trim(),
+      sshPort: raw.sshAlias ? undefined : String(raw.sshPort || '22').trim(),
+      auth: raw.auth === 'password' ? 'password' : 'key',
+      remotePath: String(raw.remotePath || '')
+        .trim()
+        .replace(/(.)\/+$/, '$1'),
+      remoteUrl: String(raw.remoteUrl || '')
+        .trim()
+        .replace(/\/+$/, ''),
+      wpCommand: String(raw.wpCommand || 'wp').trim(),
+      cacheCommand: raw.cacheCommand ? String(raw.cacheCommand).trim() : undefined,
+      extraExcludes: Array.isArray(raw.extraExcludes)
+        ? raw.extraExcludes.map((p) => String(p).trim()).filter(Boolean)
+        : [],
+      isProduction: Boolean(raw.isProduction),
+    };
+    const error = validateEnvironment(environment);
+    if (error) return { error: `${environment.label || 'Environment'}: ${error}` };
+    environments.push(environment);
+  }
+  return { environments };
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +265,7 @@ export default function (context: AddonMainContext): void {
   const userDataPath = String(context.environment.userDataPath || '');
   const appPath = String(context.environment.appPath || '');
   initLocalPaths(userDataPath, appPath);
-  // initConfig sets safeStorage then resolves the config paths (preserving the
-  // original order: paths/safeStorage set before resolveConfigPaths/migrate).
-  initConfig(userDataPath, electron.safeStorage);
-  migrateLegacyConfig();
+  initConfig(userDataPath);
 
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
@@ -265,191 +273,112 @@ export default function (context: AddonMainContext): void {
   // Hot-reload Local's renderer when the compiled renderer bundle changes
   watchRendererBundle(electron);
 
-  // Clean up stale links when a site is deleted in Local
+  // Remove the profile when its site is deleted in Local
   try {
     hooks.addAction('siteDeleted', (siteId: string) => {
-      const links = loadSiteLinks();
-      if (links[siteId]) {
-        delete links[siteId];
-        saveSiteLinks(links);
-        console.log(`[Kinsta] Removed link for deleted site ${siteId}`);
+      if (deleteProfile(siteId)) {
+        console.log(`[SSH Sync] Removed profile for deleted site ${siteId}`);
       }
     });
   } catch (e) {
-    console.error('[Kinsta] Could not register siteDeleted action:', e);
+    console.error('[SSH Sync] Could not register siteDeleted action:', e);
   }
 
-  // Test API connection
+  ipcMain.handle('sshsync:getProfile', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+    return getProfile(localSiteId);
+  });
+
+  ipcMain.handle('sshsync:listSshHosts', async () => listSshConfigHosts());
+
   ipcMain.handle(
-    'kinsta:testConnection',
-    async (_event: IpcMainInvokeEvent, apiKey: string, companyId: string) => {
+    'sshsync:saveEnvironments',
+    async (
+      _event: IpcMainInvokeEvent,
+      localSiteId: string,
+      input: Partial<ServerEnvironment>[],
+    ) => {
+      const result = normalizeEnvironments(Array.isArray(input) ? input : []);
+      if ('error' in result) return { success: false, error: result.error };
+      saveEnvironments(localSiteId, result.environments);
+      return { success: true, profile: getProfile(localSiteId) };
+    },
+  );
+
+  ipcMain.handle(
+    'sshsync:deleteProfile',
+    async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+      deleteProfile(localSiteId);
+      return { success: true };
+    },
+  );
+
+  // Connect and probe an environment as typed in the form (not yet saved)
+  ipcMain.handle(
+    'sshsync:testConnection',
+    async (_event: IpcMainInvokeEvent, input: Partial<ServerEnvironment>) => {
+      const result = normalizeEnvironments([input]);
+      if ('error' in result) return { success: false, error: result.error };
       try {
-        const client = getKinstaClient(apiKey);
-        const response = await client.get(`/sites?company=${companyId}`);
-
-        if (response.data.company) {
-          // Save credentials securely
-          const saved = saveApiKey(apiKey);
-          if (!saved) {
-            return {
-              success: false,
-              error: 'Could not save API key securely. Encryption not available.',
-            };
-          }
-          // Note: the /sites response's `company` object only contains `sites` —
-          // the Kinsta API has no endpoint that exposes the company name.
-          saveConfig({ companyId });
-          return { success: true, company: response.data.company };
-        }
-        return { success: false, error: 'Invalid response from Kinsta API' };
-      } catch (error: any) {
-        return { success: false, error: error.message || 'Connection failed' };
+        const connection = await connectRemote(result.environments[0]);
+        await connection.close();
+        return { success: true, remoteRoot: connection.remoteRoot };
+      } catch (e: any) {
+        return { success: false, error: e.message };
       }
     },
   );
 
-  // Get stored config (returns masked apiKey if exists)
-  ipcMain.handle('kinsta:getConfig', async () => {
-    const config = loadConfig();
-    const hasApiKey = getApiKey() !== null;
-    return { ...config, apiKey: hasApiKey ? '••••••••' : undefined };
-  });
-
-  // Get Kinsta sites
-  ipcMain.handle('kinsta:getSites', async () => {
-    const config = loadConfig();
-    const apiKey = getApiKey();
-    if (!apiKey || !config.companyId) {
-      return { success: false, error: 'Not connected to Kinsta' };
-    }
-
-    try {
-      const client = getKinstaClient(apiKey);
-      const response = await client.get(`/sites?company=${config.companyId}`);
-      return { success: true, sites: response.data.company?.sites || [] };
-    } catch (error: any) {
-      return { success: false, error: error.message };
-    }
-  });
-
-  // Get environments for a site
-  ipcMain.handle('kinsta:getEnvironments', async (_event: IpcMainInvokeEvent, siteId: string) => {
-    const apiKey = getApiKey();
-    if (!apiKey) {
-      return { success: false, error: 'Not connected' };
-    }
-
-    try {
-      const client = getKinstaClient(apiKey);
-      const response = await client.get(`/sites/${siteId}/environments`);
-      return { success: true, environments: response.data.site?.environments || [] };
-    } catch (error: any) {
-      return { success: false, error: error.message };
-    }
-  });
-
-  // Link Local site to Kinsta (only stores site info, not environment)
-  ipcMain.handle(
-    'kinsta:linkSite',
-    async (_event: IpcMainInvokeEvent, localSiteId: string, kinstaSite: any) => {
-      const links = loadSiteLinks();
-
-      const link: SiteLink = {
-        localSiteId,
-        kinstaSiteId: kinstaSite.id,
-        kinstaSiteName: kinstaSite.display_name || kinstaSite.name,
-        kinstaSiteSlug: kinstaSite.name, // The actual site name used for SSH
-      };
-
-      links[localSiteId] = link;
-      saveSiteLinks(links);
-
-      return { success: true, link };
-    },
-  );
-
-  // Get link for a Local site
-  ipcMain.handle('kinsta:getSiteLink', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
-    const links = loadSiteLinks();
-    return links[localSiteId] || null;
-  });
-
-  // Unlink site
-  ipcMain.handle('kinsta:unlinkSite', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
-    const links = loadSiteLinks();
-    delete links[localSiteId];
-    saveSiteLinks(links);
-    return { success: true };
-  });
-
-  // Clear all Kinsta caches for an environment (also used standalone from the page)
-  ipcMain.handle(
-    'kinsta:clearCache',
-    async (_event: IpcMainInvokeEvent, envId: string, cdnCacheId?: string) => {
-      const apiKey = getApiKey();
-      if (!apiKey) {
-        return { success: false, error: 'Not connected' };
-      }
-      try {
-        const client = getKinstaClient(apiKey);
-        const cleared = await clearKinstaCaches(client, envId, cdnCacheId);
-        return { success: true, cleared };
-      } catch (error: any) {
-        return { success: false, error: error.response?.data?.message || error.message };
-      }
-    },
-  );
-
-  // Push preview: rsync dry-run diff of what a push would change on Kinsta.
+  // Push preview: rsync dry-run diff of what a push would change on the server.
   // Read-only — no files are touched on either side.
   ipcMain.handle(
-    'kinsta:pushPreview',
+    'sshsync:pushPreview',
     async (
       _event: IpcMainInvokeEvent,
       localSiteId: string,
       site: SiteInfo,
-      envInfo: EnvironmentInfo,
+      environmentId: string,
       options: { mode?: 'newer' | 'all'; includeUploads?: boolean } = {},
     ) => {
       const mode = options.mode || 'newer';
       if (activeSyncs.has(localSiteId)) {
         return { success: false, error: 'A sync is already running for this site', mode };
       }
-      if (!validateEnvironmentInfo(envInfo)) {
-        return { success: false, error: 'Invalid environment configuration.', mode };
-      }
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) return { success: false, error: 'Unknown environment.', mode };
 
-      const { localPublicPath, sshCommandForRsync, remoteHost } = rsyncSshContext(site, envInfo);
-
-      const excludeArgs = EXCLUDE_PATTERNS.map((p) => `--exclude=${p}`);
+      const excludeArgs = [...EXCLUDE_PATTERNS, ...environment.extraExcludes].map(
+        (p) => `--exclude=${p}`,
+      );
       if (!options.includeUploads) {
         excludeArgs.push('--exclude=wp-content/uploads/');
       }
 
-      const rsync = resolveRsync();
-      const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
-
-      // %M carries the local file's mtime so we never stat thousands of files
-      // in the main process (which would block Local's entire UI)
-      const args = ['-az', '--delete', '-n'];
-      if (mode === 'newer') args.push('--update');
-      args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
-      args.push(
-        ...excludeArgs,
-        '-e',
-        sshCommandForRsync,
-        `${localPublicPath}/`,
-        `${remoteHost}:~/public/`,
-      );
-
       // One preview at a time per site: kill the previous dry-run if the
       // renderer re-fires (mode/env/uploads toggles) so orphaned SSH sessions
-      // don't pile up against Kinsta's connection limit.
+      // don't pile up against the server's connection limit.
       activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
       const preview: ActiveSync = { cancelled: false, child: null };
       activePreviews.set(localSiteId, preview);
 
+      let connection: RemoteConnection | null = null;
       try {
+        connection = await connectRemote(environment);
+        const rsync = resolveRsync();
+        const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
+
+        // %M carries the local file's mtime so we never stat thousands of files
+        // in the main process (which would block Local's entire UI)
+        const args = ['-az', '--delete', '-n'];
+        if (mode === 'newer') args.push('--update');
+        args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
+        args.push(
+          ...excludeArgs,
+          '-e',
+          rsyncRemoteShell(connection),
+          `${localPublicPath(site)}/`,
+          rsyncRemoteRoot(connection),
+        );
+
         const chunks: string[] = [];
         await runCommand(preview, rsync.bin, args, {
           okCodes: [23, 24],
@@ -464,13 +393,14 @@ export default function (context: AddonMainContext): void {
       } catch (error: any) {
         return { success: false, error: error.message, mode };
       } finally {
+        await connection?.close();
         if (activePreviews.get(localSiteId) === preview) activePreviews.delete(localSiteId);
       }
     },
   );
 
   // Cancel a running sync for a site
-  ipcMain.handle('kinsta:cancelSync', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+  ipcMain.handle('sshsync:cancelSync', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
     const sync = activeSyncs.get(localSiteId);
     if (sync) {
       sync.cancelled = true;
@@ -479,60 +409,30 @@ export default function (context: AddonMainContext): void {
     return { success: true };
   });
 
-  // Pull from Kinsta
-  ipcMain.handle(
-    'kinsta:pull',
+  // The renderer names the environment; its connection details always come
+  // from the stored profile, never from the renderer.
+  const syncHandler =
+    (mode: 'pull' | 'push') =>
     async (
       event: IpcMainInvokeEvent,
       localSiteId: string,
       site: SiteInfo,
-      envInfo: EnvironmentInfo,
+      environmentId: string,
       options: SyncOptions,
     ) => {
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) return { success: false, error: 'Unknown environment.' };
       // siteId + mode let listeners (status badge, drawer) filter events
       const sendProgress = (progress: SyncProgress) => {
-        event.sender.send('kinsta:syncProgress', {
-          ...progress,
-          siteId: localSiteId,
-          mode: 'pull',
-        });
+        event.sender.send('sshsync:syncProgress', { ...progress, siteId: localSiteId, mode });
       };
-      return executePull(
-        { localSiteId, site, envInfo, options },
+      const execute = mode === 'pull' ? executePull : executePush;
+      return execute(
+        { localSiteId, site, environment, options: options || {} },
         defaultPullPushDeps(sendProgress),
       );
-    },
-  );
+    };
 
-  // Push to Kinsta
-  ipcMain.handle(
-    'kinsta:push',
-    async (
-      event: IpcMainInvokeEvent,
-      localSiteId: string,
-      site: SiteInfo,
-      envInfo: EnvironmentInfo,
-      options: SyncOptions,
-    ) => {
-      // siteId + mode let listeners (status badge, drawer) filter events
-      const sendProgress = (progress: SyncProgress) => {
-        event.sender.send('kinsta:syncProgress', {
-          ...progress,
-          siteId: localSiteId,
-          mode: 'push',
-        });
-      };
-      return executePush(
-        { localSiteId, site, envInfo, options },
-        defaultPullPushDeps(sendProgress),
-      );
-    },
-  );
-
-  // Disconnect from Kinsta
-  ipcMain.handle('kinsta:disconnect', async () => {
-    deleteApiKey();
-    saveConfig({});
-    return { success: true };
-  });
+  ipcMain.handle('sshsync:pull', syncHandler('pull'));
+  ipcMain.handle('sshsync:push', syncHandler('push'));
 }

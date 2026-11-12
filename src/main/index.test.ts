@@ -4,18 +4,20 @@ import {
   isValidPort,
   isValidUsername,
   isValidDomain,
-  validateEnvironmentInfo,
+  isValidRemotePath,
+  isValidRemoteCommand,
+  remoteDomainFromUrl,
+  validateEnvironment,
   expandPath,
   describePartialTransfer,
-  sshArgs,
   rsyncProgressArgs,
   makeRsyncProgressParser,
   getDbCredentials,
   searchReplacePairs,
   isLikelyValidSqlDump,
-  isTransientApiError,
   EXCLUDE_PATTERNS,
-  EnvironmentInfo,
+  ServerEnvironment,
+  RemoteConnection,
   RsyncInfo,
   parseItemizeLine,
   parseItemizeOutput,
@@ -25,25 +27,54 @@ import {
   parseTablePrefix,
   setTablePrefix,
   normalizeTablePrefix,
-  rsyncSshContext,
   downgradeMySQL8Collations,
   downgradeMariaDBCollations,
+  shellQuote,
+  remoteCdPath,
+  sshTarget,
+  baseSshOptions,
+  masterSshArgs,
+  sshArgs,
+  scpArgs,
+  rsyncRemoteShell,
+  rsyncRemoteRoot,
+  remoteWp,
+  remoteDbExportCommand,
+  parseRemoteTempPath,
+  remoteProbeCommand,
+  parseRemoteProbe,
+  parseSshConfigHosts,
+  normalizeEnvironments,
+  productionDatabaseGuard,
 } from './index';
 
-const env = (overrides: Partial<EnvironmentInfo> = {}): EnvironmentInfo => ({
-  envId: 'env-1',
-  envType: 'live',
+const env = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironment => ({
+  id: 'production',
+  label: 'Production',
   sshHost: '35.1.2.3',
   sshPort: '12345',
-  sshUser: 'gbdbutik',
-  remoteDomain: 'gbdbutik.se',
+  sshUser: 'deploy',
+  auth: 'key',
+  remotePath: '/var/www/example.com',
+  remoteUrl: 'https://example.com',
+  wpCommand: 'wp',
+  extraExcludes: [],
+  isProduction: true,
+  ...overrides,
+});
+
+const connection = (overrides: Partial<RemoteConnection> = {}): RemoteConnection => ({
+  target: 'deploy@35.1.2.3',
+  sshOptions: baseSshOptions(env(), '/tmp/ssh-sync-x/cm-1'),
+  remoteRoot: '/var/www/example.com',
+  close: async () => {},
   ...overrides,
 });
 
 describe('injection guards (validators)', () => {
   it('accepts normal hosts', () => {
     expect(isValidHostname('35.1.2.3')).toBe(true);
-    expect(isValidHostname('ssh.kinsta.cloud')).toBe(true);
+    expect(isValidHostname('sv02.example.net')).toBe(true);
   });
 
   it('rejects shell metacharacters in hostnames', () => {
@@ -69,53 +100,239 @@ describe('injection guards (validators)', () => {
   });
 
   it('rejects dangerous usernames and domains', () => {
-    expect(isValidUsername('gbdbutik')).toBe(true);
+    expect(isValidUsername('deploy')).toBe(true);
     expect(isValidUsername('user name')).toBe(false);
     expect(isValidUsername('user;id')).toBe(false);
-    expect(isValidDomain('gbdbutik.se')).toBe(true);
+    expect(isValidDomain('example.com')).toBe(true);
     expect(isValidDomain("dom'ain.se")).toBe(false);
   });
 
-  it('validateEnvironmentInfo requires every field to pass', () => {
-    expect(validateEnvironmentInfo(env())).toBe(true);
-    expect(validateEnvironmentInfo(env({ sshHost: 'host;evil' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ sshPort: '99999' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ sshUser: 'a b' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ remoteDomain: '$(x).se' }))).toBe(false);
+  it('accepts absolute and ~-relative WordPress folders only', () => {
+    for (const ok of ['/var/www/example.com', '~/public_html', '~', '/home/u/webapps/app']) {
+      expect(isValidRemotePath(ok), ok).toBe(true);
+    }
+    for (const bad of [
+      'public_html',
+      '/var/www/../etc',
+      '/var/www/$(id)',
+      "/var/www/a'b",
+      '/var/www/a b',
+      '~root/x',
+      '',
+    ]) {
+      expect(isValidRemotePath(bad), bad).toBe(false);
+    }
+  });
+
+  it('accepts plain WP-CLI invocations and rejects shell syntax', () => {
+    for (const ok of ['wp', 'php8.2 /usr/local/bin/wp', 'php -d memory_limit=512M ~/wp-cli.phar']) {
+      expect(isValidRemoteCommand(ok), ok).toBe(true);
+    }
+    for (const bad of ['wp; rm -rf /', 'wp && id', 'wp | sh', '$(id)', 'wp `id`', 'wp  x', '']) {
+      expect(isValidRemoteCommand(bad), bad).toBe(false);
+    }
+  });
+
+  it('derives the search-replace domain from the site URL', () => {
+    expect(remoteDomainFromUrl('https://example.com')).toBe('example.com');
+    expect(remoteDomainFromUrl('https://example.com/')).toBe('example.com');
+    expect(remoteDomainFromUrl('https://example.com/blog/')).toBe('example.com/blog');
+    expect(remoteDomainFromUrl('http://example.com:8080')).toBe('example.com:8080');
+    expect(remoteDomainFromUrl('example.com')).toBeNull();
+    expect(remoteDomainFromUrl('ftp://example.com')).toBeNull();
+    expect(remoteDomainFromUrl('https://example.com/?x=1')).toBeNull();
+  });
+
+  it('validateEnvironment reports the first problem', () => {
+    expect(validateEnvironment(env())).toBeNull();
+    expect(validateEnvironment(env({ sshHost: undefined, sshAlias: 'example' }))).toBeNull();
+    expect(validateEnvironment(env({ sshHost: 'host;evil' }))).toMatch(/host/i);
+    expect(validateEnvironment(env({ sshPort: '99999' }))).toMatch(/port/i);
+    expect(validateEnvironment(env({ sshUser: 'a b' }))).toMatch(/user/i);
+    expect(validateEnvironment(env({ sshAlias: '-oProxyCommand=x' }))).toMatch(/alias/i);
+    expect(validateEnvironment(env({ remotePath: 'relative' }))).toMatch(/folder/i);
+    expect(validateEnvironment(env({ remoteUrl: 'nope' }))).toMatch(/URL/);
+    expect(validateEnvironment(env({ wpCommand: 'wp;id' }))).toMatch(/WP-CLI/);
+    expect(validateEnvironment(env({ cacheCommand: 'wp cache flush && id' }))).toMatch(/cache/);
+    expect(validateEnvironment(env({ extraExcludes: ['ok/', 'x;y'] }))).toMatch(/exclude/);
+    expect(validateEnvironment(env({ label: ' ' }))).toMatch(/name/);
   });
 });
 
-describe('sshArgs', () => {
-  it('builds args as an array (no shell string)', () => {
-    expect(sshArgs(env(), 'wp db export /tmp/x.sql')).toEqual([
-      '-p',
-      '12345',
-      '-o',
-      'StrictHostKeyChecking=accept-new',
-      '-o',
-      'ServerAliveInterval=60',
-      '-o',
-      'ServerAliveCountMax=120',
-      'gbdbutik@35.1.2.3',
-      'wp db export /tmp/x.sql',
+describe('normalizeEnvironments', () => {
+  it('drops unknown fields, fills defaults and assigns an id', () => {
+    const result = normalizeEnvironments([
+      {
+        label: 'Staging',
+        sshAlias: 'staging-host',
+        sshHost: 'ignored.example',
+        remotePath: '/var/www/staging/',
+        remoteUrl: 'https://staging.example.com/',
+        extraExcludes: [' wp-content/litespeed/ ', ''],
+        ...({ evil: true } as object),
+      } as Partial<ServerEnvironment>,
     ]);
+    expect('environments' in result).toBe(true);
+    const [e] = (result as { environments: ServerEnvironment[] }).environments;
+    expect(e.id).toMatch(/^[a-f0-9]{12}$/);
+    expect(e.sshHost).toBeUndefined();
+    expect(e.remotePath).toBe('/var/www/staging');
+    expect(e.remoteUrl).toBe('https://staging.example.com');
+    expect(e.wpCommand).toBe('wp');
+    expect(e.auth).toBe('key');
+    expect(e.isProduction).toBe(false);
+    expect(e.extraExcludes).toEqual(['wp-content/litespeed/']);
+    expect(e).not.toHaveProperty('evil');
+  });
+
+  it('rejects the save when one environment is invalid', () => {
+    const result = normalizeEnvironments([env(), env({ label: 'Bad', remotePath: 'x' })]);
+    expect(result).toEqual({ error: expect.stringContaining('Bad') });
+  });
+});
+
+describe('productionDatabaseGuard', () => {
+  it('lets files-only pushes and non-production databases through', () => {
+    expect(productionDatabaseGuard(env(), { includeDatabase: false })).toBeNull();
+    expect(
+      productionDatabaseGuard(env({ isProduction: false }), { includeDatabase: true }),
+    ).toBeNull();
+  });
+
+  it('needs Migration mode AND the typed domain for a production database', () => {
+    expect(productionDatabaseGuard(env(), { includeDatabase: true })).toMatch(/Migration mode/);
+    expect(productionDatabaseGuard(env(), { includeDatabase: true, migrationMode: true })).toMatch(
+      /example\.com/,
+    );
+    expect(
+      productionDatabaseGuard(env(), {
+        includeDatabase: true,
+        migrationMode: true,
+        confirmDomain: 'other.com',
+      }),
+    ).not.toBeNull();
+    expect(
+      productionDatabaseGuard(env(), {
+        includeDatabase: true,
+        migrationMode: true,
+        confirmDomain: 'example.com',
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('ssh helpers', () => {
+  it('quotes anything for a POSIX shell', () => {
+    expect(shellQuote("it's")).toBe(`'it'\\''s'`);
+    expect(shellQuote('/var/www/x')).toBe(`'/var/www/x'`);
+  });
+
+  it('keeps a leading ~ expandable when quoting a path for cd', () => {
+    expect(remoteCdPath('~')).toBe('~');
+    expect(remoteCdPath('~/public_html')).toBe(`~/'public_html'`);
+    expect(remoteCdPath('/var/www/x')).toBe(`'/var/www/x'`);
+  });
+
+  it('targets the alias when there is one, user@host otherwise', () => {
+    expect(sshTarget(env())).toBe('deploy@35.1.2.3');
+    expect(sshTarget(env({ sshAlias: 'example' }))).toBe('example');
+  });
+
+  it('passes the port as -o Port (shared by ssh, scp and rsync), never with an alias', () => {
+    expect(baseSshOptions(env())).toContain('Port=12345');
+    expect(baseSshOptions(env({ sshAlias: 'example' })).join(' ')).not.toContain('Port=');
   });
 
   it('keeps the SSH connection alive on long syncs (keepalive)', () => {
-    // A long mysqldump/import or a big rsync can idle the channel long enough
-    // for a NAT/firewall to drop it. ServerAlive* makes ssh probe the peer.
-    const args = sshArgs(env(), 'wp db export /tmp/x.sql');
-    expect(args).toContain('ServerAliveInterval=60');
-    expect(args).toContain('ServerAliveCountMax=120');
+    const options = baseSshOptions(env());
+    expect(options).toContain('ServerAliveInterval=60');
+    expect(options).toContain('ServerAliveCountMax=120');
   });
-});
 
-describe('rsyncSshContext', () => {
-  it('applies the same SSH keepalive to the rsync transport', () => {
-    const { sshCommandForRsync } = rsyncSshContext({ path: '/tmp/site' } as any, env());
-    expect(sshCommandForRsync).toContain('-o ServerAliveInterval=60');
-    expect(sshCommandForRsync).toContain('-o ServerAliveCountMax=120');
-    expect(sshCommandForRsync).toContain('-p 12345');
+  it('reuses the multiplexed master without ever becoming one', () => {
+    const options = baseSshOptions(env(), '/tmp/cm-1');
+    expect(options).toContain('ControlPath=/tmp/cm-1');
+    expect(options).toContain('ControlMaster=no');
+  });
+
+  it('keeps the master in the foreground even when ssh_config sets ControlPersist', () => {
+    const args = masterSshArgs(env({ sshAlias: 'example' }), '/tmp/cm-1');
+    expect(args).toContain('ControlPersist=no');
+    expect(args).toContain('ControlMaster=yes');
+    expect(args).toContain('ControlPath=/tmp/cm-1');
+    expect(args).toContain('BatchMode=yes');
+    expect(args.slice(-2)).toEqual(['-N', 'example']);
+  });
+
+  it('builds ssh and scp args as arrays (no local shell string)', () => {
+    const c = connection();
+    expect(sshArgs(c, 'pwd').slice(-2)).toEqual(['deploy@35.1.2.3', 'pwd']);
+    expect(scpArgs(c, 'a', 'b').slice(-2)).toEqual(['a', 'b']);
+    expect(sshArgs(c, 'pwd')).toContain('StrictHostKeyChecking=accept-new');
+  });
+
+  it('gives rsync the same ssh options and the resolved WordPress root', () => {
+    const c = connection();
+    expect(rsyncRemoteShell(c)).toBe(['ssh', ...c.sshOptions].join(' '));
+    expect(rsyncRemoteShell(c)).toContain('-o ServerAliveInterval=60');
+    expect(rsyncRemoteRoot(c)).toBe('deploy@35.1.2.3:/var/www/example.com/');
+  });
+
+  it('runs WP-CLI from the quoted WordPress root with the configured command', () => {
+    expect(
+      remoteWp(connection(), env({ wpCommand: 'php8.2 ~/wp' }), 'config get table_prefix'),
+    ).toBe(`cd '/var/www/example.com' && php8.2 ~/wp config get table_prefix`);
+  });
+
+  it('exports the database to a private mktemp file in home and cleans up on failure', () => {
+    const command = remoteDbExportCommand(connection(), env());
+    expect(command).toContain('mktemp "$HOME/.ssh-sync-XXXXXXXX"');
+    expect(command).toContain('--skip-plugins --skip-themes db export "$f"');
+    expect(command).toContain('rm -f -- "$f"');
+    expect(command).not.toContain('/tmp');
+  });
+
+  it('accepts only a mktemp path it created', () => {
+    expect(parseRemoteTempPath('/home/u/.ssh-sync-Ab12Cd34\n')).toBe('/home/u/.ssh-sync-Ab12Cd34');
+    expect(parseRemoteTempPath('banner\n/home/u/.ssh-sync-Ab12Cd34\n')).toBe(
+      '/home/u/.ssh-sync-Ab12Cd34',
+    );
+    expect(parseRemoteTempPath('/etc/passwd')).toBeNull();
+    expect(parseRemoteTempPath('/home/u/.ssh-sync-x; rm -rf /')).toBeNull();
+    expect(parseRemoteTempPath('')).toBeNull();
+  });
+
+  it('probes the folder, rsync and WP-CLI and reports the resolved root', () => {
+    const command = remoteProbeCommand(env({ remotePath: '~/public_html' }));
+    expect(command).toContain(`cd ~/'public_html'`);
+    expect(command).toContain('core is-installed');
+    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE=ok\n')).toEqual({
+      ok: true,
+      remoteRoot: '/home/u/public_html',
+    });
+    expect(parseRemoteProbe('SSHSYNC_PROBE=path\n')).toEqual({ ok: false, reason: 'path' });
+    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/x\nSSHSYNC_PROBE=wp\n')).toEqual({
+      ok: false,
+      reason: 'wp',
+    });
+    expect(parseRemoteProbe('Welcome!\n')).toEqual({ ok: false, reason: 'unexpected' });
+    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE=ok\n')).toEqual({
+      ok: false,
+      reason: 'unexpected',
+    });
+  });
+
+  it('lists connectable hosts from ssh_config, skipping patterns', () => {
+    const config = [
+      'Host *',
+      '  ServerAliveInterval 30',
+      'Host example.com example',
+      '  HostName 1.2.3.4',
+      'host staging-box',
+      'Host !bad *.internal',
+      'Match host x',
+    ].join('\n');
+    expect(parseSshConfigHosts(config)).toEqual(['example', 'example.com', 'staging-box']);
   });
 });
 
@@ -420,7 +637,7 @@ describe('buildPushRsyncArgs', () => {
     excludeArgs: ['--exclude=.git'],
     sshCommand: 'ssh -p 22',
     localPublicPath: '/x/app/public',
-    remoteHost: 'u@h',
+    remoteRoot: 'u@h:/var/www/x/',
   };
 
   it('full push keeps --delete', () => {
@@ -442,7 +659,7 @@ describe('buildPushRsyncArgs', () => {
 
   it('always ends with -e ssh, source, destination', () => {
     const args = buildPushRsyncArgs({ ...base, mode: 'all' });
-    expect(args.slice(-4)).toEqual(['-e', 'ssh -p 22', '/x/app/public/', 'u@h:~/public/']);
+    expect(args.slice(-4)).toEqual(['-e', 'ssh -p 22', '/x/app/public/', 'u@h:/var/www/x/']);
   });
 });
 
@@ -460,30 +677,9 @@ describe('isLikelyValidSqlDump', () => {
   });
 });
 
-describe('isTransientApiError', () => {
-  it('treats network errors (no response) as transient', () => {
-    expect(isTransientApiError({ code: 'ECONNABORTED' })).toBe(true);
-    expect(isTransientApiError(new Error('socket hang up'))).toBe(true);
-  });
-  it('treats 5xx and 429 as transient', () => {
-    expect(isTransientApiError({ response: { status: 500 } })).toBe(true);
-    expect(isTransientApiError({ response: { status: 503 } })).toBe(true);
-    expect(isTransientApiError({ response: { status: 429 } })).toBe(true);
-  });
-  it('does NOT retry 4xx (auth, not-found, bad request)', () => {
-    expect(isTransientApiError({ response: { status: 401 } })).toBe(false);
-    expect(isTransientApiError({ response: { status: 404 } })).toBe(false);
-    expect(isTransientApiError({ response: { status: 400 } })).toBe(false);
-  });
-  it('handles null/undefined safely', () => {
-    expect(isTransientApiError(null)).toBe(false);
-    expect(isTransientApiError(undefined)).toBe(false);
-  });
-});
-
 describe('downgradeMySQL8Collations', () => {
   // Local ships MySQL 8.x, whose default utf8mb4 collation is utf8mb4_0900_*.
-  // Kinsta runs MariaDB, which doesn't know those collations → `wp db import`
+  // MariaDB servers don't know those collations → `wp db import`
   // fails with "Unknown collation". Rewrite them to a widely-supported one.
   it('rewrites the MySQL 8 default collation in CREATE TABLE (COLLATE=)', () => {
     const sql =
@@ -520,7 +716,7 @@ describe('downgradeMySQL8Collations', () => {
 });
 
 describe('downgradeMariaDBCollations', () => {
-  // The mirror image of the push case: Kinsta's MariaDB 11.4+ defaults utf8mb4
+  // The mirror image of the push case: MariaDB 11.4+ defaults utf8mb4
   // to utf8mb4_uca1400_*, which Local's MySQL 8 doesn't know → the pull import
   // fails with "Unknown collation: 'utf8mb4_uca1400_ai_ci'".
   it('rewrites the MariaDB 11.4 default collation in CREATE TABLE (COLLATE=)', () => {
@@ -567,7 +763,6 @@ describe('EXCLUDE_PATTERNS', () => {
       '.htaccess',
       '*.sql',
       'node_modules/',
-      'wp-content/mu-plugins/kinsta-mu-plugins/',
       'local-xdebuginfo.php',
       // Host-specific persistent-cache drop-ins: object-cache.php points at the
       // host's Redis/Memcached, advanced-cache.php at its page cache. Syncing

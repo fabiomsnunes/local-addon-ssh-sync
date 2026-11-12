@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as os from 'os';
 
 import { MIN_DUMP_BYTES } from './constants';
-import { EnvironmentInfo, SiteInfo } from './types';
+import { ServerEnvironment, SiteInfo } from './types';
 
 // Security: Validate SSH/shell values to prevent command injection
 export function isValidHostname(host: string): boolean {
@@ -32,13 +32,68 @@ export function isValidDomain(domain: string): boolean {
   return !/[;&|`$"'\\<>(){}[\]!#*?]/.test(domain);
 }
 
-export function validateEnvironmentInfo(env: EnvironmentInfo): boolean {
-  return (
-    isValidHostname(env.sshHost) &&
-    isValidPort(env.sshPort) &&
-    isValidUsername(env.sshUser) &&
-    isValidDomain(env.remoteDomain)
-  );
+// Host aliases from ~/.ssh/config: what `Host` accepts minus wildcards
+export function isValidSshAlias(alias: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(alias);
+}
+
+// Absolute or ~-relative, conservative charset, no `..` segments: the path
+// reaches `cd` in a remote shell and must not wander outside what was typed.
+export function isValidRemotePath(remotePath: string): boolean {
+  if (!/^(~|~\/[A-Za-z0-9_./@+-]*|\/[A-Za-z0-9_./@+-]*)$/.test(remotePath)) return false;
+  return !remotePath.split('/').includes('..');
+}
+
+// A command typed by the user that runs in the remote shell as-is (WP-CLI
+// invocation, cache command): words, paths and `=` flags only, no shell syntax.
+export function isValidRemoteCommand(command: string): boolean {
+  return /^[A-Za-z0-9_./~=:@+-]+( [A-Za-z0-9_./~=:@+-]+)*$/.test(command);
+}
+
+export function isValidExcludePattern(pattern: string): boolean {
+  return /^[A-Za-z0-9_./*?[\]@+-]+$/.test(pattern);
+}
+
+// The host (and path, for WordPress in a subfolder) of the remote URL, as used
+// by search-replace. Null when the URL is not http(s) or carries shell syntax.
+export function remoteDomainFromUrl(remoteUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(remoteUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
+  if (url.search || url.hash || url.username || url.password) return null;
+  const domain = `${url.host}${url.pathname}`.replace(/\/+$/, '');
+  return isValidDomain(domain) ? domain : null;
+}
+
+// Returns the first problem found, or null when the environment is safe to use
+// in ssh arguments and remote commands.
+export function validateEnvironment(env: ServerEnvironment): string | null {
+  if (!env.label || !env.label.trim()) return 'Give the environment a name.';
+  if (env.sshAlias) {
+    if (!isValidSshAlias(env.sshAlias)) return 'The SSH alias contains invalid characters.';
+  } else {
+    if (!env.sshHost || !isValidHostname(env.sshHost)) return 'Enter a valid SSH host.';
+    if (!env.sshUser || !isValidUsername(env.sshUser)) return 'Enter a valid SSH user.';
+    if (env.sshPort && !isValidPort(env.sshPort)) return 'Enter a valid SSH port.';
+  }
+  if (env.auth !== 'key' && env.auth !== 'password') return 'Choose how to authenticate.';
+  if (!isValidRemotePath(env.remotePath)) {
+    return 'The WordPress folder must be an absolute path or start with ~/ (letters, digits, . _ - / only).';
+  }
+  if (!remoteDomainFromUrl(env.remoteUrl)) return 'Enter the site URL, e.g. https://example.com';
+  if (!isValidRemoteCommand(env.wpCommand))
+    return 'The WP-CLI command contains invalid characters.';
+  if (env.cacheCommand && !isValidRemoteCommand(env.cacheCommand)) {
+    return 'The cache command contains invalid characters.';
+  }
+  if ((env.extraExcludes || []).some((p) => !isValidExcludePattern(p))) {
+    return 'An exclude pattern contains invalid characters.';
+  }
+  return null;
 }
 
 // Expand ~ to home directory
@@ -51,16 +106,6 @@ export function expandPath(p: string): string {
 
 export function isLikelyValidSqlDump(sizeBytes: number): boolean {
   return Number.isFinite(sizeBytes) && sizeBytes >= MIN_DUMP_BYTES;
-}
-
-// Transient errors worth retrying: no response at all (network drop, DNS, timeout)
-// or a server-side/throttling status (>=500, 429). 4xx (auth, not-found) are not
-// retried — they won't fix themselves.
-export function isTransientApiError(error: any): boolean {
-  if (!error) return false;
-  const status = error.response?.status;
-  if (status === undefined) return true; // no response — network/timeout
-  return status >= 500 || status === 429;
 }
 
 // Resolve DB credentials from the site object (with Local's defaults)
@@ -98,7 +143,7 @@ export function setTablePrefix(wpConfig: string, prefix: string): string {
 }
 
 // Local ships MySQL 8.x, whose default utf8mb4 collation family is
-// `utf8mb4_0900_*` (ai_ci, as_cs, …). Kinsta runs MariaDB, which has no 0900
+// `utf8mb4_0900_*` (ai_ci, as_cs, …). Most hosts run MariaDB, which has no 0900
 // collations, so importing a Local dump fails with "Unknown collation
 // 'utf8mb4_0900_ai_ci'". Rewrite the whole family to utf8mb4_unicode_520_ci
 // (the same target WP Engine's Magic Sync uses) before pushing — it is
@@ -109,7 +154,7 @@ export function downgradeMySQL8Collations(sql: string): string {
   return sql.replace(/utf8mb4_0900_\w+/g, 'utf8mb4_unicode_520_ci');
 }
 
-// The mirror image for pull: Kinsta's MariaDB 11.4+ defaults utf8mb4 to the
+// The mirror image for pull: MariaDB 11.4+ defaults utf8mb4 to the
 // `utf8mb4_uca1400_*` family (ai_ci, as_cs, nopad_…), which Local's MySQL 8
 // doesn't know → the pull import fails with "Unknown collation:
 // 'utf8mb4_uca1400_ai_ci'". Rewrite the family to utf8mb4_unicode_520_ci (same

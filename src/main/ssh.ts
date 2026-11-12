@@ -1,0 +1,328 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { randomBytes } from 'crypto';
+import { spawn, spawnSync } from 'child_process';
+
+import { REMOTE_TEMP_PREFIX } from './constants';
+import { ActiveSync, RemoteConnection, RunOptions, ServerEnvironment } from './types';
+
+type RunCommand = (
+  sync: ActiveSync,
+  cmd: string,
+  args: string[],
+  opts?: RunOptions,
+) => Promise<{ code: number; stderr: string }>;
+
+// POSIX single-quoting: safe for any string inside a remote shell command.
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+// Quote a user-entered remote path for `cd`, keeping a leading ~ expandable.
+export function remoteCdPath(remotePath: string): string {
+  if (remotePath === '~') return '~';
+  if (remotePath.startsWith('~/')) return `~/${shellQuote(remotePath.slice(2))}`;
+  return shellQuote(remotePath);
+}
+
+export function sshTarget(environment: ServerEnvironment): string {
+  if (environment.sshAlias) return environment.sshAlias;
+  return `${environment.sshUser}@${environment.sshHost}`;
+}
+
+// Options shared by ssh, scp and rsync's `-e` remote shell. Port goes in as
+// `-o Port=` because scp spells the short flag differently (-P). With an alias,
+// ~/.ssh/config owns the port. No option value may contain whitespace: rsync
+// word-splits its -e string.
+export function baseSshOptions(environment: ServerEnvironment, controlPath?: string): string[] {
+  const options = [
+    '-o',
+    'StrictHostKeyChecking=accept-new',
+    // Keep the connection alive on long-running steps (big rsync, slow
+    // mysqldump/import) so an idle NAT/firewall can't drop the channel
+    // mid-sync: probe every 60s, give up only after 120 missed probes.
+    '-o',
+    'ServerAliveInterval=60',
+    '-o',
+    'ServerAliveCountMax=120',
+  ];
+  if (!environment.sshAlias && environment.sshPort) {
+    options.push('-o', `Port=${environment.sshPort}`);
+  }
+  if (controlPath) {
+    options.push('-o', `ControlPath=${controlPath}`, '-o', 'ControlMaster=no');
+  }
+  return options;
+}
+
+export function sshArgs(connection: RemoteConnection, remoteCommand: string): string[] {
+  return [...connection.sshOptions, connection.target, remoteCommand];
+}
+
+export function scpArgs(connection: RemoteConnection, from: string, to: string): string[] {
+  return [...connection.sshOptions, from, to];
+}
+
+export function remoteFileSpec(connection: RemoteConnection, remoteFile: string): string {
+  return `${connection.target}:${remoteFile}`;
+}
+
+// rsync's `-e` value (one string, word-split by rsync)
+export function rsyncRemoteShell(connection: RemoteConnection): string {
+  return ['ssh', ...connection.sshOptions].join(' ');
+}
+
+// rsync's remote side of the transfer: the WordPress root, trailing slash so
+// its contents (not the folder itself) are synced.
+export function rsyncRemoteRoot(connection: RemoteConnection): string {
+  return `${connection.target}:${connection.remoteRoot}/`;
+}
+
+export function inRemoteRoot(connection: RemoteConnection, command: string): string {
+  return `cd ${shellQuote(connection.remoteRoot)} && ${command}`;
+}
+
+export function remoteWp(
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  wpArgs: string,
+): string {
+  return inRemoteRoot(connection, `${environment.wpCommand} ${wpArgs}`);
+}
+
+// A private (0600) temp file in the SSH user's home: never a fixed name in a
+// shared /tmp, where other accounts on the server could read or pre-create it.
+export const REMOTE_MKTEMP = `mktemp "$HOME/${REMOTE_TEMP_PREFIX}XXXXXXXX"`;
+
+// Export the remote database to a fresh temp file and print its path. The file
+// is removed again if the export fails, so nothing is left behind.
+export function remoteDbExportCommand(
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+): string {
+  return [
+    `f=$(${REMOTE_MKTEMP}) || exit 1`,
+    `cd ${shellQuote(connection.remoteRoot)} && ${environment.wpCommand} --skip-plugins --skip-themes db export "$f" >/dev/null || { rm -f -- "$f"; exit 1; }`,
+    `printf '%s\\n' "$f"`,
+  ].join('; ');
+}
+
+const REMOTE_TEMP_FILE_RE = new RegExp(
+  `^/[A-Za-z0-9_./-]*/${REMOTE_TEMP_PREFIX.replace(/\./g, '\\.')}[A-Za-z0-9]+$`,
+);
+
+// The path a remote mktemp printed (last line of stdout), validated before it
+// is ever used in another remote command.
+export function parseRemoteTempPath(stdout: string): string | null {
+  const lines = stdout
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const last = lines[lines.length - 1] || '';
+  return REMOTE_TEMP_FILE_RE.test(last) ? last : null;
+}
+
+// ---------------------------------------------------------------------------
+// Connecting
+// ---------------------------------------------------------------------------
+
+// What the probe run right after connecting reports about the WordPress root.
+export type RemoteProbeResult =
+  | { ok: true; remoteRoot: string }
+  | { ok: false; reason: 'path' | 'rsync' | 'wp' | 'unexpected' };
+
+const PROBE_MARKER = 'SSHSYNC_PROBE';
+
+export function remoteProbeCommand(environment: ServerEnvironment): string {
+  return [
+    `cd ${remoteCdPath(environment.remotePath)} 2>/dev/null || { echo ${PROBE_MARKER}=path; exit 0; }`,
+    `printf '${PROBE_MARKER}_ROOT=%s\\n' "$(pwd -P)"`,
+    `command -v rsync >/dev/null 2>&1 || { echo ${PROBE_MARKER}=rsync; exit 0; }`,
+    `${environment.wpCommand} --skip-plugins --skip-themes core is-installed >/dev/null 2>&1 || { echo ${PROBE_MARKER}=wp; exit 0; }`,
+    `echo ${PROBE_MARKER}=ok`,
+  ].join('; ');
+}
+
+export function parseRemoteProbe(stdout: string): RemoteProbeResult {
+  const status = stdout.match(new RegExp(`${PROBE_MARKER}=(\\w+)`));
+  if (!status) return { ok: false, reason: 'unexpected' };
+  if (status[1] !== 'ok') {
+    const reason = status[1] as 'path' | 'rsync' | 'wp';
+    return ['path', 'rsync', 'wp'].includes(reason)
+      ? { ok: false, reason }
+      : { ok: false, reason: 'unexpected' };
+  }
+  const root = stdout.match(new RegExp(`${PROBE_MARKER}_ROOT=(.*)`));
+  const remoteRoot = root ? root[1].trim() : '';
+  // The root goes into rsync's remote spec and every remote command: refuse
+  // anything outside a conservative character set.
+  if (!/^\/[A-Za-z0-9_./@+-]*$/.test(remoteRoot)) return { ok: false, reason: 'unexpected' };
+  return { ok: true, remoteRoot };
+}
+
+export function describeProbeFailure(
+  reason: Exclude<RemoteProbeResult, { ok: true }>['reason'],
+  environment: ServerEnvironment,
+): string {
+  switch (reason) {
+    case 'path':
+      return `The WordPress folder "${environment.remotePath}" does not exist on the server.`;
+    case 'rsync':
+      return 'rsync is not installed on the server. SSH Sync needs it to transfer files.';
+    case 'wp':
+      return `WP-CLI failed in "${environment.remotePath}": check the WP-CLI command ("${environment.wpCommand}") and that WordPress is installed there.`;
+    default:
+      return 'The server answered in an unexpected way. Check the folder path and try again.';
+  }
+}
+
+let controlDir: string | null = null;
+
+// Short per-user folder for the multiplexing sockets: unix socket paths are
+// capped at ~104 bytes on macOS, which rules out Local's
+// "Application Support" data dir (and its space breaks rsync's -e splitting).
+function getControlDir(): string {
+  if (!controlDir || !fs.existsSync(controlDir)) {
+    controlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-'));
+  }
+  return controlDir;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function masterIsReady(target: string, controlPath: string): boolean {
+  const check = spawnSync('ssh', ['-o', `ControlPath=${controlPath}`, '-O', 'check', target], {
+    stdio: 'ignore',
+  });
+  return check.status === 0;
+}
+
+// The multiplexed master of one sync. ControlPersist=no overrides a user's own
+// `ControlPersist` (common in `Host *`), which would otherwise fork the master
+// into the background, out of our reach, and leave it running after the sync.
+export function masterSshArgs(environment: ServerEnvironment, controlPath: string): string[] {
+  return [
+    ...baseSshOptions(environment),
+    '-o',
+    `ControlPath=${controlPath}`,
+    '-o',
+    'ControlMaster=yes',
+    '-o',
+    'ControlPersist=no',
+    '-o',
+    'ConnectTimeout=15',
+    // Key auth never prompts: a missing key or unknown passphrase fails fast
+    // instead of hanging on a prompt nobody can see.
+    '-o',
+    'BatchMode=yes',
+    '-N',
+    sshTarget(environment),
+  ];
+}
+
+// Start the multiplexed master for this sync as our own child process, wait
+// until it accepts clients, then probe the WordPress root.
+export async function openRemoteConnection(
+  environment: ServerEnvironment,
+  runCommand: RunCommand,
+): Promise<RemoteConnection> {
+  const target = sshTarget(environment);
+  const controlPath = path.join(getControlDir(), `cm-${randomBytes(4).toString('hex')}`);
+  const masterArgs = masterSshArgs(environment, controlPath);
+
+  const master = spawn('ssh', masterArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  let masterStderr = '';
+  let masterExited = false;
+  master.stderr!.on('data', (d: Buffer) => {
+    masterStderr = (masterStderr + d.toString()).slice(-2000);
+  });
+  master.on('exit', () => {
+    masterExited = true;
+  });
+  master.on('error', (e) => {
+    masterExited = true;
+    masterStderr += e.message;
+  });
+
+  // Ask through the socket even when our child already exited: the master
+  // may still be alive elsewhere if ssh forked it after all.
+  const close = async (): Promise<void> => {
+    spawnSync('ssh', ['-o', `ControlPath=${controlPath}`, '-O', 'exit', target], {
+      stdio: 'ignore',
+    });
+    if (!masterExited) master.kill('SIGTERM');
+    try {
+      fs.unlinkSync(controlPath);
+    } catch {
+      // ssh normally removes its socket on exit
+    }
+  };
+
+  const deadline = Date.now() + 20_000;
+  while (!masterIsReady(target, controlPath)) {
+    if (masterExited || Date.now() > deadline) {
+      await close();
+      const detail = masterStderr.trim().split('\n').slice(-3).join('\n');
+      throw new Error(`Could not connect to ${target} over SSH.${detail ? `\n${detail}` : ''}`);
+    }
+    await sleep(200);
+  }
+
+  const connection: RemoteConnection = {
+    target,
+    sshOptions: baseSshOptions(environment, controlPath),
+    remoteRoot: '',
+    close,
+  };
+
+  let probeOutput = '';
+  try {
+    await runCommand(
+      { cancelled: false, child: null },
+      'ssh',
+      sshArgs(connection, remoteProbeCommand(environment)),
+      { onStdout: (chunk) => (probeOutput += chunk) },
+    );
+  } catch (e: any) {
+    await close();
+    throw new Error(`Connected to ${target}, but the server check failed: ${e.message}`);
+  }
+  const probe = parseRemoteProbe(probeOutput);
+  if (!probe.ok) {
+    await close();
+    throw new Error(describeProbeFailure(probe.reason, environment));
+  }
+  connection.remoteRoot = probe.remoteRoot;
+  return connection;
+}
+
+// Host aliases declared in an ssh_config file, without wildcard patterns or
+// negations (those are defaults, not connectable hosts).
+export function parseSshConfigHosts(config: string): string[] {
+  const hosts = new Set<string>();
+  for (const raw of config.split('\n')) {
+    const match = raw.trim().match(/^Host\s+(.+)$/i);
+    if (!match) continue;
+    for (const name of match[1].split(/\s+/)) {
+      if (!/[*?!]/.test(name) && isConnectableAlias(name)) hosts.add(name);
+    }
+  }
+  return [...hosts].sort((a, b) => a.localeCompare(b));
+}
+
+function isConnectableAlias(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name);
+}
+
+export function listSshConfigHosts(
+  configPath = path.join(os.homedir(), '.ssh', 'config'),
+): string[] {
+  try {
+    return parseSshConfigHosts(fs.readFileSync(configPath, 'utf8'));
+  } catch {
+    return [];
+  }
+}

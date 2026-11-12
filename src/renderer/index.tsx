@@ -1,9 +1,10 @@
 import * as React from 'react';
-import { AddonRendererContext, AddonSettingsItem } from '@getflywheel/local/renderer';
-import { KinstaDrawerHost } from './KinstaSitePanel';
-import KinstaPage from './KinstaPage';
-import KinstaStatusBadge from './KinstaStatusBadge';
-import KinstaSettings from './KinstaSettings';
+import { AddonRendererContext } from '@getflywheel/local/renderer';
+import { DrawerHost } from './DrawerHost';
+import SyncPage from './SyncPage';
+import StatusBadge from './StatusBadge';
+
+const PAGE_PATH = (siteId: string) => `/main/site-info/${siteId}/ssh-sync`;
 
 export default function (context: AddonRendererContext): void {
   const { hooks, events } = context;
@@ -18,10 +19,10 @@ export default function (context: AddonRendererContext): void {
   // (ReactRouter is typed Partial<…>; Local's loader always provides Route.)
   const Route = context.ReactRouter.Route!;
 
-  // Invisible host for the link/sync drawers.
+  // Invisible host for the environments/pull/push drawers.
   // Mounted in the tab nav so it exists on every site tab (renders no toolbar UI).
   hooks.addContent('SiteInfo_TabNav_Items', (site: any) => {
-    return <KinstaDrawerHost key="kinsta-drawer-host" site={site} />;
+    return <DrawerHost key="ssh-sync-drawer-host" site={site} />;
   });
 
   // The add-on's home: a dedicated page rendered inside Local's site-info
@@ -29,49 +30,34 @@ export default function (context: AddonRendererContext): void {
   hooks.addContent('routes[site-info]', ({ routeChildrenProps }: any) => {
     return (
       <Route
-        key="kinsta-route"
-        path="/main/site-info/:siteId/kinsta"
+        key="ssh-sync-route"
+        path="/main/site-info/:siteId/ssh-sync"
         render={() => (
-          <KinstaPage site={routeChildrenProps.site} siteStatus={routeChildrenProps.siteStatus} />
+          <SyncPage site={routeChildrenProps.site} siteStatus={routeChildrenProps.siteStatus} />
         )}
       />
     );
   });
 
-  // Status badge in the site view's top-right corner: link status at a
+  // Status badge in the site view's top-right corner: configured state at a
   // glance + live sync progress even when the drawer is closed.
   hooks.addContent('SiteInfo_Top_TopRight', (site: any) => {
     return (
-      <KinstaStatusBadge
-        key="kinsta-status-badge"
+      <StatusBadge
+        key="ssh-sync-status-badge"
         site={site}
-        onOpen={() => events.send('goToRoute', `/main/site-info/${site.id}/kinsta`)}
+        onOpen={() => events.send('goToRoute', PAGE_PATH(site.id))}
       />
     );
   });
 
-  // Native More-menu item navigating to the Kinsta page (the documented
+  // Native More-menu item navigating to the SSH Sync page (the documented
   // pattern — More holds navigation to add-on tabs, not raw actions).
   hooks.addFilter('siteInfoMoreMenu', (menu: any[], site: any) => {
     menu.push({
-      label: 'Kinsta Sync',
-      click: () => events.send('goToRoute', `/main/site-info/${site.id}/kinsta`),
+      label: 'SSH Sync',
+      click: () => events.send('goToRoute', PAGE_PATH(site.id)),
     });
     return menu;
   });
-
-  // Add Kinsta settings to preferences
-  hooks.addFilter(
-    'preferencesMenuItems',
-    (items: AddonSettingsItem[]) => {
-      const kinstaItem: AddonSettingsItem = {
-        path: 'kinsta',
-        displayName: 'Kinsta Sync',
-        sections: KinstaSettings,
-        onApply: () => {},
-      };
-      return [...items, kinstaItem];
-    },
-    10,
-  );
 }

@@ -16,21 +16,21 @@ import {
   FileAddedIcon,
   FileRightArrowIcon,
 } from './localComponents';
-import KinstaIcon from './KinstaIcon';
+import SyncIcon from './SyncIcon';
 import {
-  buildEnvInfo,
-  envLabel as getEnvLabel,
+  environmentTarget,
+  remoteDomainOf,
   visibleDiffRows,
   summarizeSelection,
   buildPushFileSelection,
 } from './pushHelpers';
 import { STATUS, tint } from './colors';
-import { Environment, EnvironmentInfo, SyncProgress } from './types';
+import { ServerEnvironment, SiteProfile, SyncProgress } from './types';
 
 const { ipcRenderer, shell } = window.require('electron');
 
 const RSYNC_TROUBLESHOOTING_URL =
-  'https://github.com/landerss0n/local-addon-kinsta#troubleshooting';
+  'https://github.com/fabiomsnunes/local-addon-ssh-sync#troubleshooting';
 
 // Mirrors PushDiffRow in src/main/index.ts (+ renderer-side selection state)
 interface DiffRow {
@@ -46,11 +46,8 @@ interface Props {
   isOpen: boolean;
   onClose: () => void;
   site: any;
-  siteLink: {
-    kinstaSiteId: string;
-    kinstaSiteName: string;
-    kinstaSiteSlug?: string;
-  };
+  profile: SiteProfile;
+  initialEnvironmentId: string;
 }
 
 type SyncMode = 'newer' | 'all';
@@ -61,7 +58,7 @@ const FULLSCREEN_CSS = `
 /* Stretch FlyModal's themed content box to fill its (native) overlay.
    NOTE: className is APPENDED to FlyModal's own class — never pass
    overlayClassName, that would REPLACE their positioned backdrop. */
-.KinstaPushModalContent {
+.SshSyncPushModalContent {
   width: 100% !important;
   height: 100% !important;
   max-width: none !important;
@@ -75,14 +72,14 @@ const FULLSCREEN_CSS = `
 }
 /* FlyModal styles its direct child div with max-height:93vh + padding:60px
    (the ".FlyModal > div" rule) — undo that for the fullscreen layout */
-.KinstaPushModalContent > div {
+.SshSyncPushModalContent > div {
   flex: 1;
   min-height: 0;
   max-height: none !important;
   padding: 0 !important;
   overflow-y: hidden !important;
 }
-.KinstaPushCell {
+.SshSyncPushCell {
   display: flex;
   align-items: center;
   padding: 0 10px;
@@ -91,7 +88,7 @@ const FULLSCREEN_CSS = `
   white-space: nowrap;
   font-size: 13px;
 }
-.KinstaPushRow {
+.SshSyncPushRow {
   border-bottom: 1px solid rgba(127, 127, 127, 0.12);
 }
 `;
@@ -110,13 +107,15 @@ const formatMtime = (ms?: number): string => {
   );
 };
 
-const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) => {
-  const [environments, setEnvironments] = useState<Environment[]>([]);
-  const [selectedEnvId, setSelectedEnvId] = useState<string>('');
+const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEnvironmentId }) => {
+  const environments: ServerEnvironment[] = profile.environments;
+  const [selectedEnvId, setSelectedEnvId] = useState<string>(initialEnvironmentId);
   const [mode, setMode] = useState<SyncMode>('newer');
-  const [includeDatabase, setIncludeDatabase] = useState(true);
+  const [includeDatabase, setIncludeDatabase] = useState(false);
   const [includeUploads, setIncludeUploads] = useState(false);
-  const [kinstaBackup, setKinstaBackup] = useState(true);
+  // Replacing a production database needs Migration mode + the domain typed back
+  const [migrationMode, setMigrationMode] = useState(false);
+  const [confirmDomain, setConfirmDomain] = useState('');
 
   const [rows, setRows] = useState<DiffRow[]>([]);
   // starts true: a preview always runs on open, and the push button must stay
@@ -163,14 +162,23 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   }, []);
 
   useEffect(() => {
-    if (isOpen && siteLink) {
+    if (isOpen) {
       setIsComplete(false);
       setError(null);
       setCompletionWarning(null);
-      loadEnvironments();
+      setSelectedEnvId(initialEnvironmentId);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load environments only when the screen opens / site link changes
-  }, [isOpen, siteLink]);
+  }, [isOpen, initialEnvironmentId]);
+
+  // Database pushes start unticked on production and never carry a previous
+  // environment's confirmation over to another one
+  useEffect(() => {
+    const selected = environments.find((e) => e.id === selectedEnvId);
+    setIncludeDatabase(!!selected && !selected.isProduction);
+    setMigrationMode(false);
+    setConfirmDomain('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only when the selected environment changes
+  }, [selectedEnvId]);
 
   // Live progress (events carry siteId + mode so other sites/pulls are ignored)
   useEffect(() => {
@@ -183,30 +191,11 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
         setIsPushing(false);
       }
     };
-    ipcRenderer.on('kinsta:syncProgress', handler);
+    ipcRenderer.on('sshsync:syncProgress', handler);
     return () => {
-      ipcRenderer.removeListener('kinsta:syncProgress', handler);
+      ipcRenderer.removeListener('sshsync:syncProgress', handler);
     };
   }, [site.id]);
-
-  const loadEnvironments = async () => {
-    const result = await ipcRenderer.invoke('kinsta:getEnvironments', siteLink.kinstaSiteId);
-    if (result.success && result.environments.length > 0) {
-      const envs = [...result.environments].sort(
-        (a: Environment, b: Environment) => Number(b.is_premium) - Number(a.is_premium),
-      );
-      setEnvironments(envs);
-      setSelectedEnvId(envs[0].id);
-    } else if (!result.success) {
-      setError(result.error || 'Could not load environments');
-    }
-  };
-
-  const getEnvInfo = (envId: string): EnvironmentInfo | null =>
-    buildEnvInfo(
-      environments.find((e) => e.id === envId),
-      siteLink,
-    ) as EnvironmentInfo | null;
 
   // Re-run the dry-run preview whenever its inputs change (debounced)
   useEffect(() => {
@@ -215,12 +204,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
     setPreviewLoading(true);
     setError(null);
     const timer = setTimeout(async () => {
-      const envInfo = getEnvInfo(selectedEnvId);
-      if (!envInfo) {
-        setPreviewLoading(false);
-        return;
-      }
-      const result = await ipcRenderer.invoke('kinsta:pushPreview', site.id, site, envInfo, {
+      const result = await ipcRenderer.invoke('sshsync:pushPreview', site.id, site, selectedEnvId, {
         mode,
         includeUploads,
       });
@@ -238,16 +222,20 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
     return () => {
       clearTimeout(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- isPushing/isComplete are read-only guards and getEnvInfo is read inside the timeout — re-run only on the listed preview inputs
-  }, [isOpen, selectedEnvId, mode, includeUploads, environments]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- isPushing/isComplete are read-only guards — re-run only on the listed preview inputs
+  }, [isOpen, selectedEnvId, mode, includeUploads]);
 
   const selectedRows = rows.filter((r) => r.selected);
   const { addUpdateCount, deleteCount, totalBytes, allSelected, someSelected } =
     summarizeSelection(rows);
 
   const env = environments.find((e) => e.id === selectedEnvId);
-  const isLive = !!env?.is_premium;
-  const envLabel = getEnvLabel(env);
+  const isLive = !!env?.isProduction;
+  const envLabel = env?.label || '';
+  const remoteDomain = remoteDomainOf(env?.remoteUrl);
+  const needsMigrationConfirm = isLive && includeDatabase;
+  const migrationConfirmed =
+    !needsMigrationConfirm || (migrationMode && confirmDomain.trim() === remoteDomain);
 
   const toggleAll = (checked: boolean) => {
     setRows((rs) => rs.map((r) => ({ ...r, selected: checked })));
@@ -260,8 +248,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
 
   const executePush = async () => {
     setShowConfirmModal(false);
-    const envInfo = getEnvInfo(selectedEnvId);
-    if (!envInfo) {
+    if (!env) {
       setError('Please select an environment');
       return;
     }
@@ -270,11 +257,11 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
     setError(null);
     setProgress({ stage: 'starting', progress: 0, message: 'Starting push...' });
 
-    const result = await ipcRenderer.invoke('kinsta:push', site.id, site, envInfo, {
+    const result = await ipcRenderer.invoke('sshsync:push', site.id, site, env.id, {
       includeDatabase,
       includeUploads,
-      kinstaBackup,
       mode,
+      ...(needsMigrationConfirm ? { migrationMode, confirmDomain: confirmDomain.trim() } : {}),
       // Full selection + "all modified" = plain rsync --delete fast path ({});
       // otherwise an explicit files/deletions list (selective, never blind-deletes)
       ...buildPushFileSelection(rows, mode),
@@ -296,7 +283,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
 
   const handleCancel = async () => {
     setIsCancelling(true);
-    await ipcRenderer.invoke('kinsta:cancelSync', site.id);
+    await ipcRenderer.invoke('sshsync:cancelSync', site.id);
   };
 
   const handleRequestClose = () => {
@@ -374,9 +361,9 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
     <FlyModal
       isOpen={isOpen}
       onRequestClose={handleRequestClose}
-      contentLabel={`Push ${site.name || ''} to Kinsta`}
+      contentLabel={`Push ${site.name || ''} to ${envLabel || 'server'}`}
       shouldCloseOnOverlayClick={false}
-      className="KinstaPushModalContent"
+      className="SshSyncPushModalContent"
       hideCloseIcon /* we render the native Close inside the header instead */
     >
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -396,7 +383,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
         >
           <ConnectPushIcon aria-hidden />
           <Title tag="h1" size="s" style={{ margin: 0 }}>
-            Push {site.name || site.domain} to Kinsta
+            Push {site.name || site.domain} to {envLabel || 'server'}
           </Title>
           <div
             style={{
@@ -437,7 +424,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                   borderRadius: '8px',
                 }}
               >
-                <KinstaIcon size={28} />
+                <SyncIcon size={28} />
                 <span
                   style={{
                     fontWeight: 600,
@@ -445,8 +432,9 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
                   }}
+                  title={environmentTarget(env)}
                 >
-                  {siteLink.kinstaSiteName}
+                  {remoteDomain || environmentTarget(env)}
                 </span>
               </div>
             </div>
@@ -458,7 +446,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                 options={Object.fromEntries(
                   environments.map((e) => [
                     e.id,
-                    e.is_premium ? 'Production' : `Staging (${e.display_name})`,
+                    e.isProduction ? `${e.label} (production)` : e.label,
                   ]),
                 )}
                 onChange={(value: string) => setSelectedEnvId(value)}
@@ -489,13 +477,54 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                 disabled={isPushing}
                 onChange={(checked: boolean) => setIncludeUploads(checked)}
               />
-              <Checkbox
-                label="Create Kinsta backup first"
-                checked={kinstaBackup}
-                disabled={isPushing}
-                onChange={(checked: boolean) => setKinstaBackup(checked)}
-              />
             </div>
+
+            {needsMigrationConfirm && !isPushing && !isComplete && (
+              <div
+                style={{
+                  padding: '14px',
+                  borderRadius: '8px',
+                  border: `1px solid ${tint(STATUS.danger, 0.4)}`,
+                  backgroundColor: tint(STATUS.danger, 0.08),
+                  fontSize: '12px',
+                  lineHeight: 1.5,
+                }}
+              >
+                <p style={{ margin: '0 0 10px', color: STATUS.danger }}>
+                  The production database will be replaced. Orders, form entries and users created
+                  there since your last pull are lost. Only for a migration.
+                </p>
+                <Checkbox
+                  label="Migration mode"
+                  checked={migrationMode}
+                  onChange={(checked: boolean) => setMigrationMode(checked)}
+                />
+                {migrationMode && (
+                  <label style={{ display: 'block', marginTop: '10px' }}>
+                    <span style={{ display: 'block', marginBottom: '6px' }}>
+                      Type <strong>{remoteDomain}</strong> to confirm
+                    </span>
+                    <input
+                      type="text"
+                      value={confirmDomain}
+                      onChange={(e) => setConfirmDomain(e.target.value)}
+                      spellCheck={false}
+                      autoComplete="off"
+                      style={{
+                        width: '100%',
+                        boxSizing: 'border-box',
+                        padding: '6px 8px',
+                        borderRadius: '4px',
+                        border,
+                        background: 'transparent',
+                        color: 'inherit',
+                        fontFamily: 'monospace',
+                      }}
+                    />
+                  </label>
+                )}
+              </div>
+            )}
 
             <div style={{ textAlign: 'center', marginTop: 'auto' }}>
               {isLive && !isPushing && !isComplete && (
@@ -509,10 +538,11 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                   isPushing ||
                   previewLoading ||
                   isComplete ||
+                  !migrationConfirmed ||
                   (selectedRows.length === 0 && !includeDatabase)
                 }
               >
-                Push to Kinsta
+                Push to {envLabel || 'server'}
               </PrimaryButton>
             </div>
           </div>
@@ -708,7 +738,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                       opacity: 0.65,
                     }}
                   >
-                    <Spinner /> Comparing with Kinsta…
+                    <Spinner /> Comparing with {envLabel || 'the server'}…
                   </div>
                 ) : error ? (
                   <div
@@ -743,11 +773,11 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                       { key: 'path', value: 'Filename', flex: '1 1 auto' },
                       { key: 'localMtime', value: 'Local', flex: '0 0 160px' },
                       { key: 'op', value: '→', flex: '0 0 44px' },
-                      { key: 'remote', value: `Kinsta (${envLabel})`, flex: '0 0 150px' },
+                      { key: 'remote', value: envLabel || 'Server', flex: '0 0 150px' },
                     ]}
                     rowKeyPropName="path"
-                    cellClassName="KinstaPushCell"
-                    rowClassName="KinstaPushRow"
+                    cellClassName="SshSyncPushCell"
+                    rowClassName="SshSyncPushRow"
                     cellRenderer={cellRenderer}
                     rowHeightSize="s"
                     rowHeaderHeightSize="m"
@@ -772,21 +802,18 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
       >
         <div style={{ padding: '30px', maxWidth: '420px', textAlign: 'center' }}>
           <Title size="l" style={{ marginBottom: '12px' }}>
-            Push to {isLive ? 'Production' : 'Staging'}?
+            Push to {envLabel}?
           </Title>
           <p style={{ color: '#888', fontSize: '14px', marginBottom: '10px', lineHeight: 1.5 }}>
             {addUpdateCount > 0 && <>{addUpdateCount} file(s) will be synced. </>}
             {deleteCount > 0 && (
               <strong style={{ color: STATUS.danger }}>
-                {deleteCount} item(s) will be deleted on Kinsta — folders with their entire
+                {deleteCount} item(s) will be deleted on {envLabel} — folders with their entire
                 contents.{' '}
               </strong>
             )}
             {includeDatabase && (
-              <>
-                The {isLive ? 'production' : 'staging'} database will be replaced with your local
-                database.{' '}
-              </>
+              <>The {envLabel} database will be replaced with your local database. </>
             )}
           </p>
           {isLive && (
@@ -802,7 +829,7 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                 isLive ? { backgroundColor: STATUS.danger, borderColor: STATUS.danger } : undefined
               }
             >
-              Yes, Push to {isLive ? 'Production' : 'Staging'}
+              Yes, Push to {envLabel}
             </PrimaryButton>
           </div>
         </div>
@@ -811,4 +838,4 @@ const KinstaPushScreen: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   );
 };
 
-export default KinstaPushScreen;
+export default PushScreen;

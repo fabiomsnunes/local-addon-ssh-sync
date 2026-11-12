@@ -1,7 +1,15 @@
 import * as path from 'path';
 
-import { EXCLUDE_PATTERNS, REMOTE_PUSH_BACKUP } from './constants';
-import { CancelledError, ActiveSync, SyncParams, SyncResult, PullPushDeps } from './types';
+import { EXCLUDE_PATTERNS, PRODUCT_NAME } from './constants';
+import {
+  CancelledError,
+  ActiveSync,
+  RemoteConnection,
+  ServerEnvironment,
+  SyncParams,
+  SyncResult,
+  PullPushDeps,
+} from './types';
 import {
   getDbCredentials,
   isLikelyValidSqlDump,
@@ -12,22 +20,113 @@ import {
   normalizeTablePrefix,
   downgradeMySQL8Collations,
   downgradeMariaDBCollations,
+  validateEnvironment,
+  remoteDomainFromUrl,
 } from './validators';
 import {
-  sshArgs,
   describePartialTransfer,
   rsyncProgressArgs,
   makeRsyncProgressParser,
   safeRemoteRelPath,
   buildPushRsyncArgs,
-  rsyncSshContext,
+  localPublicPath,
 } from './rsync';
+import {
+  sshArgs,
+  scpArgs,
+  shellQuote,
+  remoteFileSpec,
+  rsyncRemoteShell,
+  rsyncRemoteRoot,
+  inRemoteRoot,
+  remoteWp,
+  remoteDbExportCommand,
+  parseRemoteTempPath,
+  REMOTE_MKTEMP,
+} from './ssh';
+import { prunePushBackups } from './config';
 
 // ---------------------------------------------------------------------------
 // Pull / push orchestration (extracted from the IPC handlers so it can be
 // integration-tested with injected seams — no real processes, network, or
 // Local installation lookups). The handlers are thin wrappers around these.
 // ---------------------------------------------------------------------------
+
+type Run = PullPushDeps['runCommand'];
+
+// Cleanup must run even after a cancel, and the cancelled sync rejects every command
+const freshSync = (): ActiveSync => ({ cancelled: false, child: null });
+
+function excludeArgsFor(environment: ServerEnvironment, includeUploads?: boolean): string[] {
+  const patterns = [...EXCLUDE_PATTERNS, ...(environment.extraExcludes || [])];
+  if (!includeUploads) patterns.push('wp-content/uploads/');
+  return patterns.map((p) => `--exclude=${p}`);
+}
+
+async function removeRemoteFile(
+  run: Run,
+  connection: RemoteConnection,
+  remoteFile: string,
+): Promise<void> {
+  try {
+    await run(freshSync(), 'ssh', sshArgs(connection, `rm -f -- ${shellQuote(remoteFile)}`));
+  } catch (e: any) {
+    console.warn(`[SSH Sync] Could not remove ${remoteFile} on the server:`, e?.message);
+  }
+}
+
+// Export the remote database and download it to `localFile`. The remote copy
+// is always removed, whether or not the download worked.
+async function downloadRemoteDatabase(
+  run: Run,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  localFile: string,
+): Promise<void> {
+  let exportOutput = '';
+  await run(sync, 'ssh', sshArgs(connection, remoteDbExportCommand(connection, environment)), {
+    onStdout: (chunk) => (exportOutput += chunk),
+  });
+  const remoteFile = parseRemoteTempPath(exportOutput);
+  if (!remoteFile) {
+    throw new Error('The server did not report where it exported the database.');
+  }
+  try {
+    await run(sync, 'scp', scpArgs(connection, remoteFileSpec(connection, remoteFile), localFile));
+  } finally {
+    await removeRemoteFile(run, connection, remoteFile);
+  }
+}
+
+// Upload a local dump to a fresh private temp file on the server, import it,
+// and remove it again.
+async function importDatabaseOnServer(
+  run: Run,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  localFile: string,
+): Promise<void> {
+  let mktempOutput = '';
+  await run(sync, 'ssh', sshArgs(connection, REMOTE_MKTEMP), {
+    onStdout: (chunk) => (mktempOutput += chunk),
+  });
+  const remoteFile = parseRemoteTempPath(mktempOutput);
+  if (!remoteFile) {
+    throw new Error('Could not create a temporary file on the server.');
+  }
+  try {
+    await run(sync, 'scp', scpArgs(connection, localFile, remoteFileSpec(connection, remoteFile)));
+    await run(
+      sync,
+      'ssh',
+      sshArgs(connection, remoteWp(connection, environment, `db import ${shellQuote(remoteFile)}`)),
+    );
+  } finally {
+    await removeRemoteFile(run, connection, remoteFile);
+  }
+}
 
 // Sage/Acorn (and other Laravel-based) themes COMPILE their Blade views and
 // CACHE their config/services/packages with ABSOLUTE paths baked in. Pulled
@@ -88,26 +187,21 @@ export function clearCompiledFrameworkCaches(
 }
 
 export async function executePull(params: SyncParams, deps: PullPushDeps): Promise<SyncResult> {
-  const { localSiteId, site, envInfo, options } = params;
+  const { localSiteId, site, environment, options } = params;
   const dfs = deps.fs;
   const run = deps.runCommand;
   const sendProgress = deps.sendProgress;
 
-  const links = deps.loadSiteLinks();
-  const link = links[localSiteId];
-
-  if (!link) {
-    return { success: false, error: 'Site not linked to Kinsta' };
-  }
   if (deps.activeSyncs.has(localSiteId)) {
     return { success: false, error: 'A sync is already running for this site' };
   }
 
-  // Security: Validate environment data before using in shell commands
-  if (!deps.validateEnvironmentInfo(envInfo)) {
-    console.error('[Kinsta] Pull validation failed for:', envInfo);
-    return { success: false, error: 'Invalid environment configuration.' };
+  // Security: every value below reaches ssh arguments or a remote shell
+  const environmentError = validateEnvironment(environment);
+  if (environmentError) {
+    return { success: false, error: environmentError };
   }
+  const remoteDomain = remoteDomainFromUrl(environment.remoteUrl)!;
 
   // Pre-flight: database sync needs the local site running (MySQL socket)
   const socketPath = deps.getMysqlSocketPath(localSiteId);
@@ -124,11 +218,18 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   const sync: ActiveSync = { cancelled: false, child: null };
   deps.activeSyncs.set(localSiteId, sync);
 
-  // Fail-fast: confirm the remote is reachable before any backup/transfer
-  const pullPreflightError = await deps.preflightRemote(envInfo);
-  if (pullPreflightError) {
+  // Fail-fast: connect and verify the WordPress root before any backup/transfer
+  let connection: RemoteConnection;
+  try {
+    sendProgress({
+      stage: 'connect',
+      progress: 2,
+      message: `Connecting to ${environment.label}...`,
+    });
+    connection = await deps.connectRemote(environment);
+  } catch (e: any) {
     deps.activeSyncs.delete(localSiteId);
-    return { success: false, error: pullPreflightError };
+    return { success: false, error: e.message };
   }
 
   const startedAt = Date.now();
@@ -138,20 +239,15 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   let dbImportStarted = false;
   const localBackupPath = path.join(deps.tempDir, `${localSiteId}-pre-pull-backup.sql`);
   const db = getDbCredentials(site);
+  const publicPath = localPublicPath(site);
 
   try {
-    // Derive paths/SSH target inside the try so a throw here can't leak the
-    // activeSyncs registration — the finally always unregisters.
-    const { localPublicPath, sshCommandForRsync, remoteHost } = rsyncSshContext(site, envInfo);
-
-    // Build exclude args (no shell — patterns are passed verbatim)
-    const excludeArgs = EXCLUDE_PATTERNS.map((p) => `--exclude=${p}`);
-    if (!options.includeUploads) {
-      excludeArgs.push('--exclude=wp-content/uploads/');
-    }
-
     // 1. Sync files (live progress, flags adapted to the rsync version)
-    sendProgress({ stage: 'files', progress: 5, message: 'Syncing files from Kinsta...' });
+    sendProgress({
+      stage: 'files',
+      progress: 5,
+      message: `Syncing files from ${environment.label}...`,
+    });
 
     const rsync = deps.resolveRsync();
     const rsyncResult = await run(
@@ -160,11 +256,11 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       [
         '-az',
         ...rsyncProgressArgs(rsync),
-        ...excludeArgs,
+        ...excludeArgsFor(environment, options.includeUploads),
         '-e',
-        sshCommandForRsync,
-        `${remoteHost}:~/public/`,
-        `${localPublicPath}/`,
+        rsyncRemoteShell(connection),
+        rsyncRemoteRoot(connection),
+        `${publicPath}/`,
       ],
       {
         // 23/24 = partial transfer (e.g. legacy non-UTF-8 filenames that
@@ -177,7 +273,7 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
           sendProgress({
             stage: 'files',
             progress: overall,
-            message: `Syncing files from Kinsta... ${pct}%`,
+            message: `Syncing files from ${environment.label}... ${pct}%`,
           });
         }),
       },
@@ -193,7 +289,6 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
     // 2. Database (if requested)
     if (options.includeDatabase) {
       const dbDumpPath = path.join(deps.tempDir, `${localSiteId}-remote.sql`);
-      const remoteDbPath = '/tmp/kinsta-local-export.sql';
 
       const mysqlBin = deps.findServiceBinary(['mysql-', 'mariadb-'], 'mysql');
       const mysqldumpBin = deps.findServiceBinary(['mysql-', 'mariadb-'], 'mysqldump');
@@ -228,29 +323,12 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       sendProgress({
         stage: 'database',
         progress: 58,
-        message: 'Exporting database from Kinsta...',
+        message: `Exporting database from ${environment.label}...`,
       });
-      await run(
-        sync,
-        'ssh',
-        sshArgs(
-          envInfo,
-          `cd ~/public && wp --skip-plugins --skip-themes db export ${remoteDbPath}`,
-        ),
-      );
+      await downloadRemoteDatabase(run, sync, connection, environment, dbDumpPath);
 
-      sendProgress({ stage: 'database', progress: 65, message: 'Downloading database...' });
-      await run(sync, 'scp', [
-        '-P',
-        envInfo.sshPort,
-        '-o',
-        'StrictHostKeyChecking=accept-new',
-        `${remoteHost}:${remoteDbPath}`,
-        dbDumpPath,
-      ]);
-
-      // Kinsta's MariaDB 11.4+ → the dump carries utf8mb4_uca1400_* collations
-      // that Local's MySQL 8 can't import ("Unknown collation"). Rewrite them in
+      // MariaDB 11.4+ → the dump carries utf8mb4_uca1400_* collations that
+      // Local's MySQL 8 can't import ("Unknown collation"). Rewrite them in
       // place before the import. No-op for dumps without them.
       // latin1 maps every byte 1:1, so binary column data (e.g. Wordfence's
       // varbinary IPs) survives the round trip; 'utf8' turned invalid
@@ -281,7 +359,6 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       });
 
       // Search-replace URLs using WP-CLI (handles serialized data correctly)
-      const remoteDomain = envInfo.remoteDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
       const localDomain = site.domain;
 
       const phpBin = deps.findServiceBinary(['php-'], 'php');
@@ -291,11 +368,11 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       const mysqlBinDir = path.dirname(mysqlBin);
 
       // Temporarily modify wp-config.php to include socket path
-      const wpConfigPath = path.join(localPublicPath, 'wp-config.php');
-      const wpConfigBackupPath = wpConfigPath + '.kinsta-sync-bak';
+      const wpConfigPath = path.join(publicPath, 'wp-config.php');
+      const wpConfigBackupPath = wpConfigPath + '.ssh-sync-bak';
       let wpConfigBackup: string | null = null;
       // The local table prefix, read before the temporary socket edit, so we can
-      // reconcile it against production's after the import (see below).
+      // reconcile it against the server's after the import (see below).
       let localPrefix: string | null = null;
 
       try {
@@ -324,7 +401,7 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
           const [from, to] = pairs[i];
           sendProgress({
             stage: 'search-replace',
-            progress: 84 + i * 4,
+            progress: 84 + i * 3,
             message: `Replacing ${from} → ${to}`,
           });
           await run(
@@ -339,7 +416,7 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
               '--skip-columns=guid',
               '--skip-plugins',
               '--skip-themes',
-              `--path=${localPublicPath}`,
+              `--path=${publicPath}`,
               '--allow-root',
               ...networkArgs,
             ],
@@ -363,11 +440,11 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
             dfs.unlinkSync(wpConfigBackupPath);
           }
         } catch (e: any) {
-          console.warn('[Kinsta] wp-config.php restore failed (non-fatal):', e?.message);
+          console.warn('[SSH Sync] wp-config.php restore failed (non-fatal):', e?.message);
         }
       }
 
-      // Reconcile the table prefix. `wp db export` carries production's table
+      // Reconcile the table prefix. `wp db export` carries the server's table
       // prefix; if it differs from the local wp-config's, WordPress keeps reading
       // the old (now empty) local tables and the freshly-pulled data is invisible.
       // We adopt the remote prefix locally and drop the stale old-prefix tables.
@@ -378,18 +455,23 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
         let remotePrefix: string | null = null;
         try {
           let remotePrefixRaw = '';
-          await run(sync, 'ssh', sshArgs(envInfo, 'cd ~/public && wp config get table_prefix'), {
-            onStdout: (c) => {
-              remotePrefixRaw += c;
+          await run(
+            sync,
+            'ssh',
+            sshArgs(connection, remoteWp(connection, environment, 'config get table_prefix')),
+            {
+              onStdout: (c) => {
+                remotePrefixRaw += c;
+              },
             },
-          });
+          );
           remotePrefix = normalizeTablePrefix(remotePrefixRaw);
         } catch (e: any) {
           // A prefix-lookup blip must not roll back a successful import — skip
           // reconciliation instead. (Still honor an in-flight cancellation.)
           if (e instanceof CancelledError) throw e;
           console.warn(
-            '[Kinsta] Could not read remote table prefix; skipping prefix reconciliation:',
+            '[SSH Sync] Could not read remote table prefix; skipping prefix reconciliation:',
             e?.message,
           );
         }
@@ -459,33 +541,32 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       // Cleanup (keep the pre-pull backup until the next pull)
       try {
         dfs.unlinkSync(dbDumpPath);
-        await run(sync, 'ssh', sshArgs(envInfo, `rm -f ${remoteDbPath}`));
       } catch (e: any) {
-        console.warn('[Kinsta] Temp dump cleanup failed (non-fatal):', e?.message);
+        console.warn('[SSH Sync] Temp dump cleanup failed (non-fatal):', e?.message);
       }
     }
 
-    // Clear compiled Sage/Acorn caches that bake absolute production paths (see
+    // Clear compiled Sage/Acorn caches that bake absolute server paths (see
     // clearCompiledFrameworkCaches). Runs for every pull — the compiled views
     // are files, synced regardless of the database option — and is best-effort:
     // a failure here must never fail an otherwise-complete pull.
     try {
-      const cleared = clearCompiledFrameworkCaches(localPublicPath, dfs);
+      const cleared = clearCompiledFrameworkCaches(publicPath, dfs);
       if (cleared > 0) {
-        console.log(`[Kinsta] Cleared ${cleared} compiled theme cache file(s) after pull`);
+        console.log(`[SSH Sync] Cleared ${cleared} compiled theme cache file(s) after pull`);
       }
     } catch (e: any) {
-      console.warn('[Kinsta] Framework cache clear failed (non-fatal):', e?.message);
+      console.warn('[SSH Sync] Framework cache clear failed (non-fatal):', e?.message);
     }
 
-    deps.recordSync(localSiteId, 'pull', envInfo.envType, Date.now() - startedAt);
+    deps.recordSync(localSiteId, 'pull', environment, Date.now() - startedAt);
     sendProgress({
       stage: 'done',
       progress: 100,
       message: fileWarning ? `Pull complete — ${fileWarning}` : 'Pull complete!',
     });
     deps.notify(
-      'Kinsta Sync',
+      PRODUCT_NAME,
       fileWarning
         ? `Pull complete for ${site.name || site.domain} — some files were skipped (legacy filenames)`
         : `Pull complete for ${site.name || site.domain}`,
@@ -504,21 +585,20 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
         });
         const mysqlBinRestore = deps.findServiceBinary(['mysql-', 'mariadb-'], 'mysql');
         if (!mysqlBinRestore) throw new Error('mysql binary not found');
-        // Fresh ActiveSync — the cancelled one rejects every command
         await run(
-          { cancelled: false, child: null },
+          freshSync(),
           mysqlBinRestore,
           [`-u${db.user}`, `-p${db.password}`, `--socket=${socketPath}`, db.database],
           { stdinFile: localBackupPath },
         );
         deps.notify(
-          'Kinsta Sync',
+          PRODUCT_NAME,
           `Pull aborted — local database for ${site.name || site.domain} was restored from backup`,
         );
       } catch (restoreError: any) {
-        console.error('[Kinsta] DB restore after aborted pull failed:', restoreError.message);
+        console.error('[SSH Sync] DB restore after aborted pull failed:', restoreError.message);
         deps.notify(
-          'Kinsta Sync',
+          PRODUCT_NAME,
           `Pull aborted — automatic DB restore FAILED. Backup: ${localBackupPath}`,
         );
       }
@@ -528,37 +608,53 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
       return { success: false, cancelled: true, error: 'Sync cancelled' };
     }
     sendProgress({ stage: 'error', progress: 0, message: error.message });
-    deps.notify('Kinsta Sync', `Pull failed for ${site.name || site.domain}`);
+    deps.notify(PRODUCT_NAME, `Pull failed for ${site.name || site.domain}`);
     return { success: false, error: error.message };
   } finally {
     deps.activeSyncs.delete(localSiteId);
+    await connection.close();
   }
 }
 
+// Replacing a Production database wipes everything written there since the
+// last pull (orders, form entries, users). Only an explicit Migration mode with
+// the domain typed back allows it; enforced here, not only in the UI.
+export function productionDatabaseGuard(
+  environment: ServerEnvironment,
+  options: SyncParams['options'],
+): string | null {
+  if (!options.includeDatabase || !environment.isProduction) return null;
+  const remoteDomain = remoteDomainFromUrl(environment.remoteUrl);
+  if (options.migrationMode && remoteDomain && options.confirmDomain === remoteDomain) {
+    return null;
+  }
+  return `Pushing the database to ${environment.label} (production) replaces everything on the live site. Turn on Migration mode and type ${remoteDomain || 'the domain'} to confirm.`;
+}
+
 export async function executePush(params: SyncParams, deps: PullPushDeps): Promise<SyncResult> {
-  const { localSiteId, site, envInfo, options } = params;
+  const { localSiteId, site, environment, options } = params;
   const dfs = deps.fs;
   const run = deps.runCommand;
   const sendProgress = deps.sendProgress;
 
-  const links = deps.loadSiteLinks();
-  const link = links[localSiteId];
-
-  if (!link) {
-    return { success: false, error: 'Site not linked to Kinsta' };
-  }
   if (deps.activeSyncs.has(localSiteId)) {
     return { success: false, error: 'A sync is already running for this site' };
   }
 
-  // Security: Validate environment data before using in shell commands
-  if (!deps.validateEnvironmentInfo(envInfo)) {
-    return { success: false, error: 'Invalid environment configuration.' };
+  // Security: every value below reaches ssh arguments or a remote shell
+  const environmentError = validateEnvironment(environment);
+  if (environmentError) {
+    return { success: false, error: environmentError };
+  }
+  const remoteDomain = remoteDomainFromUrl(environment.remoteUrl)!;
+
+  const guardError = productionDatabaseGuard(environment, options);
+  if (guardError) {
+    return { success: false, error: guardError };
   }
 
-  // The local domain is interpolated into the remote search-replace shell
-  // command (unlike pull, which passes it as a spawn arg) — reject shell-unsafe
-  // domains before any destructive step.
+  // The local domain goes into the remote search-replace command — reject
+  // shell-unsafe domains before any destructive step.
   if (options.includeDatabase && !isValidDomain(site.domain)) {
     return { success: false, error: 'Invalid local site domain.' };
   }
@@ -578,11 +674,17 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   const sync: ActiveSync = { cancelled: false, child: null };
   deps.activeSyncs.set(localSiteId, sync);
 
-  // Fail-fast: confirm the remote is reachable before any backup/transfer
-  const pushPreflightError = await deps.preflightRemote(envInfo);
-  if (pushPreflightError) {
+  let connection: RemoteConnection;
+  try {
+    sendProgress({
+      stage: 'connect',
+      progress: 1,
+      message: `Connecting to ${environment.label}...`,
+    });
+    connection = await deps.connectRemote(environment);
+  } catch (e: any) {
     deps.activeSyncs.delete(localSiteId);
-    return { success: false, error: pushPreflightError };
+    return { success: false, error: e.message };
   }
 
   // A leftover preview dry-run must not compete with the real push
@@ -591,79 +693,41 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   const startedAt = Date.now();
 
   // Once the remote DB import starts, a cancel/crash leaves the remote
-  // database half-written — lets the catch block restore the remote backup.
+  // database half-written — lets the catch block restore the backup.
   let remoteImportStarted = false;
+  let remoteBackupPath: string | null = null;
+  const publicPath = localPublicPath(site);
 
   try {
-    // Derive paths/SSH target inside the try so a throw here can't leak the
-    // activeSyncs registration — the finally always unregisters.
-    const { localPublicPath, sshCommandForRsync, remoteHost } = rsyncSshContext(site, envInfo);
-
-    const excludeArgs = EXCLUDE_PATTERNS.map((p) => `--exclude=${p}`);
-    if (!options.includeUploads) {
-      excludeArgs.push('--exclude=wp-content/uploads/');
-    }
-
-    // 1a. Native Kinsta backup (files + DB) — restorable from MyKinsta.
-    //     If enabled and it fails, abort the push: the user opted into the
-    //     safety net, so don't proceed without it.
-    if (options.kinstaBackup !== false) {
-      const apiKeyForBackup = deps.getApiKey();
-      if (apiKeyForBackup) {
-        sendProgress({ stage: 'backup', progress: 2, message: 'Creating Kinsta backup...' });
-        try {
-          const client = deps.getKinstaClient(apiKeyForBackup);
-          const created = await deps.createKinstaBackup(client, envInfo.envId, sync, (msg) => {
-            sendProgress({ stage: 'backup', progress: 3, message: msg });
-          });
-          if (created) {
-            sendProgress({ stage: 'backup', progress: 5, message: 'Kinsta backup created!' });
-          } else {
-            sendProgress({
-              stage: 'backup',
-              progress: 5,
-              message: 'All 5 manual backup slots are yours — skipping Kinsta backup',
-            });
-            deps.notify(
-              'Kinsta Sync',
-              'Kinsta backup skipped: all 5 manual slots hold your own backups',
-            );
-          }
-        } catch (backupError: any) {
-          if (backupError instanceof CancelledError) throw backupError;
-          throw new Error(`Kinsta backup failed — push aborted: ${backupError.message}`);
-        }
-      }
-    }
-
-    // 1b. Safety net for the automatic rollback: export the remote database.
-    //     Stored in the remote home dir (outside ~/public, not web-accessible).
-    sendProgress({ stage: 'backup', progress: 6, message: 'Backing up remote database...' });
-    await run(
-      sync,
-      'ssh',
-      sshArgs(
-        envInfo,
-        `cd ~/public && wp --skip-plugins --skip-themes db export ${REMOTE_PUSH_BACKUP}`,
-      ),
-    );
-
-    // Verify the remote backup is non-empty before touching anything — the
-    // automatic rollback restores from this exact file. Abort if it looks bad
-    // (server data is still untouched at this point).
-    let remoteBackupWc = '';
-    await run(sync, 'ssh', sshArgs(envInfo, `wc -c < ${REMOTE_PUSH_BACKUP}`), {
-      onStdout: (c: string) => (remoteBackupWc += c),
-    });
-    const remoteBackupSize = parseInt(remoteBackupWc.trim(), 10) || 0;
-    if (!isLikelyValidSqlDump(remoteBackupSize)) {
-      throw new Error(
-        `Remote database backup looks invalid (${remoteBackupSize} bytes) — aborting the push before any change. Your server was not modified.`,
+    // 1. Safety net for the automatic rollback: the remote database, exported
+    //    and kept on this machine (nothing is left on the server).
+    if (options.includeDatabase) {
+      sendProgress({ stage: 'backup', progress: 3, message: 'Backing up remote database...' });
+      dfs.mkdirSync(deps.backupsDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      remoteBackupPath = path.join(
+        deps.backupsDir,
+        `${localSiteId}-${environment.id}-${stamp}.sql`,
       );
+      await downloadRemoteDatabase(run, sync, connection, environment, remoteBackupPath);
+
+      // The rollback restores from this exact file: abort if it looks bad
+      // (the server is still untouched at this point).
+      const backupSize = dfs.existsSync(remoteBackupPath) ? dfs.statSync(remoteBackupPath).size : 0;
+      if (!isLikelyValidSqlDump(backupSize)) {
+        throw new Error(
+          `Remote database backup looks invalid (${backupSize} bytes) — aborting the push before any change. Your server was not modified.`,
+        );
+      }
+      prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
     }
 
     // 2. Sync files (live progress, flags adapted to the rsync version)
-    sendProgress({ stage: 'files', progress: 8, message: 'Syncing files to Kinsta...' });
+    sendProgress({
+      stage: 'files',
+      progress: 8,
+      message: `Syncing files to ${environment.label}...`,
+    });
 
     const rsync = deps.resolveRsync();
 
@@ -673,7 +737,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     if (selective) {
       filesFromPath = path.join(deps.tempDir, `${localSiteId}-push-files.txt`);
       deps.ensureConfigDir();
-      // One path per line, relative to the rsync source root (~/public)
+      // One path per line, relative to the rsync source root
       dfs.writeFileSync(filesFromPath, (options.files || []).join('\n') + '\n');
     }
 
@@ -685,10 +749,10 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           rsync.bin,
           buildPushRsyncArgs({
             rsync,
-            excludeArgs,
-            sshCommand: sshCommandForRsync,
-            localPublicPath,
-            remoteHost,
+            excludeArgs: excludeArgsFor(environment, options.includeUploads),
+            sshCommand: rsyncRemoteShell(connection),
+            localPublicPath: publicPath,
+            remoteRoot: rsyncRemoteRoot(connection),
             mode: options.mode,
             filesFromPath,
           }),
@@ -701,7 +765,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
               sendProgress({
                 stage: 'files',
                 progress: overall,
-                message: `Syncing files to Kinsta... ${pct}%`,
+                message: `Syncing files to ${environment.label}... ${pct}%`,
               });
             }),
           },
@@ -718,12 +782,12 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
 
     // Checked deletions from the preview — executed explicitly (instead of
     // rsync --delete) so unchecked deletions survive. Paths are strictly
-    // validated + single-quoted (the one place a path enters a shell string).
+    // validated + single-quoted.
     if (options.deletions && options.deletions.length > 0) {
       sendProgress({
         stage: 'files',
         progress: 48,
-        message: `Deleting ${options.deletions.length} file(s) on Kinsta...`,
+        message: `Deleting ${options.deletions.length} file(s) on ${environment.label}...`,
       });
       const quoted = options.deletions.map((p) => {
         const q = safeRemoteRelPath(p);
@@ -732,7 +796,11 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       });
       for (let i = 0; i < quoted.length; i += 200) {
         const batch = quoted.slice(i, i + 200);
-        await run(sync, 'ssh', sshArgs(envInfo, `cd ~/public && rm -rf -- ${batch.join(' ')}`));
+        await run(
+          sync,
+          'ssh',
+          sshArgs(connection, inRemoteRoot(connection, `rm -rf -- ${batch.join(' ')}`)),
+        );
       }
     }
 
@@ -746,7 +814,6 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     if (options.includeDatabase) {
       const db = getDbCredentials(site);
       const dbDumpPath = path.join(deps.tempDir, `${localSiteId}-local.sql`);
-      const remoteDbPath = '/tmp/kinsta-local-import.sql';
 
       const mysqldumpBin = deps.findServiceBinary(['mysql-', 'mariadb-'], 'mysqldump');
       if (!mysqldumpBin) {
@@ -762,7 +829,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       );
 
       // Local ships MySQL 8.x → the dump carries utf8mb4_0900_* collations that
-      // Kinsta's MariaDB can't import ("Unknown collation"). Rewrite them in
+      // MariaDB servers can't import ("Unknown collation"). Rewrite them in
       // place before upload so the import succeeds. No-op for dumps without them.
       // latin1 maps every byte 1:1, so binary column data (e.g. Wordfence's
       // varbinary IPs) survives the round trip; 'utf8' turned invalid
@@ -773,23 +840,19 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         'latin1',
       );
 
-      sendProgress({ stage: 'database', progress: 65, message: 'Uploading database...' });
-      await run(sync, 'scp', [
-        '-P',
-        envInfo.sshPort,
-        '-o',
-        'StrictHostKeyChecking=accept-new',
-        dbDumpPath,
-        `${remoteHost}:${remoteDbPath}`,
-      ]);
-
       sendProgress({
         stage: 'database',
-        progress: 75,
-        message: 'Importing database on Kinsta...',
+        progress: 70,
+        message: `Importing database on ${environment.label}...`,
       });
       remoteImportStarted = true;
-      await run(sync, 'ssh', sshArgs(envInfo, `cd ~/public && wp db import ${remoteDbPath}`));
+      try {
+        await importDatabaseOnServer(run, sync, connection, environment, dbDumpPath);
+      } finally {
+        try {
+          dfs.unlinkSync(dbDumpPath);
+        } catch {}
+      }
 
       sendProgress({
         stage: 'search-replace',
@@ -797,31 +860,33 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         message: 'Running search-replace...',
       });
 
-      const localDomain = site.domain;
-      const remoteDomain = envInfo.remoteDomain.replace(/^https?:\/\//, '').replace(/\/$/, '');
       // MultiSite.No is the empty string, so truthiness is the correct check
       const networkFlag = site.multiSite ? ' --network' : '';
-      const pairs = searchReplacePairs(localDomain, remoteDomain);
+      const pairs = searchReplacePairs(site.domain, remoteDomain);
 
       for (let i = 0; i < pairs.length; i++) {
         const [from, to] = pairs[i];
         sendProgress({
           stage: 'search-replace',
-          progress: 84 + i * 4,
+          progress: 84 + i * 3,
           message: `Replacing ${from} → ${to}`,
         });
         await run(
           sync,
           'ssh',
           sshArgs(
-            envInfo,
-            `cd ~/public && wp search-replace '${from}' '${to}' --all-tables --skip-columns=guid${networkFlag}`,
+            connection,
+            remoteWp(
+              connection,
+              environment,
+              `search-replace ${shellQuote(from)} ${shellQuote(to)} --all-tables --skip-columns=guid${networkFlag}`,
+            ),
           ),
         );
       }
 
       // Reconcile the remote table prefix (symmetric with the pull side). The
-      // pushed dump carries the LOCAL prefix; if Kinsta's wp-config uses a
+      // pushed dump carries the LOCAL prefix; if the server's wp-config uses a
       // different one, WordPress there keeps reading the old (now stale) tables
       // and the pushed data is invisible. Read both authoritatively and, if they
       // differ, repoint the remote wp-config. Non-fatal: a failed lookup/set must
@@ -829,17 +894,17 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       // we surface a notice instead, mirroring the pull-side handling.
       try {
         const localPrefix = normalizeTablePrefix(
-          parseTablePrefix(dfs.readFileSync(path.join(localPublicPath, 'wp-config.php'), 'utf8')) ||
-            '',
+          parseTablePrefix(dfs.readFileSync(path.join(publicPath, 'wp-config.php'), 'utf8')) || '',
         );
-        // Only look up the remote prefix if we know the local one to compare it
-        // against — otherwise the round trip is wasted.
         let remotePrefix: string | null = null;
         if (localPrefix) {
           let remotePrefixRaw = '';
-          await run(sync, 'ssh', sshArgs(envInfo, 'cd ~/public && wp config get table_prefix'), {
-            onStdout: (c: string) => (remotePrefixRaw += c),
-          });
+          await run(
+            sync,
+            'ssh',
+            sshArgs(connection, remoteWp(connection, environment, 'config get table_prefix')),
+            { onStdout: (c: string) => (remotePrefixRaw += c) },
+          );
           remotePrefix = normalizeTablePrefix(remotePrefixRaw);
         }
         if (localPrefix && remotePrefix && localPrefix !== remotePrefix) {
@@ -852,89 +917,83 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
             sync,
             'ssh',
             sshArgs(
-              envInfo,
-              `cd ~/public && wp --skip-plugins --skip-themes config set table_prefix '${localPrefix}'`,
+              connection,
+              remoteWp(
+                connection,
+                environment,
+                `--skip-plugins --skip-themes config set table_prefix ${shellQuote(localPrefix)}`,
+              ),
             ),
           );
         }
       } catch (prefixError: any) {
         if (prefixError instanceof CancelledError) throw prefixError;
         console.warn(
-          '[Kinsta] Remote table-prefix reconcile failed (non-fatal):',
+          '[SSH Sync] Remote table-prefix reconcile failed (non-fatal):',
           prefixError?.message,
         );
         deps.notify(
-          'Kinsta Sync',
-          'Push done, but updating the remote table prefix failed — if the site looks empty, set $table_prefix in wp-config.php on Kinsta to match Local.',
+          PRODUCT_NAME,
+          `Push done, but updating the remote table prefix failed — if the site looks empty, set $table_prefix in wp-config.php on ${environment.label} to match Local.`,
         );
-      }
-
-      // Clear all Kinsta caches (page + edge + CDN) via API
-      const apiKeyForCache = deps.getApiKey();
-      if (apiKeyForCache) {
-        sendProgress({ stage: 'cache', progress: 97, message: 'Clearing Kinsta caches...' });
-        try {
-          const client = deps.getKinstaClient(apiKeyForCache);
-          await deps.clearKinstaCaches(client, envInfo.envId, envInfo.cdnCacheId);
-        } catch (e: any) {
-          // Non-fatal, but at least leave a trace this time
-          console.error(
-            '[Kinsta] Cache clear after push failed:',
-            e.response?.data?.message || e.message,
-          );
-        }
-      }
-
-      // Cleanup
-      try {
-        dfs.unlinkSync(dbDumpPath);
-        await run(sync, 'ssh', sshArgs(envInfo, `rm -f ${remoteDbPath}`));
-      } catch (e: any) {
-        console.warn('[Kinsta] Temp dump cleanup failed (non-fatal):', e?.message);
       }
     }
 
-    deps.recordSync(localSiteId, 'push', envInfo.envType, Date.now() - startedAt);
+    // 4. The environment's cache command (non-fatal)
+    if (environment.cacheCommand) {
+      sendProgress({ stage: 'cache', progress: 98, message: 'Clearing cache...' });
+      try {
+        await run(
+          sync,
+          'ssh',
+          sshArgs(connection, inRemoteRoot(connection, environment.cacheCommand)),
+        );
+      } catch (e: any) {
+        if (e instanceof CancelledError) throw e;
+        console.warn('[SSH Sync] Cache command after push failed:', e?.message);
+        deps.notify(
+          PRODUCT_NAME,
+          `Push done, but the cache command failed on ${environment.label}.`,
+        );
+      }
+    }
+
+    deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
     sendProgress({
       stage: 'done',
       progress: 100,
       message: fileWarning ? `Push complete — ${fileWarning}` : 'Push complete!',
     });
     deps.notify(
-      'Kinsta Sync',
+      PRODUCT_NAME,
       fileWarning
         ? `Push complete for ${site.name || site.domain} — some files were skipped (legacy filenames)`
         : `Push complete for ${site.name || site.domain}`,
     );
     return { success: true, warning: fileWarning };
   } catch (error: any) {
-    // The remote DB was (partially) overwritten — restore the backup we
-    // exported on the remote before the import.
-    if (remoteImportStarted) {
+    // The remote DB was (partially) overwritten — restore the backup exported
+    // right before the import.
+    if (remoteImportStarted && remoteBackupPath) {
       try {
         sendProgress({
           stage: 'database',
           progress: 0,
           message: 'Restoring remote database from backup...',
         });
-        // Fresh ActiveSync — the cancelled one rejects every command
-        await run(
-          { cancelled: false, child: null },
-          'ssh',
-          sshArgs(envInfo, `cd ~/public && wp db import ${REMOTE_PUSH_BACKUP}`),
-        );
+        await importDatabaseOnServer(run, freshSync(), connection, environment, remoteBackupPath);
         deps.notify(
-          'Kinsta Sync',
+          PRODUCT_NAME,
           `Push aborted — remote database for ${site.name || site.domain} was restored from backup`,
         );
       } catch (restoreError: any) {
         console.error(
-          '[Kinsta] Remote DB restore after aborted push failed:',
+          '[SSH Sync] Remote DB restore after aborted push failed:',
           restoreError.message,
         );
         deps.notify(
-          'Kinsta Sync',
-          `Push aborted — automatic remote DB restore FAILED. Backup on server: ${REMOTE_PUSH_BACKUP}`,
+          PRODUCT_NAME,
+          `Push aborted — automatic remote DB restore FAILED. Backup on this computer: ${remoteBackupPath}`,
         );
       }
     }
@@ -943,9 +1002,10 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       return { success: false, cancelled: true, error: 'Sync cancelled' };
     }
     sendProgress({ stage: 'error', progress: 0, message: error.message });
-    deps.notify('Kinsta Sync', `Push failed for ${site.name || site.domain}`);
+    deps.notify(PRODUCT_NAME, `Push failed for ${site.name || site.domain}`);
     return { success: false, error: error.message };
   } finally {
     deps.activeSyncs.delete(localSiteId);
+    await connection.close();
   }
 }
