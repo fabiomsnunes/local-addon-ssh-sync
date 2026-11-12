@@ -24,13 +24,19 @@ Commands:
                                     last pull (usually deleted on the server since)
   undo <site> <env>               Show what undoing the last push would restore
       --yes                         Undo it (files, and the database if it was pushed)
+      --production                  Required to undo on a production environment
+
+  --accept-site-url=<url>         Go ahead although WordPress in that folder reports
+                                  another site (e.g. a staging cloned from production)
 
 <site> is the Local site name, id or domain; <env> the environment name or id.
 Local must be running.`;
 
 export function parseArgs(argv: string[]): CliRequest | { error: string } {
   const [command, site, environment, ...rest] = argv;
-  const flags = new Set(rest.filter((a) => a.startsWith('--')));
+  const acceptArg = rest.find((a) => a.startsWith('--accept-site-url='));
+  const acceptSiteUrl = acceptArg ? acceptArg.slice('--accept-site-url='.length) : undefined;
+  const flags = new Set(rest.filter((a) => a.startsWith('--') && a !== acceptArg));
   const unknown = [...flags].filter(
     (f) =>
       ![
@@ -59,6 +65,7 @@ export function parseArgs(argv: string[]): CliRequest | { error: string } {
       includeDatabase: !flags.has('--no-db'),
       includeUploads: flags.has('--uploads'),
       makeSafe: !flags.has('--unsafe'),
+      acceptSiteUrl,
     };
   }
   if (command === 'push') {
@@ -73,9 +80,19 @@ export function parseArgs(argv: string[]): CliRequest | { error: string } {
       yes: flags.has('--yes'),
       production: flags.has('--production'),
       includeStale: flags.has('--include-stale'),
+      acceptSiteUrl,
     };
   }
-  if (command === 'undo') return { command, site, environment, yes: flags.has('--yes') };
+  if (command === 'undo') {
+    return {
+      command,
+      site,
+      environment,
+      yes: flags.has('--yes'),
+      production: flags.has('--production'),
+      acceptSiteUrl,
+    };
+  }
   return { error: `Unknown command ${command}\n\n${USAGE}` };
 }
 

@@ -56,6 +56,10 @@ export const EXCLUDE_PATTERNS = [
   'wp-content/.litespeed_conf.php',
   // Local-generated helper file in the webroot — never part of the WP site
   'local-xdebuginfo.php',
+  // Our own files in the SSH user's home (temp dumps, push backups, lock,
+  // last-push marker), in case the WordPress root is that home: never synced,
+  // never deleted by a full push
+  '/.ssh-sync-*',
   // Our own safety mu-plugin for pulled copies (safeClone.ts): never pushed
   'wp-content/mu-plugins/ssh-sync-local-safety.php',
 ];

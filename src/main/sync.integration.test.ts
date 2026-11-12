@@ -74,6 +74,13 @@ function describeStep(cmd: string, args: string[], opts: RunOptions): string {
       return 'remote-move-to-backup';
     if (remote.includes('.ssh-sync-files-') && remote.includes('rm -rf'))
       return 'remote-files-backup-remove';
+    if (remote.includes('.ssh-sync-last-push-') && remote.includes('cat '))
+      return 'remote-read-marker';
+    if (remote.includes('.ssh-sync-last-push-') && remote.includes('rm -f'))
+      return 'remote-clear-marker';
+    if (remote.includes('.ssh-sync-last-push-')) return 'remote-write-marker';
+    if (remote.includes('SSHSYNC_CHANGED')) return 'remote-changed-since';
+    if (remote.includes('while IFS= read -r p; do rm -f')) return 'remote-remove-added';
     if (remote.includes('rmdir --')) return 'remote-rmdir';
     if (remote.includes('eval-file -')) return 'remote-restore-neutralized';
     if (remote.includes('rm -rf')) return 'remote-rm';
@@ -110,6 +117,10 @@ interface FakeRunnerConfig {
   remoteFilesBackupExists?: boolean;
   // rsync --out-format lines the push prints (new files and folders)
   pushOutFormat?: string;
+  // What the server's last-push marker holds
+  marker?: string;
+  // Paths the undo check reports as changed on the server
+  changedSince?: string[];
 }
 
 interface RecordedCall {
@@ -117,6 +128,8 @@ interface RecordedCall {
   cmd: string;
   args: string[];
   opts: RunOptions;
+  // What stdinFile held at call time (path lists, scripts)
+  stdin?: string;
 }
 
 function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
@@ -135,7 +148,13 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     if (sync.cancelled) throw new CancelledError();
     let step = describeStep(cmd, args, opts);
     if (step === 'remote-db-import' && lastUploadWasBackup) step = 'remote-db-restore';
-    calls.push({ step, cmd, args, opts });
+    let stdin: string | undefined;
+    if (opts.stdinFile) {
+      try {
+        stdin = fs.readFileSync(opts.stdinFile, 'utf8');
+      } catch {}
+    }
+    calls.push({ step, cmd, args, opts, stdin });
 
     // Capture what scp would upload (source is the second-to-last arg), or
     // materialize a download (destination is the last arg, a local path).
@@ -181,6 +200,10 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     }
     if (step === 'remote-lock' && opts.onStdout) {
       opts.onStdout(cfg.lockBusy ? `SSHSYNC_LOCK=busy ${cfg.lockBusy}\n` : 'SSHSYNC_LOCK=ok\n');
+    }
+    if (step === 'remote-read-marker' && opts.onStdout) opts.onStdout(cfg.marker ?? '');
+    if (step === 'remote-changed-since' && opts.onStdout) {
+      opts.onStdout((cfg.changedSince ?? []).map((p) => `SSHSYNC_CHANGED|${p}\n`).join(''));
     }
     if (step === 'remote-files-backup-check' && opts.onStdout) {
       opts.onStdout(cfg.remoteFilesBackupExists ? 'yes\n' : '');
@@ -282,13 +305,15 @@ const environment = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironm
   ...overrides,
 });
 
-const fakeConnection = (): RemoteConnection => ({
+const fakeConnection = (overrides: Partial<RemoteConnection> = {}): RemoteConnection => ({
   target: 'deploy@35.1.2.3',
   sshOptions: ['-o', 'Port=12345', '-o', 'ControlPath=/tmp/cm-test', '-o', 'ControlMaster=no'],
   remoteRoot: '/var/www/example.com',
   remoteHome: '/home/deploy',
   siteUrl: 'https://example.com',
+  siteUrlMismatch: null,
   close: vi.fn(async () => {}),
+  ...overrides,
 });
 
 const site = (): SiteInfo => ({
@@ -935,8 +960,11 @@ describe('executePush', () => {
     const labels = steps(runner.calls);
     expect(labels).not.toContain('rsync');
     expect(labels).not.toContain('remote-db-export');
-    // Not our lock: never released by us
-    expect(labels).not.toContain('remote-unlock');
+    // The release only removes a lock holding our token: never someone else's
+    const release = runner.calls.find((c) => c.step === 'remote-unlock')!;
+    expect(release.args[release.args.length - 1]).toMatch(
+      /\/token 2>\/dev\/null\)" = '[0-9a-f]{32}' \] && rm -rf/,
+    );
   });
 
   it('takes the lock first and always releases it', async () => {
@@ -994,12 +1022,10 @@ describe('executePush', () => {
     // the downloaded backup goes back up, the added file is removed
     const restoreUpload = runner.calls.filter((c) => c.step === 'rsync').pop()!;
     expect(restoreUpload.args[restoreUpload.args.length - 2]).toMatch(/-files\/$/);
-    const removal = runner.calls.find(
-      (c) =>
-        c.step === 'remote-cleanup' &&
-        String(c.args[c.args.length - 1]).includes('wp-content/new.php'),
-    );
-    expect(removal).toBeDefined();
+    const removal = runner.calls.find((c) => c.step === 'remote-remove-added');
+    expect(removal?.stdin).toBe('wp-content/new.php\n');
+    // The aborted push left no manifest: it is not the push to undo
+    expect(latestPushManifest(backupsDir, SITE_ID, 'staging')).toBeNull();
     expect(notify).toHaveBeenCalledWith('SSH Sync', expect.stringContaining('were put back'));
   });
 
@@ -1024,6 +1050,65 @@ describe('executePush', () => {
     expect(labels).toContain('remote-unlock');
     // The manifest is gone: the same push cannot be undone twice
     expect(latestPushManifest(backupsDir, SITE_ID, 'staging')).toBeNull();
+  });
+
+  it('undo refuses when a newer push was made, from any computer', async () => {
+    const { deps } = makeDeps({ runner: makeFakeRunner() });
+    await executePush(pushParams({ includeDatabase: false }), deps);
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({
+        runner: makeFakeRunner({ marker: '2099-01-01T00-00-00-000Z other-mac (x) since y\n' }),
+      }).deps,
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/A newer push to Staging was made by other-mac/);
+  });
+
+  it('undo refuses and lists files changed on the server since the push', async () => {
+    const { deps } = makeDeps({
+      runner: makeFakeRunner({ pushOutFormat: 'SSHSYNC|<f+++++++++|wp-content/x.php\n' }),
+    });
+    fs.mkdirSync(path.join(sitePath, 'app', 'public', 'wp-content'), { recursive: true });
+    fs.writeFileSync(path.join(sitePath, 'app', 'public', 'wp-content', 'x.php'), 'x');
+    await executePush(pushParams({ includeDatabase: false, deletions: ['gone.php'] }), deps);
+    const manifest = latestPushManifest(backupsDir, SITE_ID, 'staging')!.manifest as any;
+    expect(manifest.pushed['wp-content/x.php'][0]).toBe(1);
+    expect(manifest.deleted).toEqual(['gone.php']);
+
+    const undoRunner = makeFakeRunner({ changedSince: ['wp-content/x.php'] });
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: undoRunner }).deps,
+    );
+    expect(result).toMatchObject({ success: false, conflicts: ['wp-content/x.php'] });
+    const check = undoRunner.calls.find((c) => c.step === 'remote-changed-since')!;
+    expect(check.stdin).toContain(' wp-content/x.php');
+    expect(check.stdin).toContain('- - gone.php');
+    expect(steps(undoRunner.calls)).not.toContain('rsync'); // nothing restored
+  });
+
+  it('refuses a folder that reports another site unless its URL is typed back', async () => {
+    const mismatched = () =>
+      fakeConnection({
+        siteUrl: 'https://live.example.com',
+        siteUrlMismatch:
+          'The WordPress in "/var/www/example.com" says it is https://live.example.com, not https://example.com.',
+      });
+    const refused = makeDeps({ connectRemote: async () => mismatched() });
+    const result = await executePush(pushParams(), refused.deps);
+    expect(result).toMatchObject({
+      success: false,
+      siteUrlMismatch: { actual: 'https://live.example.com', expected: 'https://example.com' },
+    });
+    expect(refused.calls).toHaveLength(0);
+
+    const accepted = makeDeps({ connectRemote: async () => mismatched() });
+    const ok = await executePush(
+      pushParams({ includeDatabase: true, acceptSiteUrl: 'https://live.example.com' }),
+      accepted.deps,
+    );
+    expect(ok.success).toBe(true);
   });
 
   it('undo of a production database push needs the typed domain', async () => {

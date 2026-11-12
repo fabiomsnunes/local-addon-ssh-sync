@@ -16,6 +16,10 @@ export interface PushManifest {
   // Null when the local rsync cannot report them (openrsync).
   added: string[] | null;
   addedDirs: string[] | null;
+  // Every file the push wrote, with the size and mtime it left on the
+  // server, and every file it deleted: undo refuses when any changed since
+  pushed?: Record<string, [number, number]>;
+  deleted?: string[];
   hasFilesBackup: boolean;
   hasDatabaseBackup: boolean;
 }
@@ -33,36 +37,85 @@ export function remoteFilesBackupDir(remoteHome: string, stamp: string): string 
 
 // rsync `--out-format=SSHSYNC|%i|%n` lines: `<f+++++++++` is a new file,
 // `cd+++++++++` a new folder (both relative to the WordPress root).
-export function parseAddedFromOutFormat(stdout: string): { files: string[]; dirs: string[] } {
-  const files: string[] = [];
-  const dirs: string[] = [];
+export interface PushedChanges {
+  // New files and folders on the server (undo removes them)
+  files: string[];
+  dirs: string[];
+  // Existing files the push overwrote (undo restores them from the backup)
+  updated: string[];
+  // Files rsync --delete removed (fast path; ticked deletions are listed by us)
+  deleted: string[];
+}
+
+export function parseAddedFromOutFormat(stdout: string): PushedChanges {
+  const changes: PushedChanges = { files: [], dirs: [], updated: [], deleted: [] };
   // Progress output ends its lines with \r, so a marker can follow progress
-  // text on the same "line": find every marker wherever it starts.
+  // text on the same "line": find every marker wherever it starts. Names are
+  // kept exactly (no trimming); only a folder's trailing slash goes.
   const marker = new RegExp(`${OUT_FORMAT_MARKER}\\|([^|\\r\\n]+)\\|([^\\r\\n]+)`, 'g');
   for (const match of stdout.matchAll(marker)) {
     const flags = match[1];
-    const name = match[2].trim().replace(/\/$/, '');
+    const name = match[2].replace(/\/$/, '');
     if (!name || name === '.') continue;
+    if (flags.startsWith('*deleting')) {
+      changes.deleted.push(name);
+      continue;
+    }
+    if (flags[0] !== '<' && flags[0] !== 'c') continue; // attribute-only changes
     const isNew = flags.length > 2 && /^\++$/.test(flags.slice(2));
-    if (!isNew) continue;
-    if (flags[1] === 'd') dirs.push(name);
-    else if (flags[1] === 'f') files.push(name);
+    if (flags[1] === 'd') {
+      if (isNew) changes.dirs.push(name);
+    } else if (flags[1] === 'f') {
+      (isNew ? changes.files : changes.updated).push(name);
+    }
   }
-  return { files, dirs };
+  return changes;
 }
 
-// Move the ticked deletions into the backup folder instead of removing them.
-// `quotedPaths` are already validated and single-quoted (safeRemoteRelPath).
-export function moveToBackupCommand(backupDir: string, quotedPaths: string[]): string {
-  return [
-    `b=${shellQuote(backupDir)}`,
-    `for p in ${quotedPaths.join(' ')}; do [ -e "$p" ] || continue; mkdir -p "$b/$(dirname "$p")" && mv -- "$p" "$b/$p" || exit 1; done`,
-  ].join('; ');
+// A relative path inside the WordPress root, safe to hand to a remote loop
+// that reads one path per line (no quoting involved at all).
+export function isSafeListedPath(p: string): boolean {
+  if (!p || p.length > 4096 || /[\n\r\0]/.test(p)) return false;
+  if (p.startsWith('/') || p.startsWith('~')) return false;
+  return !p.split('/').some((segment) => segment === '..' || segment === '' || segment === '.');
 }
 
-// Folders the push created, deepest first, removed only when empty.
-export function removeEmptyDirsCommand(quotedDirs: string[]): string {
-  return `for d in ${quotedDirs.join(' ')}; do rmdir -- "$d" 2>/dev/null; done; true`;
+// Deleting a folder already removes what is inside it: keep only the
+// outermost path, so nothing is moved twice (or nested in the backup).
+export function outermostPaths(paths: string[]): string[] {
+  const set = new Set(paths);
+  return [...set].filter((p) => {
+    const parts = p.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      if (set.has(parts.slice(0, i).join('/'))) return false;
+    }
+    return true;
+  });
+}
+
+// Remote loops over a path list given on stdin, one per line
+export function moveListedToBackupCommand(backupDir: string): string {
+  return `b=${shellQuote(backupDir)}; while IFS= read -r p; do [ -e "$p" ] || [ -L "$p" ] || continue; mkdir -p "$b/$(dirname -- "$p")" && mv -- "$p" "$b/$p" || exit 1; done`;
+}
+
+export function removeListedFilesCommand(): string {
+  return 'while IFS= read -r p; do rm -f -- "$p"; done';
+}
+
+// Folders the push created, deepest first, removed only when empty
+export function removeListedEmptyDirsCommand(): string {
+  return 'while IFS= read -r d; do rmdir -- "$d" 2>/dev/null; done; true';
+}
+
+// Undo safety: a pushed file that no longer has the size and mtime the push
+// gave it, or a deleted file that exists again, changed on the server since.
+// stdin lines: "<size> <mtime> <path>" for pushed files, "- - <path>" for deleted ones.
+export function changedSinceCommand(): string {
+  return 'while IFS=" " read -r size mtime p; do if [ "$size" = - ]; then [ -e "$p" ] && echo "SSHSYNC_CHANGED|$p"; else now=$(stat -c "%s %Y" -- "$p" 2>/dev/null); [ "$now" = "$size $mtime" ] || echo "SSHSYNC_CHANGED|$p"; fi; done; true';
+}
+
+export function parseChangedSince(stdout: string): string[] {
+  return [...stdout.matchAll(/SSHSYNC_CHANGED\|([^\r\n]+)/g)].map((m) => m[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -77,14 +130,18 @@ export function lockDir(remoteHome: string, remoteRoot: string): string {
   return `${remoteHome}/.ssh-sync-lock-${hash}`;
 }
 
-export function acquireLockCommand(lock: string, owner: string): string {
+// Each holder writes a random token: only the holder releases or refreshes
+// the lock. A dead lock (untouched for LOCK_STALE_MINUTES) is taken over with
+// an atomic mv, so two takers can never both win.
+export function acquireLockCommand(lock: string, owner: string, token: string): string {
   const q = shellQuote(lock);
   return [
-    `if mkdir ${q} 2>/dev/null; then :`,
-    // A lock older than LOCK_STALE_MINUTES belongs to a push that died
-    `elif [ -n "$(find ${q} -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ]; then rm -rf -- ${q} && mkdir ${q} || { echo SSHSYNC_LOCK=busy; exit 0; }`,
-    `else printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat ${q}/owner 2>/dev/null)"; exit 0; fi`,
-    `printf '%s\\n' ${shellQuote(owner)} > ${q}/owner`,
+    `l=${q}`,
+    `if mkdir "$l" 2>/dev/null; then :`,
+    `elif [ -n "$(find "$l" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mv "$l" "$l.stale.$$" 2>/dev/null && mkdir "$l" 2>/dev/null; then rm -rf -- "$l.stale.$$"`,
+    `else printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
+    `printf '%s\\n' ${shellQuote(owner)} > "$l/owner"`,
+    `printf '%s\\n' ${shellQuote(token)} > "$l/token"`,
     'echo SSHSYNC_LOCK=ok',
   ].join('; ');
 }
@@ -95,8 +152,28 @@ export function parseLockOutput(stdout: string): { ok: true } | { ok: false; own
   return { ok: false, owner: match ? match[2].trim() : '' };
 }
 
-export function releaseLockCommand(lock: string): string {
-  return `rm -rf -- ${shellQuote(lock)}`;
+function holdsLock(lock: string, token: string): string {
+  return `[ "$(cat ${shellQuote(lock)}/token 2>/dev/null)" = ${shellQuote(token)} ]`;
+}
+
+export function releaseLockCommand(lock: string, token: string): string {
+  return `${holdsLock(lock, token)} && rm -rf -- ${shellQuote(lock)}; true`;
+}
+
+// Long pushes keep their lock fresh so it never looks dead
+export function refreshLockCommand(lock: string, token: string): string {
+  return `${holdsLock(lock, token)} && touch ${shellQuote(lock)}; true`;
+}
+
+export function newLockToken(): string {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// The newest push to a server folder, from any computer: written on success,
+// so an undo can tell whether someone pushed after it
+export function lastPushMarker(remoteHome: string, remoteRoot: string): string {
+  const hash = crypto.createHash('sha1').update(remoteRoot).digest('hex').slice(0, 12);
+  return `${remoteHome}/.ssh-sync-last-push-${hash}`;
 }
 
 // Who holds the lock, for the message the next person sees

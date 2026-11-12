@@ -59,7 +59,10 @@ import {
   productionDatabaseGuard,
   siteUrlMismatch,
   parseAddedFromOutFormat,
-  moveToBackupCommand,
+  moveListedToBackupCommand,
+  outermostPaths,
+  isSafeListedPath,
+  releaseLockCommand,
   acquireLockCommand,
   parseLockOutput,
   lockDir,
@@ -329,18 +332,21 @@ describe('ssh helpers', () => {
     const command = remoteProbeCommand(env({ remotePath: '~/public_html' }));
     expect(command).toContain(`cd ~/'public_html'`);
     expect(command).toContain('core is-installed');
-    expect(command).toContain(`-name '.ssh-sync-*' -mmin +120 -delete`);
+    expect(command).toContain(`-name '.ssh-sync-????????' -mmin +120 -delete`);
     expect(
       parseRemoteProbe(
-        'SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE_URL=https://example.com\nSSHSYNC_PROBE_HOME=/home/u\nSSHSYNC_PROBE=ok\n',
+        'SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE_URL=https://example.com/wp\nSSHSYNC_PROBE_HOMEURL=https://example.com\nSSHSYNC_PROBE_HOME=/home/u\nSSHSYNC_PROBE=ok\n',
       ),
     ).toEqual({
       ok: true,
       remoteRoot: '/home/u/public_html',
-      siteUrl: 'https://example.com',
+      siteUrl: 'https://example.com/wp',
+      homeUrl: 'https://example.com',
       remoteHome: '/home/u',
     });
-    expect(command).toContain('option get siteurl');
+    // through WordPress, so WP_SITEURL/WP_HOME in wp-config count
+    expect(command).toContain('site_url()');
+    expect(command).toContain('home_url()');
     expect(parseRemoteProbe('SSHSYNC_PROBE=path\n')).toEqual({ ok: false, reason: 'path' });
     expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/x\nSSHSYNC_PROBE=wp\n')).toEqual({
       ok: false,
@@ -1013,20 +1019,24 @@ describe('control dir cleanup', () => {
 });
 
 describe('siteUrlMismatch', () => {
-  it('accepts the configured site whatever the scheme or trailing slash', () => {
+  it('accepts the configured site whatever the scheme, www or trailing slash', () => {
     expect(siteUrlMismatch(env(), 'https://example.com')).toBeNull();
     expect(siteUrlMismatch(env(), 'http://example.com/')).toBeNull();
+    expect(siteUrlMismatch(env(), 'https://www.example.com')).toBeNull();
     expect(
-      siteUrlMismatch(env({ remoteUrl: 'https://example.com/blog' }), 'https://example.com/blog'),
+      siteUrlMismatch(env({ remoteUrl: 'https://www.example.com' }), 'https://example.com'),
     ).toBeNull();
   });
 
-  it('refuses a folder that holds another site', () => {
+  it('accepts WordPress in a subfolder through the home URL', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com/wp', 'https://example.com')).toBeNull();
+  });
+
+  it('reports a folder that holds another site, or no readable URL', () => {
     expect(siteUrlMismatch(env(), 'https://other.com')).toMatch(
-      /is https:\/\/other\.com, not https:\/\/example\.com/,
+      /says it is https:\/\/other\.com, not https:\/\/example\.com/,
     );
-    expect(siteUrlMismatch(env(), 'https://www.example.com')).not.toBeNull();
-    expect(siteUrlMismatch(env(), '')).toMatch(/without a readable siteurl/);
+    expect(siteUrlMismatch(env(), '')).toMatch(/Could not read the site URL/);
   });
 });
 
@@ -1042,21 +1052,44 @@ describe('push backups and lock', () => {
           '   1,234  42%  progress\rSSHSYNC|<f+++++++++|after-progress.php',
         ].join('\n'),
       ),
-    ).toEqual({ files: ['a/new.php', 'after-progress.php'], dirs: ['a/dir'] });
+    ).toEqual({
+      files: ['a/new.php', 'after-progress.php'],
+      dirs: ['a/dir'],
+      updated: ['a/changed.php'],
+      deleted: [],
+    });
+    expect(parseAddedFromOutFormat('SSHSYNC|*deleting|old dir/ x.php\n')).toMatchObject({
+      deleted: ['old dir/ x.php'],
+    });
   });
 
-  it('moves deletions into the backup folder instead of removing them', () => {
-    const command = moveToBackupCommand('/home/u/.ssh-sync-files-x', ["'a/old.php'"]);
-    expect(command).toContain(`b='/home/u/.ssh-sync-files-x'`);
+  it('moves deletions into the backup folder, never nested, never through quoting', () => {
+    expect(outermostPaths(['foo/a.php', 'foo', 'bar/b.php', 'foobar/c.php'])).toEqual([
+      'foo',
+      'bar/b.php',
+      'foobar/c.php',
+    ]);
+    const command = moveListedToBackupCommand('/home/u/.ssh-sync-files-x');
+    expect(command).toContain('while IFS= read -r p');
     expect(command).toContain(`mv -- "$p" "$b/$p"`);
     expect(command).not.toContain('rm ');
+    expect(isSafeListedPath('caf\u00e9 (1) & $x.jpg')).toBe(true);
+    for (const bad of ['/etc/passwd', '../x', 'a/../b', 'a\nb', '', 'a//b', './a']) {
+      expect(isSafeListedPath(bad), bad).toBe(false);
+    }
   });
 
   it('locks per server folder with an atomic mkdir and reports the holder', () => {
     const lock = lockDir('/home/u', '/var/www/a');
     expect(lock).toMatch(/^\/home\/u\/\.ssh-sync-lock-[0-9a-f]{12}$/);
     expect(lockDir('/home/u', '/var/www/b')).not.toBe(lock);
-    expect(acquireLockCommand(lock, "me's mac")).toContain(`if mkdir '${lock}'`);
+    const acquire = acquireLockCommand(lock, "me's mac", 'tok123');
+    expect(acquire).toContain(`l='${lock}'`);
+    expect(acquire).toContain('if mkdir "$l"');
+    // A dead lock is taken over by an atomic rename, never by rm then mkdir
+    expect(acquire).toContain('mv "$l" "$l.stale.$$"');
+    expect(acquire).toContain(`'tok123' > "$l/token"`);
+    expect(releaseLockCommand(lock, 'tok123')).toContain(`= 'tok123' ] && rm -rf`);
     expect(parseLockOutput('SSHSYNC_LOCK=ok\n')).toEqual({ ok: true });
     expect(parseLockOutput('SSHSYNC_LOCK=busy mac (site) since x\n')).toEqual({
       ok: false,

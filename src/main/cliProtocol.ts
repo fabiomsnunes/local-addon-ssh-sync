@@ -19,6 +19,7 @@ export type CliRequest =
       includeDatabase: boolean;
       includeUploads: boolean;
       makeSafe: boolean;
+      acceptSiteUrl?: string;
     }
   | {
       command: 'push';
@@ -31,8 +32,16 @@ export type CliRequest =
       yes: boolean;
       production: boolean;
       includeStale: boolean;
+      acceptSiteUrl?: string;
     }
-  | { command: 'undo'; site: string; environment: string; yes: boolean };
+  | {
+      command: 'undo';
+      site: string;
+      environment: string;
+      yes: boolean;
+      production: boolean;
+      acceptSiteUrl?: string;
+    };
 
 export type CliMessage =
   | { type: 'progress'; progress: number; message: string }

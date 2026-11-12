@@ -22,8 +22,13 @@ interface UndoState {
   confirmDomain: string;
   ok?: boolean;
   message?: string;
+  // Files changed on the server after the push, which the undo refused to touch
+  conflicts?: string[];
+  // WordPress in the folder reports another site URL: confirm to go on
+  siteUrlMismatch?: SiteUrlMismatch;
 }
 import { STATUS, tint } from './colors';
+import SiteUrlConfirm, { SiteUrlMismatch } from './SiteUrlConfirm';
 import { ServerEnvironment, SiteProfile } from './types';
 
 const { ipcRenderer, shell } = window.require('electron');
@@ -169,11 +174,13 @@ const SyncPage: React.FC<Props> = ({ site }) => {
     });
   };
 
-  const confirmUndo = async (env: ServerEnvironment) => {
+  // `acceptSiteUrl` re-runs the undo after the user confirmed the site URL
+  // WordPress reports in that folder (see SiteUrlConfirm)
+  const confirmUndo = async (env: ServerEnvironment, acceptSiteUrl?: string) => {
     const state = undo[env.id];
     const push = undoable[env.id];
     if (!state || !push) return;
-    setUndoFor(env.id, { ...state, stage: 'busy' });
+    setUndoFor(env.id, { ...state, stage: 'busy', siteUrlMismatch: undefined });
     const needsDomain = env.isProduction && push.database;
     const result = await ipcRenderer.invoke(
       'sshsync:undoLastPush',
@@ -181,7 +188,18 @@ const SyncPage: React.FC<Props> = ({ site }) => {
       site,
       env.id,
       needsDomain ? state.confirmDomain : undefined,
+      acceptSiteUrl,
     );
+    if (!result.success && result.siteUrlMismatch) {
+      // Back to the confirmation, now asking for the site URL as well
+      setUndoFor(env.id, {
+        ...state,
+        stage: 'confirm',
+        message: result.error,
+        siteUrlMismatch: result.siteUrlMismatch,
+      });
+      return;
+    }
     setUndoFor(env.id, {
       ...state,
       stage: 'done',
@@ -189,6 +207,7 @@ const SyncPage: React.FC<Props> = ({ site }) => {
       message: result.success
         ? [result.note || 'Push undone.', result.warning].filter(Boolean).join(' ')
         : result.error || 'Undo failed.',
+      conflicts: result.success ? undefined : result.conflicts,
     });
     window.dispatchEvent(new CustomEvent('sshsync:state-changed', { detail: { siteId: site.id } }));
   };
@@ -201,6 +220,16 @@ const SyncPage: React.FC<Props> = ({ site }) => {
       return (
         <div style={{ ...undoBoxStyle, color: state.ok ? STATUS.success : STATUS.danger }}>
           <span>{state.message}</span>
+          {state.conflicts && state.conflicts.length > 0 && (
+            <ul
+              style={{ margin: 0, paddingLeft: '18px', fontSize: '12px', fontFamily: 'monospace' }}
+            >
+              {state.conflicts.slice(0, 10).map((file) => (
+                <li key={file}>{file}</li>
+              ))}
+              {state.conflicts.length > 10 && <li>…and {state.conflicts.length - 10} more</li>}
+            </ul>
+          )}
           <TextButton onClick={() => setUndoFor(env.id, null)}>Dismiss</TextButton>
         </div>
       );
@@ -216,6 +245,19 @@ const SyncPage: React.FC<Props> = ({ site }) => {
           Undo the push of {stampToLocalTime(push.stamp)}: files
           {push.database ? ' and database' : ''}?
         </span>
+        {push.database && (
+          <span style={{ fontSize: '12px', color: STATUS.danger }}>
+            The database goes back to how it was before the push: anything saved on the server since
+            (orders, form entries, users) is lost.
+          </span>
+        )}
+        {state.siteUrlMismatch && (
+          <SiteUrlConfirm
+            mismatch={state.siteUrlMismatch}
+            busy={busy}
+            onContinue={(acceptSiteUrl) => confirmUndo(env, acceptSiteUrl)}
+          />
+        )}
         {needsDomain && (
           <label style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '12px' }}>
             <span>

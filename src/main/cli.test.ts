@@ -46,7 +46,11 @@ describe('ssh-sync arguments', () => {
       site: 'mysite',
       environment: 'staging',
       yes: false,
+      production: false,
     });
+    expect(
+      parseArgs(['pull', 'mysite', 'staging', '--accept-site-url=https://live.example.com']),
+    ).toMatchObject({ acceptSiteUrl: 'https://live.example.com' });
     expect(
       parseArgs(['push', 'mysite', 'staging', '--yes', '--delete', '--db', '--all-modified']),
     ).toMatchObject({

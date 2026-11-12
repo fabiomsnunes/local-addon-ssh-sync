@@ -504,10 +504,21 @@ async function handleCliRequest(
         `Undoing a database push to ${environment.label} (production) is only possible in the app.`,
       );
     }
+    if (environment.isProduction && !request.production) {
+      return fail(`${environment.label} is production: add --production to undo there.`);
+    }
     const result = await runCancellable(() =>
-      executeUndoPush({ localSiteId: site.id, site, environment }, defaultPullPushDeps(progress)),
+      executeUndoPush(
+        { localSiteId: site.id, site, environment, acceptSiteUrl: request.acceptSiteUrl },
+        defaultPullPushDeps(progress),
+      ),
     );
-    if (!result.success) return fail(result.error || 'Undo failed.');
+    if (!result.success) {
+      for (const file of (result.conflicts || []).slice(0, 20)) {
+        send({ type: 'output', text: `  changed since the push: ${file}` });
+      }
+      return fail(result.error || 'Undo failed.');
+    }
     return send({
       type: 'result',
       success: true,
@@ -727,7 +738,11 @@ export default function (context: AddonMainContext): void {
           typeof input.password === 'string' ? input.password : null,
         );
         await connection.close();
-        return { success: true, remoteRoot: connection.remoteRoot };
+        return {
+          success: true,
+          remoteRoot: connection.remoteRoot,
+          warning: connection.siteUrlMismatch,
+        };
       } catch (e: any) {
         return { success: false, error: e.message };
       }
@@ -812,6 +827,7 @@ export default function (context: AddonMainContext): void {
       site: SiteInfo,
       environmentId: string,
       confirmDomain?: string,
+      acceptSiteUrl?: string,
     ) => {
       const environment = findEnvironment(localSiteId, environmentId);
       if (!environment) return { success: false, error: 'Unknown environment.' };
@@ -823,7 +839,7 @@ export default function (context: AddonMainContext): void {
         });
       };
       return executeUndoPush(
-        { localSiteId, site, environment, confirmDomain },
+        { localSiteId, site, environment, confirmDomain, acceptSiteUrl },
         defaultPullPushDeps(sendProgress),
       );
     },

@@ -66,6 +66,9 @@ export interface SyncOptions {
   // the remote domain typed back by the user.
   migrationMode?: boolean;
   confirmDomain?: string;
+  // The site URL the server reported, typed back by the user to go ahead
+  // despite a site URL mismatch
+  acceptSiteUrl?: string;
   // Pull only, on unless false: neutralize the copy before WordPress loads
   // (see safeClone.ts)
   makeSafe?: boolean;
@@ -119,8 +122,11 @@ export interface RemoteConnection {
   remoteRoot: string;
   // The SSH user's home (absolute), for our temp files, backups and lock
   remoteHome: string;
-  // WordPress's siteurl there, already checked against the environment
+  // The site WordPress reports there (home URL, else siteurl)
   siteUrl: string;
+  // Why that is not the environment's site, or null when it is. Syncs refuse
+  // unless the user typed the reported URL back (SyncOptions.acceptSiteUrl).
+  siteUrlMismatch: string | null;
   close: () => Promise<void>;
 }
 
@@ -161,6 +167,10 @@ export interface SyncResult {
   warning?: string | null;
   // What the sync did besides the transfer, for the user (e.g. the safe-clone summary)
   note?: string | null;
+  // Set when the server folder reports another site (see RemoteConnection)
+  siteUrlMismatch?: { actual: string; expected: string };
+  // Undo only: files changed on the server since the push
+  conflicts?: string[];
 }
 
 // Every environment-touching dependency executePull/executePush rely on. The
