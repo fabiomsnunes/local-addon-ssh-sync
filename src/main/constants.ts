@@ -51,6 +51,9 @@ export const EXCLUDE_PATTERNS = [
   // the other's (unreachable) cache backend and break caching / fatal the site.
   'wp-content/object-cache.php',
   'wp-content/advanced-cache.php',
+  // LiteSpeed Cache's per-site config file (cache paths and server settings),
+  // written by the plugin on each server
+  'wp-content/.litespeed_conf.php',
   // Local-generated helper file in the webroot — never part of the WP site
   'local-xdebuginfo.php',
   // Our own safety mu-plugin for pulled copies (safeClone.ts): never pushed

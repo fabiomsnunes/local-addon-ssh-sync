@@ -185,8 +185,14 @@ let controlDir: string | null = null;
 // Open connections, so quitting Local mid-sync can still close their masters
 const openConnections = new Set<RemoteConnection>();
 
+// Masters still starting up (not yet a RemoteConnection) can be closed too
+const startingMasters = new Set<() => Promise<void>>();
+
 export async function closeAllConnections(): Promise<void> {
-  await Promise.all([...openConnections].map((connection) => connection.close()));
+  await Promise.all([
+    ...[...openConnections].map((connection) => connection.close()),
+    ...[...startingMasters].map((close) => close()),
+  ]);
 }
 
 // Short per-user folder for the multiplexing sockets: unix socket paths are
@@ -197,6 +203,44 @@ function getControlDir(): string {
     controlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-'));
   }
   return controlDir;
+}
+
+// Our control dirs hold only sockets and the password-free askpass helper.
+// Removed on quit; ones left by a crash are swept at the next start.
+export function removeControlDir(): void {
+  if (!controlDir) return;
+  try {
+    fs.rmSync(controlDir, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+  controlDir = null;
+}
+
+export function sweepStaleControlDirs(olderThanMs = 24 * 60 * 60 * 1000): void {
+  const tmp = os.tmpdir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(tmp);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!/^ssh-sync-[A-Za-z0-9]{6}$/.test(entry)) continue;
+    const dir = path.join(tmp, entry);
+    try {
+      // Only folders that look like ours: master sockets, askpass sockets
+      // and the helper, nothing else
+      const ours = fs
+        .readdirSync(dir)
+        .every((name) => /^(cm|ap)-[0-9a-f]{8}$/.test(name) || name === 'askpass.sh');
+      if (ours && Date.now() - fs.statSync(dir).mtimeMs > olderThanMs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // another process's dir, or already gone
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -355,9 +399,11 @@ export async function openRemoteConnection(
     }
   };
 
+  startingMasters.add(close);
   const deadline = Date.now() + 20_000;
   while (!masterIsReady(target, controlPath)) {
     if (masterExited || Date.now() > deadline) {
+      startingMasters.delete(close);
       await close();
       const detail = masterStderr.trim().split('\n').slice(-3).join('\n');
       throw new Error(`Could not connect to ${target} over SSH.${detail ? `\n${detail}` : ''}`);
@@ -367,6 +413,7 @@ export async function openRemoteConnection(
   // Authenticated: the password is no longer needed by anyone
   stopAskpass();
 
+  startingMasters.delete(close);
   const connection: RemoteConnection = {
     target,
     sshOptions: baseSshOptions(environment, controlPath),

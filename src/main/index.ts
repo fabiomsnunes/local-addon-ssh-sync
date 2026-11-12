@@ -24,6 +24,8 @@ import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, localPublicPath }
 import {
   openRemoteConnection,
   closeAllConnections,
+  removeControlDir,
+  sweepStaleControlDirs,
   listSshConfigHosts,
   rsyncRemoteShell,
   rsyncRemoteRoot,
@@ -556,6 +558,7 @@ export default function (context: AddonMainContext): void {
 
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
+  sweepStaleControlDirs();
 
   // The `ssh-sync` command's endpoint
   ensureConfigDir();
@@ -568,7 +571,7 @@ export default function (context: AddonMainContext): void {
   try {
     electron.app.on('before-quit', () => {
       cliServer.close();
-      void closeAllConnections();
+      void closeAllConnections().finally(removeControlDir);
     });
   } catch (e) {
     console.error('[SSH Sync] Could not register the quit handler:', e);
