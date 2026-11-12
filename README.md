@@ -1,115 +1,115 @@
-# Kinsta Sync for Local
+# SSH Sync for Local
 
-Sync WordPress sites between [Local](https://localwp.com) and [Kinsta](https://kinsta.com) hosting — pull and push files **and** database, with automatic URL search-replace, safety backups, and rollback.
+Pull and push WordPress sites between [Local](https://localwp.com) and **any server you can reach over SSH**: files and database, with automatic URL search-replace, safety backups, rollback, and a local copy that cannot email your customers or upload backups by accident.
 
-> **Community project.** Not affiliated with, endorsed by, or supported by Kinsta Inc. or WP Engine. "Kinsta" and the Kinsta logo are trademarks of Kinsta Inc. Use at your own risk — see [Safety nets](#safety-nets) for how the add-on protects your data.
+No host API, no account to connect: if `ssh you@your-server` works, SSH Sync works.
+
+> Started from [local-addon-kinsta](https://github.com/landerss0n/local-addon-kinsta) by Lucas Andersson (MIT), whose sync engine it reuses for any host. Not affiliated with WP Engine or Local.
 
 ## Features
 
-- **Pull from Kinsta** — files + database from Production or Staging into your Local site
-- **Push to Kinsta** — files + database from Local to Production or Staging
-- **Push preview with selective sync** — a Magic Sync-style fullscreen diff before every push: see exactly which files will be added, updated or deleted, untick anything you don't want pushed, and choose between _only newer files_ and _all modified files_
-- **Automatic search-replace** — `https://`, `http://` and protocol-relative URLs, multisite-aware, `guid` column untouched
-- **Safety first** — local + remote database backups before every destructive step, optional native Kinsta backup before push, automatic rollback if a sync fails or is cancelled mid-import
-- **Live progress** — real rsync progress, per-step status, cancellable at any time
-- **Cache clearing** — clears Kinsta's page, edge and CDN caches after a push (and on demand)
-- **Site search** — quickly find the right site even with 100+ sites on the account
-
-## Screenshots
-
-<p align="center">
-  <img src="docs/screenshots/02-push-preview.png" alt="Push preview — fullscreen per-file diff with selective sync" width="900">
-</p>
-<p align="center"><sub><b>Push preview</b> — a Magic Sync-style fullscreen diff: pick the environment, untick any file, choose <i>only newer</i> vs <i>all modified</i>, then push.</sub></p>
-
-<table>
-  <tr>
-    <td width="50%"><img src="docs/screenshots/01-kinsta-page.png" alt="Kinsta Sync page"></td>
-    <td width="50%"><img src="docs/screenshots/03-link-drawer.png" alt="Link a Kinsta site"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub><b>Home</b> — link status, environments, and recent sync history under <b>More&nbsp;→&nbsp;Kinsta&nbsp;Sync</b>.</sub></td>
-    <td align="center"><sub><b>Linking</b> — search across every Kinsta site on your account.</sub></td>
-  </tr>
-</table>
+- **Pull** files (uploads optional) and the database from a server into a Local site
+- **Push** with a preview: a dry-run diff of every file that would change, untick what you don't want, _only newer_ or _all modified_ files; deletions only when you tick them
+- **Environments per site**: Production, Staging, anything; each with its own SSH connection, WordPress folder, URL, WP-CLI command, cache command and excludes
+- **SSH key or password**: an alias from your `~/.ssh/config`, or host, user and port
+- **Safe local copy** (on by default): turns off backup, mail and remote-management plugins, switches Stripe to test mode, and blocks outgoing requests and email on the copy. A later database push puts all of that back on the server
+- **Production guard**: replacing a production database needs Migration mode and the domain typed back
+- **Search-replace** of `https://`, `http://`, `//` and JSON-escaped URLs, multisite-aware, `guid` untouched; table prefix differences handled both ways
+- **Safety nets**: local database backup before a pull, remote database downloaded before a push, automatic rollback if an import fails
+- **Command line**: `ssh-sync pull|push|test|envs`, next to Local's own `localwp`
 
 ## Requirements
 
-- **macOS or Linux** (Windows is not supported — the add-on shells out to `rsync`/`ssh`)
-- **Local** 9.x or newer
-- **rsync** — macOS ships with a limited rsync; `brew install rsync` is recommended for full live progress (everything works without it, you just get coarser progress)
-- **A Kinsta account** with:
-  - an [API key](https://my.kinsta.com/account/api-keys) (create with an expiry and rotate it periodically)
-  - your **Company ID** — found in your MyKinsta URL (`my.kinsta.com/?idCompany=<id>`) or under MyKinsta → _your username_ → Company settings → Billing details
-  - your **SSH key added** to MyKinsta (file/database transfer runs over SSH)
+- **macOS** (Linux should work, untested; Windows is not supported)
+- **Local 10** or newer
+- **On the server**: SSH access, `rsync` and [WP-CLI](https://wp-cli.org/) (most managed hosts have both; Test connection tells you which one is missing)
+- **On your computer**: `brew install rsync` is recommended. macOS ships openrsync, which works but cannot show live progress or the size and type of each change in the push preview
 
 ## Installation
 
-### From a release (recommended)
-
-1. Download the latest `.tgz` from [Releases](https://github.com/landerss0n/local-addon-kinsta/releases)
+1. Download the latest `.tgz` from [Releases](https://github.com/fabiomsnunes/local-addon-ssh-sync/releases)
 2. In Local: **Add-ons → Installed → Install from disk** and pick the file
 3. Enable the add-on and relaunch Local when prompted
 
-### From source
+From source:
 
 ```bash
-cd ~/Library/Application\ Support/Local/addons   # macOS
-# cd ~/.config/Local/addons                      # Linux
-
-git clone https://github.com/landerss0n/local-addon-kinsta.git
-cd local-addon-kinsta
+cd ~/Library/Application\ Support/Local/addons
+git clone https://github.com/fabiomsnunes/local-addon-ssh-sync.git
+cd local-addon-ssh-sync
 npm install
 npm run build
 ```
 
-Restart Local, then enable **Kinsta Sync** under **Add-ons → Installed**.
-
 ## Getting started
 
-1. **Connect your account** — Local → Preferences → **Kinsta Sync**: paste your API key and Company ID, click Connect. The key is validated against the Kinsta API before anything is stored.
-2. **Link a site** — open a site in Local → **More → Kinsta Sync** → **Link site**, search and pick the matching Kinsta site.
-3. **Pull or Push** — from the same page. Pick the environment (Production/Staging) and what to sync (files / database) per run. Push always starts with a preview of exactly what will change on the server.
-
-Sites are linked at the _site_ level, so you can sync against Production one time and Staging the next without relinking. A status badge in the site's top-right corner shows the link state and live sync progress.
+1. Create (or open) the site in Local. For a new copy of a live site, an empty WordPress site is enough
+2. **More → SSH Sync → Add a server**
+   - **Connection**: pick a host from your `~/.ssh/config`, or enter host, user and port
+   - **Authentication**: SSH key (your agent or `~/.ssh/config`) or password
+   - **WordPress folder**: where `wp-config.php` lives, e.g. `/var/www/example.com` or `~/public_html`
+   - **Site URL**: e.g. `https://example.com`
+   - **This is production**: tick it for the live site
+3. **Test connection**, then **Save**
+4. **Pull** to bring the site into Local; **Push** to send your changes back
 
 ## What a sync does
 
-**Pull** (Kinsta → Local): rsync files → back up the local database → export the remote database over SSH (WP-CLI) → import into Local's MySQL → search-replace URLs (3 passes: `https://`, `http://`, `//`).
+**Pull** (server → Local): connect once and check the WordPress folder → install the local safety net → rsync files → back up the local database → export the server database to a private temp file, download it, delete it → import → search-replace → adopt the server's table prefix → make the copy safe (see below).
 
-**Push** (Local → Kinsta): opens a fullscreen **preview** — a dry-run diff of every file that would be added, updated or deleted on the server. Pick the environment, what to include (database / uploads / native Kinsta backup) and untick any files or deletions you don't want, then push: confirmation dialog for Production → _(optional, default on)_ create a native Kinsta backup → back up the remote database to `~/kinsta-sync-pre-push-backup.sql` on the server → rsync exactly the files you selected → delete only the deletions you ticked (nothing is deleted blindly) → export the Local database → import on Kinsta → search-replace → clear Kinsta page/edge/CDN caches.
+**Push** (Local → server): the preview shows exactly what would change. Push then: confirmation for production → (with the database) export the server database and download it as the rollback backup → rsync only the files you selected → delete only the deletions you ticked → (with the database) import, search-replace, re-enable on the server what the safe copy had turned off → run the environment's cache command.
 
-Excluded from file sync: `.git`, `node_modules`, caches, SQL dumps, `wp-config.php` (and every copy of it), `.htaccess`, Kinsta's mu-plugins and other host-specific files, plus backup copies of any file (`*.bak`, `*.bak-*`, `*.orig`, `*~`).
+Never synced, either way: `wp-config.php` and every copy of it, `.htaccess`, `.user.ini`, `php.ini`, object/page cache drop-ins, `wp-content/cache/`, `.git`, `node_modules`, SQL dumps, backup copies of any file (`*.bak`, `*.orig`, `*~`) and the safety mu-plugin. Add your own per environment (e.g. `wp-content/litespeed/`).
 
-### Safety nets
+## The safe local copy
 
-- **Before a pull**, the local database is backed up to a temp file (kept until the next pull).
-- **Before a push**, the remote database is exported to `~/kinsta-sync-pre-push-backup.sql` on the Kinsta server, outside the web root.
-- **Native Kinsta backup before push** (checkbox, default on): creates a manual backup via the Kinsta API and waits for it to finish — if it can't be created, the push is aborted. Kinsta allows max 5 manual backups per environment; the add-on only ever deletes its _own_ old backups (tagged `kinsta-sync`) to free a slot, never yours.
-- **Automatic rollback**: if a sync fails or is cancelled after the database import started, the respective backup is restored automatically — you're never left with a half-imported database. (Pushed file changes and deletions can't be rolled back — only the database.)
-- **No blind deletes on push**: files are never deleted on the server unless you explicitly ticked them in the push preview.
-- **Production pushes** always require an explicit confirmation.
+A pulled site runs the live site's plugins. The first page you open fires wp-cron, which can send real emails, upload a backup to the live site's storage, report to a management dashboard or call payment APIs. With **Make the local copy safe** (on by default), every pull:
+
+- installs `wp-content/mu-plugins/ssh-sync-local-safety.php` and defines `SSH_SYNC_LOCAL_COPY` in the Local site's `wp-config.php` _before_ anything is transferred: outgoing HTTP is blocked (WordPress.org and local hosts allowed) and no email is sent;
+- deactivates backup, mail, remote-management and alerting plugins (UpdraftPlus, BackWPup, MainWP Child, ManageWP Worker, FluentSMTP, WP Mail SMTP, Post SMTP, MailPoet, Wordfence, …) straight in the database, before WordPress loads;
+- switches WooCommerce Stripe to test mode;
+- sets `WP_ENVIRONMENT_TYPE` to `local`.
+
+The mu-plugin is never pushed. When you push the database, SSH Sync re-enables on the server exactly what it turned off, so the live site never ends up without its backups or payments. Delete the mu-plugin or the `SSH_SYNC_LOCAL_COPY` line to turn the protection off on a copy.
+
+## Command line
+
+Install it from **More → SSH Sync → Command line**. It lands next to Local's `localwp` (Preferences → Advanced → Install Local CLI puts that folder on your `PATH`). Local must be running.
+
+```bash
+ssh-sync envs my-site
+ssh-sync test my-site staging
+ssh-sync pull my-site production            # files + database, safe copy
+ssh-sync pull my-site production --no-db --uploads
+ssh-sync push my-site staging               # dry run: lists what would change
+ssh-sync push my-site staging --yes         # push the listed files
+ssh-sync push my-site staging --yes --db    # and the database (never to production)
+```
+
+`push` never deletes on the server without `--delete`, and the command line never replaces a production database: that needs Migration mode in the app.
 
 ## Security
 
-- **Your API key never leaves your machine** except in HTTPS requests to `api.kinsta.com`. It is encrypted at rest with Electron's `safeStorage` (backed by the macOS Keychain / OS credential store) and is never shown in the UI after entry — only a mask.
-- **SSH uses your existing keys/agent** — the add-on stores no SSH credentials and no passwords.
-- **No shell strings** — every external command (`rsync`, `ssh`, `mysql`, `wp`) is spawned with argument arrays, so site names and paths can't be used for command injection.
-- **No telemetry** — the add-on talks to the Kinsta API and your Kinsta SSH host. Nothing else, ever.
-- `wp-config.php` is modified temporarily during database import (to use Local's MySQL socket) and always restored — including crash recovery via a `.kinsta-sync-bak` copy.
+- **No shell strings locally**: every command (`ssh`, `rsync`, `scp`, `mysql`, `php`) is spawned with argument arrays. Every value that reaches the server's shell (paths, WP-CLI and cache commands) is validated against a strict character set and quoted.
+- **SSH keys**: your own agent and `~/.ssh/config`; SSH Sync stores no keys.
+- **Passwords**: encrypted with Electron `safeStorage` (the macOS Keychain), never shown again, never sent back to the UI. ssh receives them through `SSH_ASKPASS` from a one-shot socket, so they never appear in process arguments, environment variables or files. Refused where the OS has no real keyring.
+- **One connection per sync**, closed at the end, even if your `~/.ssh/config` sets `ControlPersist`.
+- **Nothing left on the server**: database dumps go to private (`mktemp`, 0600) files in the SSH user's home and are deleted right after the transfer; orphans older than two hours are swept on the next connect. The pre-push backup is kept on your computer (last 3 per environment).
+- **No telemetry.** SSH Sync talks to your servers and nothing else.
 
-Stored locally (in Local's app-data directory under `addons-data/kinsta-sync/`): the encrypted API key, your Company ID, site links with last-sync timestamps, and temporary SQL dumps.
+Stored under Local's `addons-data/ssh-sync/`: environments, encrypted passwords, what the safe copy changed per site, pre-push database backups.
 
 ## Troubleshooting
 
-| Problem                                                 | Fix                                                                                                                                                                                                |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No live file-progress during sync                       | `brew install rsync` (macOS ships openrsync, which can't report totals)                                                                                                                            |
-| Push preview shows file names without sizes/change type | `brew install rsync` — openrsync lacks the itemize flags, so the preview falls back to a name-only list                                                                                            |
-| "The local site must be running for database sync"      | Start the site in Local first — DB import needs its MySQL socket                                                                                                                                   |
-| SSH errors during sync                                  | Make sure your SSH key is added in MyKinsta and the environment has SSH access enabled                                                                                                             |
-| Kinsta backup step skipped                              | All 5 manual backup slots are taken by your own backups — delete one in MyKinsta                                                                                                                   |
-| "N file(s) were skipped" warning after sync             | Those files have names in a legacy encoding (e.g. Latin-1 `åäö`) that macOS can't store. Everything else synced. Fix permanently by renaming the files on the server (and updating any references) |
+| Problem                                            | Fix                                                                                                                                |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Test connection: "Could not connect … over SSH"    | Try `ssh <target>` in a terminal. For key auth the key must be in your agent or `~/.ssh/config` (no passphrase prompt is possible) |
+| "The WordPress folder … does not exist"            | Use the folder that holds `wp-config.php`; `~/` is the SSH user's home                                                             |
+| "WP-CLI failed"                                    | Set the WP-CLI command, e.g. `php ~/wp-cli.phar` or `php8.2 /usr/local/bin/wp`                                                     |
+| "rsync is not installed on the server"             | Ask your host; SSH Sync needs it to transfer files                                                                                 |
+| No live progress, preview without sizes            | `brew install rsync`                                                                                                               |
+| "The local site must be running for database sync" | Start the site in Local first                                                                                                      |
+| "N file(s) were skipped" after a sync              | File names in a legacy encoding that macOS cannot store; rename them on the server                                                 |
 
 ## Development
 
@@ -117,14 +117,11 @@ Stored locally (in Local's app-data directory under `addons-data/kinsta-sync/`):
 npm install
 npm run build          # main + renderer
 npm run watch          # rebuild on change (renderer hot-reloads; main needs a Local restart)
+npm test
 ```
 
-See [CLAUDE.md](CLAUDE.md) for architecture notes, the hooks used, and findings about Local's add-on API (including why a native Connect-tab integration isn't possible).
-
-- [Local add-on API docs](https://build.localwp.com/)
-- [Local components](https://getflywheel.github.io/local-components/)
-- [Kinsta API reference](https://api-docs.kinsta.com/)
+Architecture notes, the Local hooks used and the Local API findings are in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

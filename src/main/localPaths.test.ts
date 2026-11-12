@@ -23,7 +23,7 @@ function makeBinary(service: string, archDir: string, bin: string) {
 }
 
 beforeEach(() => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'kinsta-localpaths-'));
+  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-localpaths-'));
   initLocalPaths(sandbox, path.join(sandbox, 'app', 'Contents', 'Resources', 'app.asar'));
 });
 
