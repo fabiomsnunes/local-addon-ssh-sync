@@ -194,7 +194,7 @@ Under `<userDataPath>/addons-data/ssh-sync/` (0700):
 
 1. Production database guard (Migration mode + typed domain), validation, connect
 2. With the database: export the remote database and download it as the rollback backup
-3. rsync the selected files (`--files-from`, never `--delete`), then the ticked deletions
+3. rsync the selected files (`--files-from`), then the ticked deletions; when every row is selected in "all modified" mode, one full `rsync --delete` instead (the server ends up identical to Local). Either way the replaced and deleted files are kept in the push backup
 4. With the database: dump Local's database, rewrite MySQL 8 collations, upload to a private temp file, import, search-replace with plugins and themes skipped, reconcile the table prefix, restore what the safe copy turned off — all on an uncancellable ActiveSync; a cancel takes effect afterwards
 5. The environment's cache command (optional)
 6. Rollback only if the server import started and did not finish

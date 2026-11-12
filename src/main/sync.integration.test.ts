@@ -512,6 +512,28 @@ describe('executePull', () => {
     expect(steps(runner.calls)).toContain('mysql-restore');
   });
 
+  it('a failed safe step after a prefix adoption puts the local prefix and tables back', async () => {
+    const runner = makeFakeRunner({
+      remotePrefix: 'wp0x_',
+      localTables: ['wp0x_options', 'wp0x_posts', 'wp_options'],
+      failAt: 'local-neutralize',
+    });
+    const { deps } = makeDeps({ runner });
+    const result = await executePull(pullParams(), deps);
+    expect(result.success).toBe(false);
+    const labels = steps(runner.calls);
+    expect(labels).toContain('mysql-restore');
+    const drops = runner.calls.filter((c) => c.step === 'mysql-drop-tables');
+    const lastDrop = drops[drops.length - 1];
+    expect(labels.lastIndexOf('mysql-drop-tables')).toBeGreaterThan(
+      labels.indexOf('mysql-restore'),
+    );
+    expect(lastDrop.args[lastDrop.args.length - 1]).toContain('`wp0x_options`');
+    expect(lastDrop.args[lastDrop.args.length - 1]).not.toContain('`wp_options`');
+    const wpConfig = fs.readFileSync(path.join(sitePath, 'app', 'public', 'wp-config.php'), 'utf8');
+    expect(wpConfig).toContain("$table_prefix = 'wp_';");
+  });
+
   it('a files-only pull still installs the mu-plugin, without touching the database', async () => {
     const runner = makeFakeRunner();
     const { deps } = makeDeps({ runner });
@@ -1181,6 +1203,40 @@ describe('executePush', () => {
     expect(labels.indexOf('remote-config-set-prefix')).toBeGreaterThan(
       labels.indexOf('remote-db-restore'),
     );
+  });
+
+  it('failed pushes never prune the backups of the last good push, and clean up after themselves', async () => {
+    const good = makeDeps({ runner: makeFakeRunner() });
+    expect((await executePush(pushParams(), good.deps)).success).toBe(true);
+    const goodBase = latestPushManifest(backupsDir, SITE_ID, 'staging')!.base;
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 5)); // distinct stamps
+      const failed = makeDeps({ runner: makeFakeRunner({ failAt: 'remote-db-import' }) });
+      expect((await executePush(pushParams(), failed.deps)).success).toBe(false);
+    }
+    expect(fs.existsSync(`${goodBase}.sql`)).toBe(true);
+    expect(latestPushManifest(backupsDir, SITE_ID, 'staging')!.base).toBe(goodBase);
+    // only the good push's artifacts remain
+    expect(fs.readdirSync(backupsDir).filter((f) => f.endsWith('.sql'))).toHaveLength(1);
+  });
+
+  it('a database-only push made with openrsync can still be undone', async () => {
+    const openrsync = makeDeps({
+      runner: makeFakeRunner(),
+      resolveRsync: () => ({
+        ...FAKE_RSYNC,
+        supportsOutFormat: false,
+        supportsItemizeChanges: false,
+      }),
+    });
+    await executePush(pushParams({ includeDatabase: true, files: [] }), openrsync.deps);
+    const undoRunner = makeFakeRunner();
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: undoRunner }).deps,
+    );
+    expect(result.success).toBe(true);
+    expect(steps(undoRunner.calls)).toContain('remote-db-restore');
   });
 
   it('undo of a production database push needs the typed domain', async () => {

@@ -132,7 +132,12 @@ export function prunePushBackups(
     if (!match) continue;
     byStamp.set(match[1], [...(byStamp.get(match[1]) || []), name]);
   }
-  const stamps = [...byStamp.keys()].sort().reverse();
+  // Only finished pushes (with a manifest) count and get pruned: what a
+  // failed push left behind is there because its rollback failed
+  const stamps = [...byStamp.keys()]
+    .filter((stamp) => byStamp.get(stamp)!.some((name) => name.endsWith('.json')))
+    .sort()
+    .reverse();
   for (const stamp of stamps.slice(PUSH_BACKUPS_TO_KEEP)) {
     for (const name of byStamp.get(stamp)!) {
       try {

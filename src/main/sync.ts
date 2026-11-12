@@ -562,6 +562,8 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   // Once the local DB import starts, a cancel/crash leaves the database
   // half-written — these let the catch block restore the pre-pull backup.
   let dbImportStarted = false;
+  // Set once the local site was switched to the server's table prefix
+  let adoptedPrefix: { previous: string; tables: string[]; wpConfigPath: string } | null = null;
   const localBackupPath = path.join(deps.tempDir, `${localSiteId}-pre-pull-backup.sql`);
   const db = getDbCredentials(site);
   const publicPath = localPublicPath(site);
@@ -863,6 +865,8 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
             //    (with the DB rolled back by the catch) leaves a consistent site.
             const cfg = dfs.readFileSync(wpConfigPath, 'utf8');
             dfs.writeFileSync(wpConfigPath, setTablePrefix(cfg, remotePrefix));
+            // A failure after this point must undo the adoption too
+            adoptedPrefix = { previous: localPrefix, tables: keep, wpConfigPath };
           }
         }
       }
@@ -943,6 +947,29 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
           [`-u${db.user}`, `-p${db.password}`, `--socket=${socketPath}`, db.database],
           { stdinFile: localBackupPath },
         );
+        // The backup brought the local-prefix tables back: drop the pulled
+        // ones and point wp-config.php back at the local prefix
+        if (adoptedPrefix) {
+          const dropSql =
+            'SET FOREIGN_KEY_CHECKS=0;' +
+            adoptedPrefix.tables
+              .map((t) => ` DROP TABLE IF EXISTS \`${t.replace(/`/g, '``')}\`;`)
+              .join('') +
+            ' SET FOREIGN_KEY_CHECKS=1;';
+          await run(freshSync(), mysqlBinRestore, [
+            `-u${db.user}`,
+            `-p${db.password}`,
+            `--socket=${socketPath}`,
+            db.database,
+            '-e',
+            dropSql,
+          ]);
+          const cfg = dfs.readFileSync(adoptedPrefix.wpConfigPath, 'utf8');
+          dfs.writeFileSync(
+            adoptedPrefix.wpConfigPath,
+            setTablePrefix(cfg, adoptedPrefix.previous),
+          );
+        }
         deps.notify(
           PRODUCT_NAME,
           `Pull aborted — local database for ${site.name || site.domain} was restored from backup`,
@@ -1145,6 +1172,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     remoteFilesBackup = remoteFilesBackupDir(connection.remoteHome, stamp);
     const knowsAdded = rsync.supportsOutFormat;
     let rsyncOutput = '';
+    let ranRsync = false;
     try {
       if (!selective || (options.files && options.files.length > 0)) {
         const progressParser = makeRsyncProgressParser(rsync, (pct) => {
@@ -1157,6 +1185,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           });
         });
         filesChanged = true;
+        ranRsync = true;
         const rsyncResult = await run(
           sync,
           rsync.bin,
@@ -1192,7 +1221,12 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           dfs.unlinkSync(filesFromPath);
         } catch {}
       }
-      changes = knowsAdded ? parseAddedFromOutFormat(rsyncOutput) : null;
+      // No rsync run (database-only or deletions-only push): nothing unknown
+      changes = !ranRsync
+        ? { files: [], dirs: [], updated: [], deleted: [] }
+        : knowsAdded
+          ? parseAddedFromOutFormat(rsyncOutput)
+          : null;
     }
     // Checked deletions from the preview — executed explicitly (instead of
     // rsync --delete) so unchecked deletions survive. Paths are strictly
@@ -1252,7 +1286,6 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       };
       writePushManifest(deps, backupBase, pushManifest);
     }
-    prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
 
     sendProgress({
       stage: 'files',
@@ -1519,8 +1552,11 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           .map((p) => (p === 'stripe-testmode' ? 'Stripe live mode' : p.split('/')[0]))
           .join(', ')}.`
       : null;
+    // Only now: a failed push must never push a good one's backups out
+    prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
     return { success: true, warning: pushWarning(), note: restoredNote };
   } catch (error: any) {
+    let rollbackFailed = false;
     // The remote DB was (partially) overwritten — restore the backup exported
     // right before the import.
     if (remoteImportStarted && !remoteDatabaseFinished && remoteBackupPath) {
@@ -1536,6 +1572,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           `Push aborted — remote database for ${site.name || site.domain} was restored from backup`,
         );
       } catch (restoreError: any) {
+        rollbackFailed = true;
         console.error(
           '[SSH Sync] Remote DB restore after aborted push failed:',
           restoreError.message,
@@ -1568,11 +1605,21 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           `Push aborted — the files it changed on ${environment.label} were put back`,
         );
       } catch (restoreError: any) {
+        rollbackFailed = true;
         console.error('[SSH Sync] File restore after aborted push failed:', restoreError.message);
         deps.notify(
           PRODUCT_NAME,
           `Push aborted — restoring the files on ${environment.label} FAILED. Backup: ${localFilesBackup || remoteFilesBackup}`,
         );
+      }
+    }
+    // Rolled back: this push's backups have served their purpose. Kept when
+    // a rollback failed, as the user's way back.
+    if (!rollbackFailed) {
+      for (const artifact of [`${backupBase}.sql`, `${backupBase}-files`]) {
+        try {
+          dfs.rmSync(artifact, { recursive: true, force: true });
+        } catch {}
       }
     }
     if (error instanceof CancelledError) {
