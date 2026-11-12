@@ -102,6 +102,7 @@ describe('cli socket', () => {
       { type: 'result', success: true, message: 'done' },
     ]);
     await new Promise((r) => server.close(r));
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 
@@ -122,6 +123,7 @@ describe('cli socket disconnect', () => {
     });
     await gone;
     await new Promise((r) => server.close(r));
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
 

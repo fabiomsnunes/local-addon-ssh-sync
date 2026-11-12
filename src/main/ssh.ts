@@ -199,6 +199,39 @@ function getControlDir(): string {
   return controlDir;
 }
 
+// Our control dirs hold only sockets and the password-free askpass helper.
+// Removed on quit; ones left by a crash are swept at the next start.
+export function removeControlDir(): void {
+  if (!controlDir) return;
+  try {
+    fs.rmSync(controlDir, { recursive: true, force: true });
+  } catch {
+    // best effort
+  }
+  controlDir = null;
+}
+
+export function sweepStaleControlDirs(olderThanMs = 24 * 60 * 60 * 1000): void {
+  const tmp = os.tmpdir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(tmp);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!/^ssh-sync-[A-Za-z0-9]{6}$/.test(entry)) continue;
+    const dir = path.join(tmp, entry);
+    try {
+      if (Date.now() - fs.statSync(dir).mtimeMs > olderThanMs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // another process's dir, or already gone
+    }
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

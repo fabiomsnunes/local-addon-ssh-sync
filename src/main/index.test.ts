@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -42,6 +42,8 @@ import {
   askpassEnvironment,
   askpassHelperPath,
   serveAskpass,
+  removeControlDir,
+  sweepStaleControlDirs,
   openRemoteConnection,
   sshArgs,
   scpArgs,
@@ -875,6 +877,8 @@ describe('EXCLUDE_PATTERNS', () => {
 });
 
 describe('password authentication', () => {
+  afterAll(() => removeControlDir());
+
   it('tries the password once, never keys, and never batch mode', () => {
     const args = masterSshArgs(env({ auth: 'password' }), '/tmp/cm-1');
     expect(args).toContain('PubkeyAuthentication=no');
@@ -899,6 +903,7 @@ describe('password authentication', () => {
     });
     expect(stdout).toBe("pa ss'word\n");
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(path.dirname(socketPath), { recursive: true, force: true });
   });
 
   it('refuses to connect a password environment with no password', async () => {
@@ -964,5 +969,23 @@ describe('parseNeutralizeOutput', () => {
       },
     });
     expect(parseNeutralizeOutput('Warning: x')).toBeNull();
+  });
+});
+
+describe('control dir cleanup', () => {
+  it('sweeps only our own stale dirs', () => {
+    const tmp = os.tmpdir();
+    const stale = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    const fresh = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    const other = fs.mkdtempSync(path.join(tmp, 'not-ours-'));
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(stale, old, old);
+    fs.utimesSync(other, old, old);
+    sweepStaleControlDirs();
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+    fs.rmSync(fresh, { recursive: true });
+    fs.rmSync(other, { recursive: true });
   });
 });
