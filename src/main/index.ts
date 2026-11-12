@@ -55,6 +55,7 @@ export * from './validators';
 export * from './rsync';
 export * from './ssh';
 export * from './sync';
+export * from './safeClone';
 export * from './localPaths';
 export * from './config';
 export {

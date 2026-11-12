@@ -31,6 +31,8 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
   const [selectedEnvId, setSelectedEnvId] = useState<string>(initialEnvironmentId);
   const [includeDatabase, setIncludeDatabase] = useState(true);
   const [includeUploads, setIncludeUploads] = useState(false);
+  const [makeSafe, setMakeSafe] = useState(true);
+  const [safeCloneNote, setSafeCloneNote] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
@@ -91,12 +93,15 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
     setIsComplete(false);
     setSyncProgress({ stage: 'starting', progress: 0, message: 'Starting pull...' });
 
+    setSafeCloneNote(null);
     const result = await ipcRenderer.invoke('sshsync:pull', site.id, site, env.id, {
       includeUploads,
       includeDatabase,
+      makeSafe,
     });
 
     if (result.success) {
+      setSafeCloneNote(result.note || null);
       loadLastSynced();
     } else {
       // Cancelled syncs return to the form without an error banner
@@ -294,6 +299,16 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
                     checked={includeUploads}
                     onChange={(checked: boolean) => setIncludeUploads(checked)}
                   />
+                  <div style={{ height: '12px' }} />
+                  <Checkbox
+                    label="Make the local copy safe (recommended)"
+                    checked={makeSafe}
+                    onChange={(checked: boolean) => setMakeSafe(checked)}
+                  />
+                  <div style={{ fontSize: '12px', opacity: 0.6, margin: '6px 0 0 28px' }}>
+                    Turns off backup, mail and remote-management plugins and blocks outgoing
+                    requests and email, so this copy cannot reach the live site&apos;s services.
+                  </div>
                 </div>
               </div>
 
@@ -445,6 +460,19 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
               <span style={{ opacity: 0.7, marginBottom: '24px', display: 'block' }}>
                 Your site has been synced successfully.
               </span>
+              {safeCloneNote && (
+                <span
+                  style={{
+                    opacity: 0.7,
+                    fontSize: '12px',
+                    marginBottom: '24px',
+                    display: 'block',
+                    maxWidth: '360px',
+                  }}
+                >
+                  {safeCloneNote}
+                </span>
+              )}
               <TextButton onClick={handleClose}>Close</TextButton>
             </div>
           )}

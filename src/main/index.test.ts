@@ -55,6 +55,8 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
+  ensureLocalEnvironmentType,
+  parseNeutralizeOutput,
 } from './index';
 
 const env = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironment => ({
@@ -775,6 +777,8 @@ describe('EXCLUDE_PATTERNS', () => {
       '*.sql',
       'node_modules/',
       'local-xdebuginfo.php',
+      // Our safety mu-plugin for pulled copies must never reach a server
+      'wp-content/mu-plugins/ssh-sync-local-safety.php',
       // Host-specific persistent-cache drop-ins: object-cache.php points at the
       // host's Redis/Memcached, advanced-cache.php at its page cache. Syncing
       // either way would point one host at the other's cache backend.
@@ -898,5 +902,35 @@ describe('password authentication', () => {
     await expect(
       openRemoteConnection(env({ auth: 'password' }), async () => ({ code: 0, stderr: '' }), null),
     ).rejects.toThrow(/No password saved/);
+  });
+});
+
+describe('ensureLocalEnvironmentType', () => {
+  it('replaces an existing value', () => {
+    expect(
+      ensureLocalEnvironmentType("<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'production' );\n"),
+    ).toBe("<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'local' );\n");
+  });
+
+  it('adds it before "That\'s all, stop editing!"', () => {
+    const out = ensureLocalEnvironmentType(
+      "<?php\n$table_prefix = 'wp_';\n/* That's all, stop editing! Happy publishing. */\nrequire_once ABSPATH . 'wp-settings.php';\n",
+    );
+    expect(out.indexOf('WP_ENVIRONMENT_TYPE')).toBeLessThan(out.indexOf("That's all"));
+  });
+
+  it('adds it before wp-settings.php when there is no marker', () => {
+    const out = ensureLocalEnvironmentType("<?php\nrequire_once ABSPATH . 'wp-settings.php';\n");
+    expect(out.indexOf('WP_ENVIRONMENT_TYPE')).toBeLessThan(out.indexOf('wp-settings'));
+  });
+});
+
+describe('parseNeutralizeOutput', () => {
+  it('reads the JSON summary and rejects anything else', () => {
+    expect(parseNeutralizeOutput('{"deactivated":["a/a.php"],"stripe":false}')).toEqual({
+      deactivated: ['a/a.php'],
+      stripe: false,
+    });
+    expect(parseNeutralizeOutput('Warning: x')).toBeNull();
   });
 });
