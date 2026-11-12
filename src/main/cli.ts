@@ -15,10 +15,15 @@ Commands:
       --unsafe                      Do not make the local copy safe
   push <site> <env>               Show what a push would change (dry run)
       --yes                         Push the listed files
+      --production                  Required to push files to a production environment
       --delete                      Also delete the listed remote-only files
       --db                          Also push the database (never to production)
       --uploads                     Include wp-content/uploads
       --all-modified                Every changed file, not only newer ones
+      --include-stale               Also push files only in Local and older than the
+                                    last pull (usually deleted on the server since)
+  undo <site> <env>               Show what undoing the last push would restore
+      --yes                         Undo it (files, and the database if it was pushed)
 
 <site> is the Local site name, id or domain; <env> the environment name or id.
 Local must be running.`;
@@ -28,9 +33,17 @@ export function parseArgs(argv: string[]): CliRequest | { error: string } {
   const flags = new Set(rest.filter((a) => a.startsWith('--')));
   const unknown = [...flags].filter(
     (f) =>
-      !['--no-db', '--uploads', '--unsafe', '--yes', '--delete', '--db', '--all-modified'].includes(
-        f,
-      ),
+      ![
+        '--no-db',
+        '--uploads',
+        '--unsafe',
+        '--yes',
+        '--delete',
+        '--db',
+        '--all-modified',
+        '--production',
+        '--include-stale',
+      ].includes(f),
   );
   if (!command || command === 'help' || command === '--help') return { error: USAGE };
   if (unknown.length) return { error: `Unknown option ${unknown[0]}\n\n${USAGE}` };
@@ -58,8 +71,11 @@ export function parseArgs(argv: string[]): CliRequest | { error: string } {
       mode: flags.has('--all-modified') ? 'all' : 'newer',
       deletions: flags.has('--delete'),
       yes: flags.has('--yes'),
+      production: flags.has('--production'),
+      includeStale: flags.has('--include-stale'),
     };
   }
+  if (command === 'undo') return { command, site, environment, yes: flags.has('--yes') };
   return { error: `Unknown command ${command}\n\n${USAGE}` };
 }
 

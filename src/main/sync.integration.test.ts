@@ -15,6 +15,8 @@ import {
   ActiveSync,
   RunOptions,
   RsyncInfo,
+  executeUndoPush,
+  latestPushManifest,
 } from './index';
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,16 @@ function describeStep(cmd: string, args: string[], opts: RunOptions): string {
     if (remote.includes('db import')) return 'remote-db-import';
     if (remote.includes('search-replace')) return 'remote-search-replace';
     if (remote.includes('cache flush')) return 'remote-cache';
+    if (remote.includes('SSHSYNC_LOCK')) return 'remote-lock';
+    if (remote.includes('.ssh-sync-lock-') && remote.includes('rm -rf')) return 'remote-unlock';
+    if (remote.includes('.ssh-sync-files-') && remote.includes('[ -d')) {
+      return remote.includes('cp -a') ? 'remote-files-restore' : 'remote-files-backup-check';
+    }
+    if (remote.includes('.ssh-sync-files-') && remote.includes('mv --'))
+      return 'remote-move-to-backup';
+    if (remote.includes('.ssh-sync-files-') && remote.includes('rm -rf'))
+      return 'remote-files-backup-remove';
+    if (remote.includes('rmdir --')) return 'remote-rmdir';
     if (remote.includes('eval-file -')) return 'remote-restore-neutralized';
     if (remote.includes('rm -rf')) return 'remote-rm';
     if (remote.includes('rm -f')) return 'remote-cleanup';
@@ -92,6 +104,12 @@ interface FakeRunnerConfig {
   pullDumpSql?: string | Buffer;
   // JSON the neutralize script prints (safe clone)
   neutralizeOutput?: string;
+  // Another push holds the server lock
+  lockBusy?: string;
+  // The push replaced or deleted files, so the server backup folder exists
+  remoteFilesBackupExists?: boolean;
+  // rsync --out-format lines the push prints (new files and folders)
+  pushOutFormat?: string;
 }
 
 interface RecordedCall {
@@ -160,6 +178,26 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     // Remote table prefix lookup (pull reconciliation).
     if (step === 'remote-config-prefix' && opts.onStdout) {
       opts.onStdout(`${cfg.remotePrefix ?? ''}\n`);
+    }
+    if (step === 'remote-lock' && opts.onStdout) {
+      opts.onStdout(cfg.lockBusy ? `SSHSYNC_LOCK=busy ${cfg.lockBusy}\n` : 'SSHSYNC_LOCK=ok\n');
+    }
+    if (step === 'remote-files-backup-check' && opts.onStdout) {
+      opts.onStdout(cfg.remoteFilesBackupExists ? 'yes\n' : '');
+    }
+    if (
+      step === 'rsync' &&
+      cfg.pushOutFormat &&
+      opts.onStdout &&
+      args.some((a) => a.startsWith('--out-format='))
+    ) {
+      opts.onStdout(cfg.pushOutFormat);
+    }
+    // A server backup folder downloaded to this machine: materialize it
+    if (step === 'rsync' && String(args[args.length - 2]).includes('.ssh-sync-files-')) {
+      const dest = args[args.length - 1];
+      fs.mkdirSync(dest, { recursive: true });
+      fs.writeFileSync(path.join(dest, 'replaced.php'), 'old');
     }
     if (step === 'remote-restore-neutralized' && opts.onStdout) {
       opts.onStdout('{"restored":["updraftplus/updraftplus.php","stripe-testmode"]}\n');
@@ -248,6 +286,8 @@ const fakeConnection = (): RemoteConnection => ({
   target: 'deploy@35.1.2.3',
   sshOptions: ['-o', 'Port=12345', '-o', 'ControlPath=/tmp/cm-test', '-o', 'ControlMaster=no'],
   remoteRoot: '/var/www/example.com',
+  remoteHome: '/home/deploy',
+  siteUrl: 'https://example.com',
   close: vi.fn(async () => {}),
 });
 
@@ -292,6 +332,7 @@ function makeDeps(overrides: DepsOverrides = {}): {
       else neutralizeRecords.delete(id);
     },
     loadNeutralizeRecord: (id) => neutralizeRecords.get(id) ?? null,
+    latestPushManifest: (id, environmentId) => latestPushManifest(backupsDir, id, environmentId),
     ensureConfigDir: () => fs.mkdirSync(tempDir, { recursive: true }),
     tempDir,
     backupsDir,
@@ -785,9 +826,9 @@ describe('executePush', () => {
     expect(labels).not.toContain('remote-db-restore'); // no rollback on success
 
     // The pre-push backup lives on this machine; every remote temp file is removed
-    expect(
-      fs.readdirSync(backupsDir).filter((f) => f.startsWith(`${SITE_ID}-staging-`)),
-    ).toHaveLength(1);
+    const kept = fs.readdirSync(backupsDir).filter((f) => f.startsWith(`${SITE_ID}-staging-`));
+    expect(kept.filter((f) => f.endsWith('.sql'))).toHaveLength(1);
+    expect(kept.filter((f) => f.endsWith('.json'))).toHaveLength(1);
     const cleanups = calls.filter((c) => c.step === 'remote-cleanup');
     expect(cleanups).toHaveLength(2); // the backup export and the uploaded dump
     for (const c of cleanups) expect(c.args[c.args.length - 1]).toContain(REMOTE_TEMP);
@@ -883,6 +924,123 @@ describe('executePush', () => {
     const { deps } = makeDeps({ runner });
     await executePush(pushParams({ includeDatabase: false }), deps);
     expect(steps(runner.calls)).not.toContain('remote-restore-neutralized');
+  });
+
+  it('refuses to push while another push holds the server lock', async () => {
+    const runner = makeFakeRunner({ lockBusy: 'other-mac (site) since 2026-11-12T10:00:00Z' });
+    const { deps } = makeDeps({ runner });
+    const result = await executePush(pushParams(), deps);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Another push to Staging is running: other-mac/);
+    const labels = steps(runner.calls);
+    expect(labels).not.toContain('rsync');
+    expect(labels).not.toContain('remote-db-export');
+    // Not our lock: never released by us
+    expect(labels).not.toContain('remote-unlock');
+  });
+
+  it('takes the lock first and always releases it', async () => {
+    const runner = makeFakeRunner({ failAt: 'remote-db-import' });
+    const { deps } = makeDeps({ runner });
+    await executePush(pushParams(), deps);
+    const labels = steps(runner.calls);
+    expect(labels[0]).toBe('remote-lock');
+    expect(labels).toContain('remote-unlock');
+  });
+
+  it('backs up replaced files, records added ones, and leaves nothing on the server', async () => {
+    const runner = makeFakeRunner({
+      remoteFilesBackupExists: true,
+      pushOutFormat:
+        'SSHSYNC|<f+++++++++|wp-content/new.php\nSSHSYNC|cd+++++++++|wp-content/newdir/\nSSHSYNC|<f.st......|wp-content/changed.php\n',
+    });
+    const { deps } = makeDeps({ runner });
+    const result = await executePush(
+      pushParams({ includeDatabase: false, files: ['wp-content/new.php'], deletions: ['old.php'] }),
+      deps,
+    );
+    expect(result.success).toBe(true);
+    const push = runner.calls.find((c) => c.step === 'rsync')!;
+    expect(push.args).toContain('--backup');
+    expect(push.args.some((a) => a.startsWith('--backup-dir=/home/deploy/.ssh-sync-files-'))).toBe(
+      true,
+    );
+    const labels = steps(runner.calls);
+    expect(labels).toContain('remote-move-to-backup'); // deletions are moved, not removed
+    expect(labels).not.toContain('remote-rm');
+    expect(labels).toContain('remote-files-backup-remove');
+    const latest = latestPushManifest(backupsDir, SITE_ID, 'staging')!;
+    expect(latest.manifest).toMatchObject({
+      environmentId: 'staging',
+      added: ['wp-content/new.php'],
+      addedDirs: ['wp-content/newdir'],
+      hasFilesBackup: true,
+      hasDatabaseBackup: false,
+    });
+    expect(fs.existsSync(`${latest.base}-files/replaced.php`)).toBe(true);
+  });
+
+  it('puts the files back when the database step fails', async () => {
+    const runner = makeFakeRunner({
+      failAt: 'remote-db-import',
+      remoteFilesBackupExists: true,
+      pushOutFormat: 'SSHSYNC|<f+++++++++|wp-content/new.php\n',
+    });
+    const { deps, notify } = makeDeps({ runner });
+    const result = await executePush(pushParams(), deps);
+    expect(result.success).toBe(false);
+    const labels = steps(runner.calls);
+    expect(labels).toContain('remote-db-restore');
+    // the downloaded backup goes back up, the added file is removed
+    const restoreUpload = runner.calls.filter((c) => c.step === 'rsync').pop()!;
+    expect(restoreUpload.args[restoreUpload.args.length - 2]).toMatch(/-files\/$/);
+    const removal = runner.calls.find(
+      (c) =>
+        c.step === 'remote-cleanup' &&
+        String(c.args[c.args.length - 1]).includes('wp-content/new.php'),
+    );
+    expect(removal).toBeDefined();
+    expect(notify).toHaveBeenCalledWith('SSH Sync', expect.stringContaining('were put back'));
+  });
+
+  it('undo restores the files and the database of the last push, once', async () => {
+    const first = makeFakeRunner({
+      remoteFilesBackupExists: true,
+      pushOutFormat: 'SSHSYNC|<f+++++++++|wp-content/new.php\n',
+    });
+    const { deps } = makeDeps({ runner: first });
+    expect((await executePush(pushParams(), deps)).success).toBe(true);
+
+    const undoRunner = makeFakeRunner();
+    const undo = makeDeps({ runner: undoRunner });
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      undo.deps,
+    );
+    expect(result).toMatchObject({ success: true, note: 'Files and database restored.' });
+    const labels = steps(undoRunner.calls);
+    // the import of the pre-push backup (labelled a restore by the fake runner)
+    expect(labels).toContain('remote-db-restore');
+    expect(labels).toContain('remote-unlock');
+    // The manifest is gone: the same push cannot be undone twice
+    expect(latestPushManifest(backupsDir, SITE_ID, 'staging')).toBeNull();
+  });
+
+  it('undo of a production database push needs the typed domain', async () => {
+    const { deps } = makeDeps({ runner: makeFakeRunner() });
+    await executePush(
+      pushParams(
+        { includeDatabase: true, migrationMode: true, confirmDomain: 'example.com' },
+        { isProduction: true, id: 'staging' },
+      ),
+      deps,
+    );
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment({ isProduction: true }) },
+      makeDeps({ runner: makeFakeRunner() }).deps,
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Type example\.com to confirm/);
   });
 
   it('files-only push skips the database backup entirely', async () => {

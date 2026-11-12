@@ -117,6 +117,10 @@ export interface RemoteConnection {
   sshOptions: string[];
   // The WordPress root resolved to an absolute path on the server
   remoteRoot: string;
+  // The SSH user's home (absolute), for our temp files, backups and lock
+  remoteHome: string;
+  // WordPress's siteurl there, already checked against the environment
+  siteUrl: string;
   close: () => Promise<void>;
 }
 
@@ -174,6 +178,7 @@ export interface PullPushDeps {
     | 'unlinkSync'
     | 'readdirSync'
     | 'mkdirSync'
+    | 'rmSync'
   >;
   runCommand: (
     sync: ActiveSync,
@@ -200,6 +205,11 @@ export interface PullPushDeps {
   // What the safe-copy step changed in the local database (null clears it)
   saveNeutralizeRecord: (localSiteId: string, record: NeutralizeRecord | null) => void;
   loadNeutralizeRecord: (localSiteId: string) => NeutralizeRecord | null;
+  // The newest undoable push to an environment (manifest + backup base path)
+  latestPushManifest: (
+    localSiteId: string,
+    environmentId: string,
+  ) => { base: string; manifest: unknown } | null;
   ensureConfigDir: () => void;
   tempDir: string;
   // Remote databases exported before a push land here (the rollback source)

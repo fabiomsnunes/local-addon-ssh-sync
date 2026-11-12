@@ -23,6 +23,8 @@ import {
   visibleDiffRows,
   summarizeSelection,
   buildPushFileSelection,
+  isStaleLocalOnly,
+  lastPullFrom,
 } from './pushHelpers';
 import { STATUS, tint } from './colors';
 import { ServerEnvironment, SiteProfile, SyncProgress } from './types';
@@ -40,6 +42,8 @@ interface DiffRow {
   sizeBytes: number;
   localMtime?: number;
   selected: boolean;
+  // Only in Local and older than the last pull: starts unticked
+  stale?: boolean;
 }
 
 interface Props {
@@ -213,7 +217,13 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
       if (result.success) {
         setDegraded(!!result.degraded);
         const visible = visibleDiffRows<DiffRow>(result.rows || []);
-        setRows(visible.map((r: DiffRow) => ({ ...r, selected: true })));
+        const lastPull = lastPullFrom(profile.history, selectedEnvId);
+        setRows(
+          visible.map((r: DiffRow) => {
+            const stale = isStaleLocalOnly(r, lastPull);
+            return { ...r, stale, selected: !stale };
+          }),
+        );
       } else {
         setError(result.error || 'Preview failed');
         setRows([]);
@@ -321,6 +331,19 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
           >
             {row.path}
             {row.isDir ? '/' : ''}
+            {row.stale && (
+              <span
+                style={{
+                  marginLeft: '8px',
+                  fontFamily: 'inherit',
+                  fontSize: '11px',
+                  opacity: 0.6,
+                  fontStyle: 'normal',
+                }}
+              >
+                Only in Local, older than your last pull
+              </span>
+            )}
           </span>
         );
       case 'localMtime':

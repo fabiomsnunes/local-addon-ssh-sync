@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'child_process';
 import * as net from 'net';
 
 import { REMOTE_TEMP_PREFIX } from './constants';
+import { remoteDomainFromUrl } from './validators';
 import { ActiveSync, RemoteConnection, RunOptions, ServerEnvironment } from './types';
 
 type RunCommand = (
@@ -126,7 +127,7 @@ export function parseRemoteTempPath(stdout: string): string | null {
 
 // What the probe run right after connecting reports about the WordPress root.
 export type RemoteProbeResult =
-  | { ok: true; remoteRoot: string }
+  | { ok: true; remoteRoot: string; siteUrl: string; remoteHome: string }
   | { ok: false; reason: 'path' | 'rsync' | 'wp' | 'unexpected' };
 
 const PROBE_MARKER = 'SSHSYNC_PROBE';
@@ -138,11 +139,12 @@ export function remoteProbeCommand(environment: ServerEnvironment): string {
     // Our own dumps left by a sync that died mid-transfer (dropped connection,
     // Local closed) hold a full database: sweep any older than two hours.
     `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
-    // Our own dumps left by a sync that died mid-transfer (dropped connection,
-    // Local closed) hold a full database: sweep any older than two hours.
-    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
     `command -v rsync >/dev/null 2>&1 || { echo ${PROBE_MARKER}=rsync; exit 0; }`,
     `${environment.wpCommand} --skip-plugins --skip-themes core is-installed >/dev/null 2>&1 || { echo ${PROBE_MARKER}=wp; exit 0; }`,
+    // The site WordPress says lives here, to catch a folder that belongs to
+    // another site on the same server
+    `printf '${PROBE_MARKER}_URL=%s\\n' "$(${environment.wpCommand} --skip-plugins --skip-themes option get siteurl 2>/dev/null)"`,
+    `printf '${PROBE_MARKER}_HOME=%s\\n' "$HOME"`,
     `echo ${PROBE_MARKER}=ok`,
   ].join('; ');
 }
@@ -161,7 +163,20 @@ export function parseRemoteProbe(stdout: string): RemoteProbeResult {
   // The root goes into rsync's remote spec and every remote command: refuse
   // anything outside a conservative character set.
   if (!/^\/[A-Za-z0-9_./@+-]*$/.test(remoteRoot)) return { ok: false, reason: 'unexpected' };
-  return { ok: true, remoteRoot };
+  const siteUrl = (stdout.match(new RegExp(`${PROBE_MARKER}_URL=(.*)`)) || [])[1]?.trim() || '';
+  const remoteHome = (stdout.match(new RegExp(`${PROBE_MARKER}_HOME=(.*)`)) || [])[1]?.trim() || '';
+  if (!/^\/[A-Za-z0-9_./@+-]*$/.test(remoteHome)) return { ok: false, reason: 'unexpected' };
+  return { ok: true, remoteRoot, siteUrl, remoteHome };
+}
+
+// The probed siteurl must be the configured site (host and path; http/https
+// and a trailing slash do not matter). A different one means the folder
+// belongs to another site on the same server: refuse before any transfer.
+export function siteUrlMismatch(environment: ServerEnvironment, siteUrl: string): string | null {
+  const expected = remoteDomainFromUrl(environment.remoteUrl);
+  const actual = remoteDomainFromUrl(siteUrl);
+  if (expected && actual && expected.toLowerCase() === actual.toLowerCase()) return null;
+  return `The WordPress in "${environment.remotePath}" is ${siteUrl || 'a site without a readable siteurl'}, not ${environment.remoteUrl}. Fix the WordPress folder or the site URL of ${environment.label}.`;
 }
 
 export function describeProbeFailure(
@@ -418,6 +433,8 @@ export async function openRemoteConnection(
     target,
     sshOptions: baseSshOptions(environment, controlPath),
     remoteRoot: '',
+    remoteHome: '',
+    siteUrl: '',
     close,
   };
   registered = connection;
@@ -440,7 +457,14 @@ export async function openRemoteConnection(
     await close();
     throw new Error(describeProbeFailure(probe.reason, environment));
   }
+  const mismatch = siteUrlMismatch(environment, probe.siteUrl);
+  if (mismatch) {
+    await close();
+    throw new Error(mismatch);
+  }
   connection.remoteRoot = probe.remoteRoot;
+  connection.remoteHome = probe.remoteHome;
+  connection.siteUrl = probe.siteUrl;
   return connection;
 }
 

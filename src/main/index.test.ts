@@ -57,6 +57,12 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
+  siteUrlMismatch,
+  parseAddedFromOutFormat,
+  moveToBackupCommand,
+  acquireLockCommand,
+  parseLockOutput,
+  lockDir,
   ensureLocalCopyConfig,
   restoreNeutralizedScript,
   parseNeutralizeOutput,
@@ -324,17 +330,26 @@ describe('ssh helpers', () => {
     expect(command).toContain(`cd ~/'public_html'`);
     expect(command).toContain('core is-installed');
     expect(command).toContain(`-name '.ssh-sync-*' -mmin +120 -delete`);
-    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE=ok\n')).toEqual({
+    expect(
+      parseRemoteProbe(
+        'SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE_URL=https://example.com\nSSHSYNC_PROBE_HOME=/home/u\nSSHSYNC_PROBE=ok\n',
+      ),
+    ).toEqual({
       ok: true,
       remoteRoot: '/home/u/public_html',
+      siteUrl: 'https://example.com',
+      remoteHome: '/home/u',
     });
+    expect(command).toContain('option get siteurl');
     expect(parseRemoteProbe('SSHSYNC_PROBE=path\n')).toEqual({ ok: false, reason: 'path' });
     expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/x\nSSHSYNC_PROBE=wp\n')).toEqual({
       ok: false,
       reason: 'wp',
     });
     expect(parseRemoteProbe('Welcome!\n')).toEqual({ ok: false, reason: 'unexpected' });
-    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE=ok\n')).toEqual({
+    expect(
+      parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE_HOME=/h\nSSHSYNC_PROBE=ok\n'),
+    ).toEqual({
       ok: false,
       reason: 'unexpected',
     });
@@ -994,5 +1009,58 @@ describe('control dir cleanup', () => {
     fs.rmSync(foreign, { recursive: true });
     fs.rmSync(fresh, { recursive: true });
     fs.rmSync(other, { recursive: true });
+  });
+});
+
+describe('siteUrlMismatch', () => {
+  it('accepts the configured site whatever the scheme or trailing slash', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com')).toBeNull();
+    expect(siteUrlMismatch(env(), 'http://example.com/')).toBeNull();
+    expect(
+      siteUrlMismatch(env({ remoteUrl: 'https://example.com/blog' }), 'https://example.com/blog'),
+    ).toBeNull();
+  });
+
+  it('refuses a folder that holds another site', () => {
+    expect(siteUrlMismatch(env(), 'https://other.com')).toMatch(
+      /is https:\/\/other\.com, not https:\/\/example\.com/,
+    );
+    expect(siteUrlMismatch(env(), 'https://www.example.com')).not.toBeNull();
+    expect(siteUrlMismatch(env(), '')).toMatch(/without a readable siteurl/);
+  });
+});
+
+describe('push backups and lock', () => {
+  it('reads new files and folders from rsync out-format lines', () => {
+    expect(
+      parseAddedFromOutFormat(
+        [
+          'SSHSYNC|<f+++++++++|a/new.php',
+          'SSHSYNC|cd+++++++++|a/dir/',
+          'SSHSYNC|<f.st......|a/changed.php',
+          'SSHSYNC|.d..t......|./',
+          '   1,234  42%  progress\rSSHSYNC|<f+++++++++|after-progress.php',
+        ].join('\n'),
+      ),
+    ).toEqual({ files: ['a/new.php', 'after-progress.php'], dirs: ['a/dir'] });
+  });
+
+  it('moves deletions into the backup folder instead of removing them', () => {
+    const command = moveToBackupCommand('/home/u/.ssh-sync-files-x', ["'a/old.php'"]);
+    expect(command).toContain(`b='/home/u/.ssh-sync-files-x'`);
+    expect(command).toContain(`mv -- "$p" "$b/$p"`);
+    expect(command).not.toContain('rm ');
+  });
+
+  it('locks per server folder with an atomic mkdir and reports the holder', () => {
+    const lock = lockDir('/home/u', '/var/www/a');
+    expect(lock).toMatch(/^\/home\/u\/\.ssh-sync-lock-[0-9a-f]{12}$/);
+    expect(lockDir('/home/u', '/var/www/b')).not.toBe(lock);
+    expect(acquireLockCommand(lock, "me's mac")).toContain(`if mkdir '${lock}'`);
+    expect(parseLockOutput('SSHSYNC_LOCK=ok\n')).toEqual({ ok: true });
+    expect(parseLockOutput('SSHSYNC_LOCK=busy mac (site) since x\n')).toEqual({
+      ok: false,
+      owner: 'mac (site) since x',
+    });
   });
 });

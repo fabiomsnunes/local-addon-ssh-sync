@@ -30,13 +30,15 @@ import {
   rsyncRemoteShell,
   rsyncRemoteRoot,
 } from './ssh';
-import { executePull, executePush } from './sync';
+import { executePull, executePush, executeUndoPush } from './sync';
 import {
   CliRequest,
   CliMessage,
   CLI_SOCKET_NAME,
   readLocalSite,
   startCliServer,
+  isStaleLocalOnly,
+  lastPullFrom,
   cliLauncherScript,
 } from './cliProtocol';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
@@ -60,6 +62,7 @@ import {
   cleanupTempFiles,
   saveNeutralizeRecord,
   loadNeutralizeRecord,
+  latestPushManifest,
 } from './config';
 
 // Re-export the public API from the extracted modules so existing imports
@@ -70,6 +73,7 @@ export * from './rsync';
 export * from './ssh';
 export * from './sync';
 export * from './safeClone';
+export * from './pushBackup';
 export * from './localPaths';
 export * from './config';
 export {
@@ -269,6 +273,8 @@ function defaultPullPushDeps(sendProgress: (progress: SyncProgress) => void): Pu
     notify,
     saveNeutralizeRecord,
     loadNeutralizeRecord,
+    latestPushManifest: (siteId: string, environmentId: string) =>
+      latestPushManifest(getBackupsDir(), siteId, environmentId),
     ensureConfigDir,
     tempDir: getTempDir(),
     backupsDir: getBackupsDir(),
@@ -477,6 +483,42 @@ async function handleCliRequest(
     });
   }
 
+  if (request.command === 'undo') {
+    const latest = latestPushManifest(getBackupsDir(), site.id, environment.id);
+    if (!latest) return fail(`No push to ${environment.label} to undo.`);
+    const manifest = latest.manifest as {
+      stamp: string;
+      hasDatabaseBackup: boolean;
+      added: string[] | null;
+    };
+    const what = `the push of ${manifest.stamp.replace(/T(\d\d)-(\d\d).*/, ' $1:$2 UTC')}: files${manifest.hasDatabaseBackup ? ' and database' : ''}`;
+    if (!request.yes) {
+      return send({
+        type: 'result',
+        success: true,
+        message: `Would undo ${what}. Add --yes to undo.`,
+      });
+    }
+    if (manifest.hasDatabaseBackup && environment.isProduction) {
+      return fail(
+        `Undoing a database push to ${environment.label} (production) is only possible in the app.`,
+      );
+    }
+    const result = await runCancellable(() =>
+      executeUndoPush({ localSiteId: site.id, site, environment }, defaultPullPushDeps(progress)),
+    );
+    if (!result.success) return fail(result.error || 'Undo failed.');
+    return send({
+      type: 'result',
+      success: true,
+      message: [`Undid ${what}.`, result.warning].filter(Boolean).join(' '),
+    });
+  }
+
+  if (request.yes && environment.isProduction && !request.production) {
+    return fail(`${environment.label} is production: add --production to push files to it.`);
+  }
+
   // push: always from a fresh preview, so only what it lists can change
   progress({ stage: 'preview', progress: 1, message: `Comparing with ${environment.label}...` });
   const preview = await previewPush(site.id, site, environment, {
@@ -484,8 +526,16 @@ async function handleCliRequest(
     includeUploads: request.includeUploads,
   });
   if (!preview.success) return fail(preview.error);
+  const lastPull = lastPullFrom(getProfile(site.id)?.history, environment.id);
   const rows = preview.rows.filter((r) => !(r.isDir && r.op !== 'delete'));
-  const files = rows.filter((r) => r.op !== 'delete');
+  const stale = request.includeStale ? [] : rows.filter((r) => isStaleLocalOnly(r, lastPull));
+  for (const r of stale) {
+    send({
+      type: 'output',
+      text: `  ${r.path}  (only in Local, older than the last pull: skipped, add --include-stale)`,
+    });
+  }
+  const files = rows.filter((r) => r.op !== 'delete' && !stale.includes(r));
   const deletions = rows.filter((r) => r.op === 'delete');
   for (const r of files) {
     send({
@@ -736,6 +786,48 @@ export default function (context: AddonMainContext): void {
         defaultPullPushDeps(sendProgress),
       );
     };
+
+  // The newest push to each environment that can still be undone
+  ipcMain.handle(
+    'sshsync:undoablePushes',
+    async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+      const environments = getProfile(localSiteId)?.environments || [];
+      const result: Record<string, { stamp: string; database: boolean }> = {};
+      for (const environment of environments) {
+        const latest = latestPushManifest(getBackupsDir(), localSiteId, environment.id);
+        if (latest) {
+          const m = latest.manifest as { stamp: string; hasDatabaseBackup: boolean };
+          result[environment.id] = { stamp: m.stamp, database: Boolean(m.hasDatabaseBackup) };
+        }
+      }
+      return result;
+    },
+  );
+
+  ipcMain.handle(
+    'sshsync:undoLastPush',
+    async (
+      event: IpcMainInvokeEvent,
+      localSiteId: string,
+      site: SiteInfo,
+      environmentId: string,
+      confirmDomain?: string,
+    ) => {
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) return { success: false, error: 'Unknown environment.' };
+      const sendProgress = (progress: SyncProgress) => {
+        event.sender.send('sshsync:syncProgress', {
+          ...progress,
+          siteId: localSiteId,
+          mode: 'push',
+        });
+      };
+      return executeUndoPush(
+        { localSiteId, site, environment, confirmDomain },
+        defaultPullPushDeps(sendProgress),
+      );
+    },
+  );
 
   ipcMain.handle('sshsync:pull', syncHandler('pull'));
   ipcMain.handle('sshsync:push', syncHandler('push'));
