@@ -22,6 +22,9 @@ export interface PushManifest {
   deleted?: string[];
   hasFilesBackup: boolean;
   hasDatabaseBackup: boolean;
+  // The server's table prefix before a database push changed it (undo sets
+  // it back; wp-config.php itself is never synced or backed up)
+  remotePrefixBefore?: string;
 }
 
 export const REMOTE_FILES_BACKUP_PREFIX = '.ssh-sync-files-';

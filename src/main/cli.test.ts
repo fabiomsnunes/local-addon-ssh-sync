@@ -11,6 +11,8 @@ import {
   CliMessage,
   isStaleLocalOnly,
   lastPullFrom,
+  cliPullOptions,
+  cliPushOptions,
 } from './cliProtocol';
 
 describe('ssh-sync arguments', () => {
@@ -66,6 +68,34 @@ describe('ssh-sync arguments', () => {
     expect(parseArgs(['pull', 'mysite'])).toHaveProperty('error');
     expect(parseArgs(['nope', 'mysite', 'x'])).toHaveProperty('error');
     expect(parseArgs(['envs', 'mysite'])).toEqual({ command: 'envs', site: 'mysite' });
+  });
+});
+
+describe('CLI flags reach the engine', () => {
+  it('passes --accept-site-url and every other flag to pull and push', () => {
+    const pull = parseArgs([
+      'pull',
+      's',
+      'e',
+      '--no-db',
+      '--unsafe',
+      '--accept-site-url=https://x.com',
+    ]);
+    expect(cliPullOptions(pull as any)).toEqual({
+      includeDatabase: false,
+      includeUploads: false,
+      makeSafe: false,
+      acceptSiteUrl: 'https://x.com',
+    });
+    const push = parseArgs(['push', 's', 'e', '--yes', '--db', '--accept-site-url=https://x.com']);
+    expect(cliPushOptions(push as any, ['a.php'], ['b.php'])).toEqual({
+      includeDatabase: true,
+      includeUploads: false,
+      mode: 'newer',
+      files: ['a.php'],
+      deletions: [], // no --delete
+      acceptSiteUrl: 'https://x.com',
+    });
   });
 });
 

@@ -1159,6 +1159,30 @@ describe('executePush', () => {
     expect(ok.success).toBe(true);
   });
 
+  it('undo points the server back at its old table prefix after a prefix-changing push', async () => {
+    fs.writeFileSync(
+      path.join(sitePath, 'app', 'public', 'wp-config.php'),
+      "<?php\ndefine('DB_HOST', 'localhost');\n$table_prefix = 'wp_';\n",
+    );
+    const { deps } = makeDeps({ runner: makeFakeRunner({ remotePrefix: 'abc_' }) });
+    expect((await executePush(pushParams(), deps)).success).toBe(true);
+    const manifest = latestPushManifest(backupsDir, SITE_ID, 'staging')!.manifest as any;
+    expect(manifest.remotePrefixBefore).toBe('abc_');
+
+    const undoRunner = makeFakeRunner();
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: undoRunner }).deps,
+    );
+    expect(result.success).toBe(true);
+    const labels = steps(undoRunner.calls);
+    const setPrefix = undoRunner.calls.find((c) => c.step === 'remote-config-set-prefix')!;
+    expect(setPrefix.args[setPrefix.args.length - 1]).toContain("config set table_prefix 'abc_'");
+    expect(labels.indexOf('remote-config-set-prefix')).toBeGreaterThan(
+      labels.indexOf('remote-db-restore'),
+    );
+  });
+
   it('undo of a production database push needs the typed domain', async () => {
     const { deps } = makeDeps({ runner: makeFakeRunner() });
     await executePush(

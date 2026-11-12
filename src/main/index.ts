@@ -39,6 +39,8 @@ import {
   startCliServer,
   isStaleLocalOnly,
   lastPullFrom,
+  cliPullOptions,
+  cliPushOptions,
   cliLauncherScript,
 } from './cliProtocol';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
@@ -465,11 +467,7 @@ async function handleCliRequest(
           localSiteId: site.id,
           site,
           environment,
-          options: {
-            includeDatabase: request.includeDatabase,
-            includeUploads: request.includeUploads,
-            makeSafe: request.makeSafe,
-          },
+          options: cliPullOptions(request),
         },
         defaultPullPushDeps(progress),
       ),
@@ -577,13 +575,11 @@ async function handleCliRequest(
         localSiteId: site.id,
         site,
         environment,
-        options: {
-          includeDatabase: request.includeDatabase,
-          includeUploads: request.includeUploads,
-          mode: request.mode,
-          files: files.map((r) => r.path),
-          deletions: request.deletions ? deletions.map((r) => r.path) : [],
-        },
+        options: cliPushOptions(
+          request,
+          files.map((r) => r.path),
+          deletions.map((r) => r.path),
+        ),
       },
       defaultPullPushDeps(progress),
     ),

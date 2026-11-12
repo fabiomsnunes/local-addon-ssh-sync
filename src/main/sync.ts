@@ -1068,6 +1068,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   let lockHeartbeat: ReturnType<typeof setInterval> | null = null;
   let restoreWarning: string | null = null;
   let prefixReconciled = true;
+  let pushManifest: PushManifest | null = null;
+  let remotePrefixBefore: string | null = null;
   let cancelledLate = false;
   let remoteBackupPath: string | null = null;
   const publicPath = localPublicPath(site);
@@ -1237,8 +1239,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       }
     }
     // A push that changed nothing on the server leaves nothing to undo
-    if (filesChanged || options.includeDatabase)
-      writePushManifest(deps, backupBase, {
+    if (filesChanged || options.includeDatabase) {
+      pushManifest = {
         environmentId: environment.id,
         stamp,
         added: changes ? changes.files : null,
@@ -1247,7 +1249,9 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
         hasFilesBackup: Boolean(localFilesBackup),
         hasDatabaseBackup: Boolean(options.includeDatabase),
-      });
+      };
+      writePushManifest(deps, backupBase, pushManifest);
+    }
     prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
 
     sendProgress({
@@ -1366,6 +1370,9 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
             progress: 96,
             message: `Updating remote table prefix to ${localPrefix}...`,
           });
+          // wp-config.php is never synced or backed up: the old prefix goes in
+          // the manifest so an undo can point the site back at its tables
+          remotePrefixBefore = remotePrefix;
           await run(
             serverDbSync,
             'ssh',
@@ -1394,6 +1401,10 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       // The server database is complete and consistent: nothing after this
       // point may roll it back, a late cancel included.
       remoteDatabaseFinished = true;
+      if (pushManifest && remotePrefixBefore) {
+        pushManifest.remotePrefixBefore = remotePrefixBefore;
+        writePushManifest(deps, backupBase, pushManifest);
+      }
 
       // What the safe local copy turned off goes back on, on the server it
       // was pulled from only: on any other environment it would switch on
@@ -1423,7 +1434,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
             );
           } catch (e: any) {
             console.warn('[SSH Sync] Restoring neutralized plugins failed:', e?.message);
-            restoreWarning = `Push done, but re-enabling what the safe local copy turned off failed on ${environment.label}: check its active plugins${record.options.options?.stripeTestmode !== null ? ' and Stripe mode' : ''}.`;
+            restoreWarning = `Push done, but re-enabling what the safe local copy turned off failed on ${environment.label}: check its active plugins${typeof record.options.options?.stripeTestmode === 'string' ? ' and Stripe mode' : ''}.`;
           }
         }
         if (skipped.length) {
@@ -1725,6 +1736,22 @@ export async function executeUndoPush(
     if (withDatabase) {
       sendProgress({ stage: 'database', progress: 60, message: 'Restoring the database...' });
       await importDatabaseOnServer(deps.runCommand, undoSync, connection, environment, sqlBackup);
+      // The push pointed wp-config.php at the pushed tables: point it back
+      const previousPrefix = normalizeTablePrefix(manifest.remotePrefixBefore || '');
+      if (previousPrefix) {
+        await deps.runCommand(
+          undoSync,
+          'ssh',
+          sshArgs(
+            connection,
+            remoteWp(
+              connection,
+              environment,
+              `--skip-plugins --skip-themes config set table_prefix ${shellQuote(previousPrefix)}`,
+            ),
+          ),
+        );
+      }
     }
     if (environment.cacheCommand) {
       try {

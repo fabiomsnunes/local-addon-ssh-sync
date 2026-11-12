@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 
-import { SiteInfo } from './types';
+import { SiteInfo, SyncOptions } from './types';
 
 // The `ssh-sync` command talks to the add-on's main process over a unix socket
 // in the add-on's data dir: one JSON request line in, JSON lines out
@@ -185,4 +185,30 @@ export function lastPullFrom(
 ): number | null {
   const pull = (history || []).find((h) => h.mode === 'pull' && h.environmentId === environmentId);
   return pull ? Date.parse(pull.at) : null;
+}
+
+// The engine options a CLI request maps to: every flag the user can pass
+// reaches the engine (a dropped one silently changes what a sync does)
+export function cliPullOptions(request: Extract<CliRequest, { command: 'pull' }>): SyncOptions {
+  return {
+    includeDatabase: request.includeDatabase,
+    includeUploads: request.includeUploads,
+    makeSafe: request.makeSafe,
+    acceptSiteUrl: request.acceptSiteUrl,
+  };
+}
+
+export function cliPushOptions(
+  request: Extract<CliRequest, { command: 'push' }>,
+  files: string[],
+  deletions: string[],
+): SyncOptions {
+  return {
+    includeDatabase: request.includeDatabase,
+    includeUploads: request.includeUploads,
+    mode: request.mode,
+    files,
+    deletions: request.deletions ? deletions : [],
+    acceptSiteUrl: request.acceptSiteUrl,
+  };
 }
