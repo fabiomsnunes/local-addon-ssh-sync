@@ -113,29 +113,65 @@ export function recordSync(
   saveProfiles(profiles);
 }
 
-// Keep the newest pre-push backups of one environment, delete the rest.
-// Backup names start with `<siteId>-<environmentId>-` and end with a sortable
-// timestamp, so a lexical sort is chronological.
+// Keep the backups of the newest pushes to one environment, delete the rest.
+// Each push leaves <prefix><stamp>.sql, <prefix><stamp>-files/ and
+// <prefix><stamp>.json; the stamp right after the prefix also keeps
+// environment `a` from matching the backups of environment `a-b`.
 export function prunePushBackups(
   backupsDir: string,
   localSiteId: string,
   environmentId: string,
-  dfs: Pick<typeof fs, 'readdirSync' | 'unlinkSync'> = fs,
+  dfs: Pick<typeof fs, 'readdirSync' | 'rmSync'> = fs,
 ): void {
   const prefix = `${localSiteId}-${environmentId}-`;
-  const backups = (dfs.readdirSync(backupsDir) as string[])
-    // The timestamp right after the prefix keeps environment `a` from matching
-    // the backups of environment `a-b`.
-    .filter((f) => f.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}T/.test(f.slice(prefix.length)))
-    .filter((f) => f.endsWith('.sql'))
-    .sort()
-    .reverse();
-  for (const old of backups.slice(PUSH_BACKUPS_TO_KEEP)) {
-    try {
-      dfs.unlinkSync(path.join(backupsDir, old));
-    } catch {
-      // A backup we could not delete is harmless; the next push retries
+  const artifact = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.sql|\.json|-files)$/;
+  const byStamp = new Map<string, string[]>();
+  for (const name of dfs.readdirSync(backupsDir) as string[]) {
+    if (!name.startsWith(prefix)) continue;
+    const match = name.slice(prefix.length).match(artifact);
+    if (!match) continue;
+    byStamp.set(match[1], [...(byStamp.get(match[1]) || []), name]);
+  }
+  const stamps = [...byStamp.keys()].sort().reverse();
+  for (const stamp of stamps.slice(PUSH_BACKUPS_TO_KEEP)) {
+    for (const name of byStamp.get(stamp)!) {
+      try {
+        dfs.rmSync(path.join(backupsDir, name), { recursive: true, force: true });
+      } catch {
+        // A backup we could not delete is harmless; the next push retries
+      }
     }
+  }
+}
+
+// The newest push to an environment that can still be undone
+export function latestPushManifest(
+  backupsDir: string,
+  localSiteId: string,
+  environmentId: string,
+): { base: string; manifest: any } | null {
+  const prefix = `${localSiteId}-${environmentId}-`;
+  let names: string[];
+  try {
+    names = fs.readdirSync(backupsDir);
+  } catch {
+    return null;
+  }
+  const latest = names
+    .filter(
+      (n) =>
+        n.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}T[\d-]+Z\.json$/.test(n.slice(prefix.length)),
+    )
+    .sort()
+    .pop();
+  if (!latest) return null;
+  try {
+    return {
+      base: path.join(backupsDir, latest.replace(/\.json$/, '')),
+      manifest: JSON.parse(fs.readFileSync(path.join(backupsDir, latest), 'utf8')),
+    };
+  } catch {
+    return null;
   }
 }
 

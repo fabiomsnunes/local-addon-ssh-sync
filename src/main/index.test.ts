@@ -57,6 +57,17 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
+  siteUrlMismatch,
+  parseAddedFromOutFormat,
+  moveListedToBackupCommand,
+  outermostPaths,
+  isSafeListedPath,
+  releaseLockCommand,
+  changedSinceCommand,
+  changedSinceLines,
+  acquireLockCommand,
+  parseLockOutput,
+  lockDir,
   ensureLocalCopyConfig,
   restoreNeutralizedScript,
   parseNeutralizeOutput,
@@ -323,18 +334,30 @@ describe('ssh helpers', () => {
     const command = remoteProbeCommand(env({ remotePath: '~/public_html' }));
     expect(command).toContain(`cd ~/'public_html'`);
     expect(command).toContain('core is-installed');
-    expect(command).toContain(`-name '.ssh-sync-*' -mmin +120 -delete`);
-    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE=ok\n')).toEqual({
+    expect(command).toContain(`-name '.ssh-sync-????????' -mmin +120 -delete`);
+    expect(
+      parseRemoteProbe(
+        'SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE_URL=https://example.com/wp\nSSHSYNC_PROBE_HOMEURL=https://example.com\nSSHSYNC_PROBE_HOME=/home/u\nSSHSYNC_PROBE=ok\n',
+      ),
+    ).toEqual({
       ok: true,
       remoteRoot: '/home/u/public_html',
+      siteUrl: 'https://example.com/wp',
+      homeUrl: 'https://example.com',
+      remoteHome: '/home/u',
     });
+    // through WordPress, so WP_SITEURL/WP_HOME in wp-config count
+    expect(command).toContain('site_url()');
+    expect(command).toContain('home_url()');
     expect(parseRemoteProbe('SSHSYNC_PROBE=path\n')).toEqual({ ok: false, reason: 'path' });
     expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/x\nSSHSYNC_PROBE=wp\n')).toEqual({
       ok: false,
       reason: 'wp',
     });
     expect(parseRemoteProbe('Welcome!\n')).toEqual({ ok: false, reason: 'unexpected' });
-    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE=ok\n')).toEqual({
+    expect(
+      parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE_HOME=/h\nSSHSYNC_PROBE=ok\n'),
+    ).toEqual({
       ok: false,
       reason: 'unexpected',
     });
@@ -994,5 +1017,117 @@ describe('control dir cleanup', () => {
     fs.rmSync(foreign, { recursive: true });
     fs.rmSync(fresh, { recursive: true });
     fs.rmSync(other, { recursive: true });
+  });
+});
+
+describe('siteUrlMismatch', () => {
+  it('accepts the configured site whatever the scheme, www or trailing slash', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com')).toBeNull();
+    expect(siteUrlMismatch(env(), 'http://example.com/')).toBeNull();
+    expect(siteUrlMismatch(env(), 'https://www.example.com')).toBeNull();
+    expect(
+      siteUrlMismatch(env({ remoteUrl: 'https://www.example.com' }), 'https://example.com'),
+    ).toBeNull();
+  });
+
+  it('accepts WordPress in a subfolder through the home URL', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com/wp', 'https://example.com')).toBeNull();
+  });
+
+  it('reports a folder that holds another site, or no readable URL', () => {
+    expect(siteUrlMismatch(env(), 'https://other.com')).toMatch(
+      /says it is https:\/\/other\.com, not https:\/\/example\.com/,
+    );
+    expect(siteUrlMismatch(env(), '')).toMatch(/Could not read the site URL/);
+  });
+});
+
+describe('push backups and lock', () => {
+  it('reads new files and folders from rsync out-format lines', () => {
+    expect(
+      parseAddedFromOutFormat(
+        [
+          'SSHSYNC|<f+++++++++|a/new.php',
+          'SSHSYNC|cd+++++++++|a/dir/',
+          'SSHSYNC|<f.st......|a/changed.php',
+          'SSHSYNC|.d..t......|./',
+          '   1,234  42%  progress\rSSHSYNC|<f+++++++++|after-progress.php',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      files: ['a/new.php', 'after-progress.php'],
+      dirs: ['a/dir'],
+      updated: ['a/changed.php'],
+      deleted: [],
+    });
+    expect(parseAddedFromOutFormat('SSHSYNC|*deleting|old dir/ x.php\n')).toMatchObject({
+      deleted: ['old dir/ x.php'],
+    });
+  });
+
+  it('moves deletions into the backup folder, never nested, never through quoting', () => {
+    expect(outermostPaths(['foo/a.php', 'foo', 'bar/b.php', 'foobar/c.php'])).toEqual([
+      'foo',
+      'bar/b.php',
+      'foobar/c.php',
+    ]);
+    const command = moveListedToBackupCommand('/home/u/.ssh-sync-files-x');
+    expect(command).toContain('while IFS= read -r p');
+    expect(command).toContain(`mv -- "$p" "$b/$p"`);
+    expect(command).not.toContain('rm ');
+    expect(isSafeListedPath('caf\u00e9 (1) & $x.jpg')).toBe(true);
+    for (const bad of ['/etc/passwd', '../x', 'a/../b', 'a\nb', '', 'a//b', './a']) {
+      expect(isSafeListedPath(bad), bad).toBe(false);
+    }
+  });
+
+  it('locks per server folder with an atomic mkdir and reports the holder', () => {
+    const lock = lockDir('/home/u', '/var/www/a');
+    expect(lock).toMatch(/^\/home\/u\/\.ssh-sync-lock-[0-9a-f]{12}$/);
+    expect(lockDir('/home/u', '/var/www/b')).not.toBe(lock);
+    const acquire = acquireLockCommand(lock, "me's mac", 'tok123');
+    expect(acquire).toContain(`l='${lock}'`);
+    expect(acquire).toContain('if mkdir "$l"');
+    // A dead lock is taken over by an atomic rename, never by rm then mkdir
+    expect(acquire).toContain('mv "$l" "$l.stale.$$"');
+    expect(acquire).toContain(`'tok123' > "$l/token"`);
+    expect(releaseLockCommand(lock, 'tok123')).toContain(`= 'tok123' ] && rm -rf`);
+    expect(parseLockOutput('SSHSYNC_LOCK=ok\n')).toEqual({ ok: true });
+    expect(parseLockOutput('SSHSYNC_LOCK=busy mac (site) since x\n')).toEqual({
+      ok: false,
+      owner: 'mac (site) since x',
+    });
+  });
+});
+
+describe("changedSinceCommand (run for real with this machine's sh)", () => {
+  it('reports files whose size or mtime changed and deletions that came back, keeping spaces', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-changed-'));
+    const same = ' lead and trail .txt ';
+    fs.writeFileSync(path.join(dir, same), 'abc');
+    fs.writeFileSync(path.join(dir, 'edited.php'), 'abcdef');
+    fs.writeFileSync(path.join(dir, 'café (1).txt'), 'x');
+    const stat = (f: string) => {
+      const st = fs.statSync(path.join(dir, f));
+      return [st.size, Math.floor(st.mtimeMs / 1000)] as [number, number];
+    };
+    const lines = changedSinceLines(
+      { [same]: stat(same), 'edited.php': [3, stat('edited.php')[1]] },
+      ['café (1).txt', 'still-gone.txt'],
+    );
+    const input = path.join(dir, 'list');
+    fs.writeFileSync(input, `${lines.join('\n')}\n`);
+    const { stdout } = await promisify(execFile)('sh', [
+      '-c',
+      `cd "$1" && { ${changedSinceCommand()}; } < "$2"`,
+      'sh',
+      dir,
+      input,
+    ]);
+    expect(stdout.trim().split('\n').sort()).toEqual([
+      'SSHSYNC_CHANGED|café (1).txt',
+      'SSHSYNC_CHANGED|edited.php',
+    ]);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

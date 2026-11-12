@@ -66,6 +66,9 @@ export interface SyncOptions {
   // the remote domain typed back by the user.
   migrationMode?: boolean;
   confirmDomain?: string;
+  // The site URL the server reported, typed back by the user to go ahead
+  // despite a site URL mismatch
+  acceptSiteUrl?: string;
   // Pull only, on unless false: neutralize the copy before WordPress loads
   // (see safeClone.ts)
   makeSafe?: boolean;
@@ -117,6 +120,13 @@ export interface RemoteConnection {
   sshOptions: string[];
   // The WordPress root resolved to an absolute path on the server
   remoteRoot: string;
+  // The SSH user's home (absolute), for our temp files, backups and lock
+  remoteHome: string;
+  // The site WordPress reports there (home URL, else siteurl)
+  siteUrl: string;
+  // Why that is not the environment's site, or null when it is. Syncs refuse
+  // unless the user typed the reported URL back (SyncOptions.acceptSiteUrl).
+  siteUrlMismatch: string | null;
   close: () => Promise<void>;
 }
 
@@ -157,6 +167,10 @@ export interface SyncResult {
   warning?: string | null;
   // What the sync did besides the transfer, for the user (e.g. the safe-clone summary)
   note?: string | null;
+  // Set when the server folder reports another site (see RemoteConnection)
+  siteUrlMismatch?: { actual: string; expected: string };
+  // Undo only: files changed on the server since the push
+  conflicts?: string[];
 }
 
 // Every environment-touching dependency executePull/executePush rely on. The
@@ -174,6 +188,7 @@ export interface PullPushDeps {
     | 'unlinkSync'
     | 'readdirSync'
     | 'mkdirSync'
+    | 'rmSync'
   >;
   runCommand: (
     sync: ActiveSync,
@@ -200,6 +215,11 @@ export interface PullPushDeps {
   // What the safe-copy step changed in the local database (null clears it)
   saveNeutralizeRecord: (localSiteId: string, record: NeutralizeRecord | null) => void;
   loadNeutralizeRecord: (localSiteId: string) => NeutralizeRecord | null;
+  // The newest undoable push to an environment (manifest + backup base path)
+  latestPushManifest: (
+    localSiteId: string,
+    environmentId: string,
+  ) => { base: string; manifest: unknown } | null;
   ensureConfigDir: () => void;
   tempDir: string;
   // Remote databases exported before a push land here (the rollback source)

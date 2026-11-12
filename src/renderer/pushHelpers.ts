@@ -86,3 +86,29 @@ export function buildPushFileSelection(
     deletions: selected.filter((r) => r.op === 'delete').map((r) => r.path),
   };
 }
+
+// A file only in Local, older than the last pull from that environment, was
+// most likely deleted on the server since (or is a leftover of the Local
+// install): pushing it would bring it back. Same rule as the main process's
+// isStaleLocalOnly (cliProtocol.ts). Needs the mtime from the preview.
+export function isStaleLocalOnly(
+  row: { op: string; isDir?: boolean; localMtime?: number },
+  lastPullMs: number | null,
+): boolean {
+  return (
+    row.op === 'add' &&
+    !row.isDir &&
+    lastPullMs !== null &&
+    typeof row.localMtime === 'number' &&
+    row.localMtime < lastPullMs
+  );
+}
+
+// The newest pull from one environment, from the profile's history
+export function lastPullFrom(
+  history: { mode: string; environmentId: string; at: string }[] | undefined,
+  environmentId: string,
+): number | null {
+  const pull = (history || []).find((h) => h.mode === 'pull' && h.environmentId === environmentId);
+  return pull ? Date.parse(pull.at) : null;
+}

@@ -23,8 +23,11 @@ import {
   visibleDiffRows,
   summarizeSelection,
   buildPushFileSelection,
+  isStaleLocalOnly,
+  lastPullFrom,
 } from './pushHelpers';
 import { STATUS, tint } from './colors';
+import SiteUrlConfirm, { SiteUrlMismatch } from './SiteUrlConfirm';
 import { ServerEnvironment, SiteProfile, SyncProgress } from './types';
 
 const { ipcRenderer, shell } = window.require('electron');
@@ -40,6 +43,8 @@ interface DiffRow {
   sizeBytes: number;
   localMtime?: number;
   selected: boolean;
+  // Only in Local and older than the last pull: starts unticked
+  stale?: boolean;
 }
 
 interface Props {
@@ -116,6 +121,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
   // Replacing a production database needs Migration mode + the domain typed back
   const [migrationMode, setMigrationMode] = useState(false);
   const [confirmDomain, setConfirmDomain] = useState('');
+  const [siteUrlMismatch, setSiteUrlMismatch] = useState<SiteUrlMismatch | null>(null);
 
   const [rows, setRows] = useState<DiffRow[]>([]);
   // starts true: a preview always runs on open, and the push button must stay
@@ -165,6 +171,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
     if (isOpen) {
       setIsComplete(false);
       setError(null);
+      setSiteUrlMismatch(null);
       setCompletionWarning(null);
       setSelectedEnvId(initialEnvironmentId);
     }
@@ -203,6 +210,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
     const seq = ++previewSeq.current;
     setPreviewLoading(true);
     setError(null);
+    setSiteUrlMismatch(null);
     const timer = setTimeout(async () => {
       const result = await ipcRenderer.invoke('sshsync:pushPreview', site.id, site, selectedEnvId, {
         mode,
@@ -213,7 +221,13 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
       if (result.success) {
         setDegraded(!!result.degraded);
         const visible = visibleDiffRows<DiffRow>(result.rows || []);
-        setRows(visible.map((r: DiffRow) => ({ ...r, selected: true })));
+        const lastPull = lastPullFrom(profile.history, selectedEnvId);
+        setRows(
+          visible.map((r: DiffRow) => {
+            const stale = isStaleLocalOnly(r, lastPull);
+            return { ...r, stale, selected: !stale };
+          }),
+        );
       } else {
         setError(result.error || 'Preview failed');
         setRows([]);
@@ -246,7 +260,9 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
 
   const handlePushClick = () => setShowConfirmModal(true);
 
-  const executePush = async () => {
+  // `acceptSiteUrl` re-runs the push after the user confirmed the site URL
+  // WordPress reports in that folder (see SiteUrlConfirm)
+  const executePush = async (acceptSiteUrl?: string) => {
     setShowConfirmModal(false);
     if (!env) {
       setError('Please select an environment');
@@ -255,6 +271,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
 
     setIsPushing(true);
     setError(null);
+    setSiteUrlMismatch(null);
     setProgress({ stage: 'starting', progress: 0, message: 'Starting push...' });
 
     const result = await ipcRenderer.invoke('sshsync:push', site.id, site, env.id, {
@@ -265,6 +282,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
       // Full selection + "all modified" = plain rsync --delete fast path ({});
       // otherwise an explicit files/deletions list (selective, never blind-deletes)
       ...buildPushFileSelection(rows, mode),
+      ...(acceptSiteUrl ? { acceptSiteUrl } : {}),
     });
 
     if (result.success) {
@@ -275,6 +293,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
       setIsPushing(false);
     } else {
       setError(result.cancelled ? null : result.error);
+      setSiteUrlMismatch(result.siteUrlMismatch || null);
       setIsPushing(false);
       setIsCancelling(false);
       setProgress(null);
@@ -321,6 +340,19 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
           >
             {row.path}
             {row.isDir ? '/' : ''}
+            {row.stale && (
+              <span
+                style={{
+                  marginLeft: '8px',
+                  fontFamily: 'inherit',
+                  fontSize: '11px',
+                  opacity: 0.6,
+                  fontStyle: 'normal',
+                }}
+              >
+                Only in Local, older than your last pull
+              </span>
+            )}
           </span>
         );
       case 'localMtime':
@@ -751,6 +783,13 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
                     }}
                   >
                     {error}
+                    {siteUrlMismatch && (
+                      <SiteUrlConfirm
+                        mismatch={siteUrlMismatch}
+                        busy={isPushing}
+                        onContinue={(acceptSiteUrl) => executePush(acceptSiteUrl)}
+                      />
+                    )}
                   </div>
                 ) : rows.length === 0 ? (
                   <div
@@ -824,7 +863,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
           <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
             <TextButton onClick={() => setShowConfirmModal(false)}>Cancel</TextButton>
             <PrimaryButton
-              onClick={executePush}
+              onClick={() => executePush()}
               style={
                 isLive ? { backgroundColor: STATUS.danger, borderColor: STATUS.danger } : undefined
               }

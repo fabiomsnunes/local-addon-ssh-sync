@@ -1,3 +1,4 @@
+import * as os from 'os';
 import * as path from 'path';
 
 import { EXCLUDE_PATTERNS, PRODUCT_NAME } from './constants';
@@ -27,7 +28,6 @@ import {
   describePartialTransfer,
   rsyncProgressArgs,
   makeRsyncProgressParser,
-  safeRemoteRelPath,
   buildPushRsyncArgs,
   localPublicPath,
 } from './rsync';
@@ -44,6 +44,30 @@ import {
   REMOTE_MKTEMP,
 } from './ssh';
 import { prunePushBackups } from './config';
+import {
+  PushManifest,
+  OUT_FORMAT_MARKER,
+  pushStamp,
+  remoteFilesBackupDir,
+  parseAddedFromOutFormat,
+  PushedChanges,
+  isSafeListedPath,
+  outermostPaths,
+  moveListedToBackupCommand,
+  removeListedFilesCommand,
+  removeListedEmptyDirsCommand,
+  changedSinceCommand,
+  changedSinceLines,
+  parseChangedSince,
+  refreshLockCommand,
+  newLockToken,
+  lastPushMarker,
+  lockDir,
+  acquireLockCommand,
+  parseLockOutput,
+  releaseLockCommand,
+  lockOwner,
+} from './pushBackup';
 import {
   SAFETY_MU_PLUGIN_PATH,
   SAFETY_MU_PLUGIN_SOURCE,
@@ -65,6 +89,25 @@ import {
 // ---------------------------------------------------------------------------
 
 type Run = PullPushDeps['runCommand'];
+
+// A server folder whose WordPress reports another site is refused unless the
+// user typed that site's URL back (e.g. a staging just cloned from production
+// still says production).
+function siteUrlRefusal(
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  acceptSiteUrl: string | undefined,
+): SyncResult | null {
+  if (!connection.siteUrlMismatch) return null;
+  // With no readable URL, the folder itself is what the user confirms
+  const confirmValue = connection.siteUrl || connection.remoteRoot;
+  if (acceptSiteUrl && acceptSiteUrl === confirmValue) return null;
+  return {
+    success: false,
+    error: `${connection.siteUrlMismatch} If that is right, type ${confirmValue} to continue.`,
+    siteUrlMismatch: { actual: confirmValue, expected: environment.remoteUrl },
+  };
+}
 
 // Cleanup must run even after a cancel, and the cancelled sync rejects every command
 const freshSync = (): ActiveSync => ({ cancelled: false, child: null });
@@ -216,6 +259,125 @@ async function neutralizeDatabase(
   const result = parseNeutralizeOutput(output);
   if (!result) throw new Error('Could not make the local copy safe: unexpected output.');
   return result;
+}
+
+// Bring the server's backup folder of this push to this machine, then remove
+// it there. Returns the local folder, or null when the push replaced nothing.
+async function downloadFilesBackup(
+  deps: PullPushDeps,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  remoteDir: string,
+  localDir: string,
+): Promise<string | null> {
+  let exists = '';
+  await deps.runCommand(
+    sync,
+    'ssh',
+    sshArgs(connection, `[ -d ${shellQuote(remoteDir)} ] && echo yes || true`),
+    {
+      onStdout: (c) => (exists += c),
+    },
+  );
+  if (!exists.includes('yes')) return null;
+  const rsync = deps.resolveRsync();
+  await deps.runCommand(sync, rsync.bin, [
+    '-a',
+    '-e',
+    rsyncRemoteShell(connection),
+    `${connection.target}:${remoteDir}/`,
+    `${localDir}/`,
+  ]);
+  await deps.runCommand(
+    freshSync(),
+    'ssh',
+    sshArgs(connection, `rm -rf -- ${shellQuote(remoteDir)}`),
+  );
+  return localDir;
+}
+
+function writePushManifest(deps: PullPushDeps, backupBase: string, manifest: PushManifest): void {
+  deps.fs.writeFileSync(`${backupBase}.json`, JSON.stringify(manifest, null, 2));
+}
+
+// Run a remote loop over a list of paths sent on stdin, one per line: no path
+// ever enters a shell string, whatever characters it holds.
+async function runWithPathList(
+  deps: PullPushDeps,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  command: string,
+  lines: string[],
+): Promise<string> {
+  if (!lines.length) return '';
+  const listFile = path.join(deps.tempDir, `ssh-sync-list-${pushStamp()}-${lines.length}.txt`);
+  deps.fs.writeFileSync(listFile, `${lines.join('\n')}\n`);
+  let output = '';
+  try {
+    await deps.runCommand(sync, 'ssh', sshArgs(connection, inRemoteRoot(connection, command)), {
+      stdinFile: listFile,
+      onStdout: (chunk) => (output += chunk),
+    });
+  } finally {
+    try {
+      deps.fs.unlinkSync(listFile);
+    } catch {}
+  }
+  return output;
+}
+
+// Put a push's files back: replaced and deleted files from the backup (on
+// this machine, or still on the server when the push failed mid-way), and
+// the files and empty folders it added removed.
+async function restorePushedFiles(
+  deps: PullPushDeps,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  backup: {
+    localFilesBackup: string | null;
+    remoteFilesBackup: string | null;
+    added: { files: string[]; dirs: string[] } | null;
+  },
+): Promise<void> {
+  const run = deps.runCommand;
+  if (backup.localFilesBackup && deps.fs.existsSync(backup.localFilesBackup)) {
+    const rsync = deps.resolveRsync();
+    await run(sync, rsync.bin, [
+      '-a',
+      '-e',
+      rsyncRemoteShell(connection),
+      `${backup.localFilesBackup}/`,
+      rsyncRemoteRoot(connection),
+    ]);
+  } else if (backup.remoteFilesBackup) {
+    const q = shellQuote(backup.remoteFilesBackup);
+    await run(
+      sync,
+      'ssh',
+      sshArgs(
+        connection,
+        inRemoteRoot(connection, `if [ -d ${q} ]; then cp -a ${q}/. . && rm -rf -- ${q}; fi`),
+      ),
+    );
+  }
+  if (backup.added) {
+    await runWithPathList(
+      deps,
+      sync,
+      connection,
+      removeListedFilesCommand(),
+      backup.added.files.filter(isSafeListedPath),
+    );
+    await runWithPathList(
+      deps,
+      sync,
+      connection,
+      removeListedEmptyDirsCommand(),
+      [...backup.added.dirs]
+        .filter(isSafeListedPath)
+        .sort((x, y) => y.split('/').length - x.split('/').length),
+    );
+  }
 }
 
 // Plugins still installed locally keep their place in the record; the rest
@@ -387,6 +549,12 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   } catch (e: any) {
     deps.activeSyncs.delete(localSiteId);
     return { success: false, error: e.message };
+  }
+  const siteUrlRefused = siteUrlRefusal(connection, environment, options.acceptSiteUrl);
+  if (siteUrlRefused) {
+    deps.activeSyncs.delete(localSiteId);
+    await connection.close();
+    return siteUrlRefused;
   }
 
   const startedAt = Date.now();
@@ -870,6 +1038,12 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     deps.activeSyncs.delete(localSiteId);
     return { success: false, error: e.message };
   }
+  const siteUrlRefused = siteUrlRefusal(connection, environment, options.acceptSiteUrl);
+  if (siteUrlRefused) {
+    deps.activeSyncs.delete(localSiteId);
+    await connection.close();
+    return siteUrlRefused;
+  }
 
   // A leftover preview dry-run must not compete with the real push
   deps.activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
@@ -881,6 +1055,17 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   let remoteImportStarted = false;
   let remoteDatabaseFinished = false;
   let restoredOnServer: string[] = [];
+  const stamp = pushStamp();
+  const backupBase = path.join(deps.backupsDir, `${localSiteId}-${environment.id}-${stamp}`);
+  let lock: string | null = null;
+  // Set right before the first file changes on the server: from then on a
+  // failure puts the replaced files back and removes the added ones
+  let filesChanged = false;
+  let remoteFilesBackup: string | null = null;
+  let localFilesBackup: string | null = null;
+  let changes: PushedChanges | null = null;
+  const lockToken = newLockToken();
+  let lockHeartbeat: ReturnType<typeof setInterval> | null = null;
   let restoreWarning: string | null = null;
   let prefixReconciled = true;
   let cancelledLate = false;
@@ -888,16 +1073,39 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   const publicPath = localPublicPath(site);
 
   try {
+    // 0. One push at a time to this server folder, from any computer. The
+    //    release in `finally` checks our token, so it is safe to attempt even
+    //    when this acquire is interrupted or loses the race.
+    lock = lockDir(connection.remoteHome, connection.remoteRoot);
+    let lockOutput = '';
+    await run(
+      sync,
+      'ssh',
+      sshArgs(
+        connection,
+        acquireLockCommand(lock, lockOwner(os.hostname(), site.name || site.domain), lockToken),
+      ),
+      { onStdout: (c) => (lockOutput += c) },
+    );
+    const lockResult = parseLockOutput(lockOutput);
+    if (!lockResult.ok) {
+      throw new Error(
+        `Another push to ${environment.label} is running${lockResult.owner ? `: ${lockResult.owner}` : ''}. Try again when it finishes.`,
+      );
+    }
+    const heldLock = lock;
+    lockHeartbeat = setInterval(() => {
+      run(freshSync(), 'ssh', sshArgs(connection, refreshLockCommand(heldLock, lockToken))).catch(
+        () => {},
+      );
+    }, 15 * 60_000);
+    dfs.mkdirSync(deps.backupsDir, { recursive: true });
+
     // 1. Safety net for the automatic rollback: the remote database, exported
     //    and kept on this machine (nothing is left on the server).
     if (options.includeDatabase) {
       sendProgress({ stage: 'backup', progress: 3, message: 'Backing up remote database...' });
-      dfs.mkdirSync(deps.backupsDir, { recursive: true });
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      remoteBackupPath = path.join(
-        deps.backupsDir,
-        `${localSiteId}-${environment.id}-${stamp}.sql`,
-      );
+      remoteBackupPath = `${backupBase}.sql`;
       await downloadRemoteDatabase(run, sync, connection, environment, remoteBackupPath);
 
       // The rollback restores from this exact file: abort if it looks bad
@@ -908,7 +1116,6 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           `Remote database backup looks invalid (${backupSize} bytes) — aborting the push before any change. Your server was not modified.`,
         );
       }
-      prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
     }
 
     // 2. Sync files (live progress, flags adapted to the rsync version)
@@ -931,14 +1138,35 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     }
 
     let fileWarning: string | null = null;
+    // Replaced and deleted server files go to a backup folder (downloaded
+    // below); new ones are listed so an undo can remove them
+    remoteFilesBackup = remoteFilesBackupDir(connection.remoteHome, stamp);
+    const knowsAdded = rsync.supportsOutFormat;
+    let rsyncOutput = '';
     try {
       if (!selective || (options.files && options.files.length > 0)) {
+        const progressParser = makeRsyncProgressParser(rsync, (pct) => {
+          // Files = 8–50% of the overall push
+          const overall = 8 + Math.round(pct * 0.42);
+          sendProgress({
+            stage: 'files',
+            progress: overall,
+            message: `Syncing files to ${environment.label}... ${pct}%`,
+          });
+        });
+        filesChanged = true;
         const rsyncResult = await run(
           sync,
           rsync.bin,
           buildPushRsyncArgs({
             rsync,
-            excludeArgs: excludeArgsFor(environment, options.includeUploads),
+            excludeArgs: [
+              ...excludeArgsFor(environment, options.includeUploads),
+              '--backup',
+              `--backup-dir=${remoteFilesBackup}`,
+              // -8: names exactly as on disk (no \#ooo escapes) in the markers
+              ...(knowsAdded ? ['-8', `--out-format=${OUT_FORMAT_MARKER}|%i|%n`] : []),
+            ],
             sshCommand: rsyncRemoteShell(connection),
             localPublicPath: publicPath,
             remoteRoot: rsyncRemoteRoot(connection),
@@ -948,15 +1176,10 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           {
             // 23/24 = partial transfer — warn instead of failing the whole sync
             okCodes: [23, 24],
-            onStdout: makeRsyncProgressParser(rsync, (pct) => {
-              // Files = 8–50% of the overall push
-              const overall = 8 + Math.round(pct * 0.42);
-              sendProgress({
-                stage: 'files',
-                progress: overall,
-                message: `Syncing files to ${environment.label}... ${pct}%`,
-              });
-            }),
+            onStdout: (chunk) => {
+              rsyncOutput += chunk;
+              progressParser(chunk);
+            },
           },
         );
         fileWarning = describePartialTransfer(rsyncResult);
@@ -967,8 +1190,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           dfs.unlinkSync(filesFromPath);
         } catch {}
       }
+      changes = knowsAdded ? parseAddedFromOutFormat(rsyncOutput) : null;
     }
-
     // Checked deletions from the preview — executed explicitly (instead of
     // rsync --delete) so unchecked deletions survive. Paths are strictly
     // validated + single-quoted.
@@ -978,20 +1201,54 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         progress: 48,
         message: `Deleting ${options.deletions.length} file(s) on ${environment.label}...`,
       });
-      const quoted = options.deletions.map((p) => {
-        const q = safeRemoteRelPath(p);
-        if (!q) throw new Error(`Unsafe path refused for remote deletion: ${p}`);
-        return q;
-      });
-      for (let i = 0; i < quoted.length; i += 200) {
-        const batch = quoted.slice(i, i + 200);
-        await run(
-          sync,
-          'ssh',
-          sshArgs(connection, inRemoteRoot(connection, `rm -rf -- ${batch.join(' ')}`)),
-        );
+      const unsafe = options.deletions.find((p) => !isSafeListedPath(p));
+      if (unsafe) throw new Error(`Unsafe path refused for remote deletion: ${unsafe}`);
+      filesChanged = true;
+      await runWithPathList(
+        deps,
+        sync,
+        connection,
+        moveListedToBackupCommand(remoteFilesBackup),
+        outermostPaths(options.deletions),
+      );
+    }
+
+    // The replaced and deleted files come to this machine; nothing stays on
+    // the server. The manifest makes the push undoable.
+    if (filesChanged) {
+      localFilesBackup = await downloadFilesBackup(
+        deps,
+        sync,
+        connection,
+        remoteFilesBackup,
+        `${backupBase}-files`,
+      );
+      remoteFilesBackup = null;
+    }
+    // What each written file looks like now on the server (rsync -a keeps
+    // size and mtime), so an undo can see if anything changed after the push
+    const pushed: Record<string, [number, number]> = {};
+    for (const file of changes ? [...changes.files, ...changes.updated] : []) {
+      try {
+        const stat = dfs.statSync(path.join(publicPath, file));
+        pushed[file] = [stat.size, Math.floor(stat.mtimeMs / 1000)];
+      } catch {
+        // gone locally since: undo will not check it
       }
     }
+    // A push that changed nothing on the server leaves nothing to undo
+    if (filesChanged || options.includeDatabase)
+      writePushManifest(deps, backupBase, {
+        environmentId: environment.id,
+        stamp,
+        added: changes ? changes.files : null,
+        addedDirs: changes ? changes.dirs : null,
+        pushed,
+        deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
+        hasFilesBackup: Boolean(localFilesBackup),
+        hasDatabaseBackup: Boolean(options.includeDatabase),
+      });
+    prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
 
     sendProgress({
       stage: 'files',
@@ -1215,17 +1472,35 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       : null;
     const warning =
       [fileWarning, lateCancelWarning, restoreWarning].filter(Boolean).join(' ') || null;
+    const pushWarning = () => [warning, markerWarning].filter(Boolean).join(' ') || null;
 
+    // The newest push to this folder, for undo from any computer to check
+    let markerWarning: string | null = null;
+    if (filesChanged || options.includeDatabase) {
+      try {
+        await run(
+          freshSync(),
+          'ssh',
+          sshArgs(
+            connection,
+            `printf '%s %s\\n' ${shellQuote(stamp)} ${shellQuote(lockOwner(os.hostname(), site.name || site.domain))} > ${shellQuote(lastPushMarker(connection.remoteHome, connection.remoteRoot))}`,
+          ),
+        );
+      } catch (e: any) {
+        console.warn('[SSH Sync] Could not record the push on the server:', e?.message);
+        markerWarning = `This push could not be recorded on ${environment.label}, so an undo of an older push from another computer cannot see it.`;
+      }
+    }
     deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
     sendProgress({
       stage: 'done',
       progress: 100,
-      message: warning ? `Push complete — ${warning}` : 'Push complete!',
+      message: pushWarning() ? `Push complete — ${pushWarning()}` : 'Push complete!',
     });
     deps.notify(
       PRODUCT_NAME,
-      warning
-        ? `Push complete for ${site.name || site.domain} — ${warning}`
+      pushWarning()
+        ? `Push complete for ${site.name || site.domain} — ${pushWarning()}`
         : `Push complete for ${site.name || site.domain}`,
     );
     const restoredNote = restoredOnServer.length
@@ -1233,7 +1508,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           .map((p) => (p === 'stripe-testmode' ? 'Stripe live mode' : p.split('/')[0]))
           .join(', ')}.`
       : null;
-    return { success: true, warning, note: restoredNote };
+    return { success: true, warning: pushWarning(), note: restoredNote };
   } catch (error: any) {
     // The remote DB was (partially) overwritten — restore the backup exported
     // right before the import.
@@ -1260,6 +1535,35 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         );
       }
     }
+    // A push that did not finish is not undoable: its changes are rolled
+    // back here, so the newest finished push stays the one to undo
+    try {
+      dfs.unlinkSync(`${backupBase}.json`);
+    } catch {
+      // not written yet
+    }
+    // Files changed but the push did not finish: put them back, so the
+    // server keeps code that matches its (restored) database
+    if (filesChanged && !remoteDatabaseFinished) {
+      try {
+        sendProgress({ stage: 'files', progress: 0, message: 'Restoring server files...' });
+        await restorePushedFiles(deps, freshSync(), connection, {
+          localFilesBackup,
+          remoteFilesBackup,
+          added: changes,
+        });
+        deps.notify(
+          PRODUCT_NAME,
+          `Push aborted — the files it changed on ${environment.label} were put back`,
+        );
+      } catch (restoreError: any) {
+        console.error('[SSH Sync] File restore after aborted push failed:', restoreError.message);
+        deps.notify(
+          PRODUCT_NAME,
+          `Push aborted — restoring the files on ${environment.label} FAILED. Backup: ${localFilesBackup || remoteFilesBackup}`,
+        );
+      }
+    }
     if (error instanceof CancelledError) {
       sendProgress({ stage: 'cancelled', progress: 0, message: 'Sync cancelled' });
       return { success: false, cancelled: true, error: 'Sync cancelled' };
@@ -1269,6 +1573,201 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     return { success: false, error: error.message };
   } finally {
     deps.activeSyncs.delete(localSiteId);
+    if (lockHeartbeat) clearInterval(lockHeartbeat);
+    if (lock) {
+      try {
+        await run(freshSync(), 'ssh', sshArgs(connection, releaseLockCommand(lock, lockToken)));
+      } catch (e: any) {
+        console.warn('[SSH Sync] Could not release the push lock:', e?.message);
+      }
+    }
+    await connection.close();
+  }
+}
+
+// Undo the newest push to an environment: the files it replaced or deleted
+// come back, the files it added go, and when it carried the database, the
+// database from right before it is imported again. Undoing a production
+// database needs the domain typed back, like the push itself.
+export async function executeUndoPush(
+  params: {
+    localSiteId: string;
+    site: SyncParams['site'];
+    environment: ServerEnvironment;
+    confirmDomain?: string;
+    acceptSiteUrl?: string;
+  },
+  deps: PullPushDeps,
+): Promise<SyncResult> {
+  const { localSiteId, site, environment } = params;
+  const sendProgress = deps.sendProgress;
+  if (deps.activeSyncs.has(localSiteId)) {
+    return { success: false, error: 'A sync is already running for this site' };
+  }
+  const environmentError = validateEnvironment(environment);
+  if (environmentError) return { success: false, error: environmentError };
+
+  const latest = deps.latestPushManifest(localSiteId, environment.id);
+  if (!latest) return { success: false, error: `No push to ${environment.label} to undo.` };
+  const manifest = latest.manifest as PushManifest;
+  const sqlBackup = `${latest.base}.sql`;
+  const withDatabase = manifest.hasDatabaseBackup && deps.fs.existsSync(sqlBackup);
+  if (
+    withDatabase &&
+    environment.isProduction &&
+    params.confirmDomain !== remoteDomainFromUrl(environment.remoteUrl)
+  ) {
+    return {
+      success: false,
+      error: `Undoing this push replaces the ${environment.label} database with the one from before it. Type ${remoteDomainFromUrl(environment.remoteUrl)} to confirm.`,
+    };
+  }
+
+  const sync: ActiveSync = { cancelled: false, child: null };
+  deps.activeSyncs.set(localSiteId, sync);
+  let connection: RemoteConnection;
+  try {
+    sendProgress({
+      stage: 'connect',
+      progress: 2,
+      message: `Connecting to ${environment.label}...`,
+    });
+    connection = await deps.connectRemote(environment);
+  } catch (e: any) {
+    deps.activeSyncs.delete(localSiteId);
+    return { success: false, error: e.message };
+  }
+  const siteUrlRefused = siteUrlRefusal(connection, environment, params.acceptSiteUrl);
+  if (siteUrlRefused) {
+    deps.activeSyncs.delete(localSiteId);
+    await connection.close();
+    return siteUrlRefused;
+  }
+
+  const lockToken = newLockToken();
+  const lock = lockDir(connection.remoteHome, connection.remoteRoot);
+  try {
+    let lockOutput = '';
+    await deps.runCommand(
+      sync,
+      'ssh',
+      sshArgs(
+        connection,
+        acquireLockCommand(lock, lockOwner(os.hostname(), site.name || site.domain), lockToken),
+      ),
+      { onStdout: (c) => (lockOutput += c) },
+    );
+    const lockResult = parseLockOutput(lockOutput);
+    if (!lockResult.ok) {
+      throw new Error(
+        `Another push to ${environment.label} is running${lockResult.owner ? `: ${lockResult.owner}` : ''}. Try again when it finishes.`,
+      );
+    }
+
+    // Only the newest push to this folder can be undone, whoever made it
+    const marker = lastPushMarker(connection.remoteHome, connection.remoteRoot);
+    let markerOutput = '';
+    await deps.runCommand(
+      sync,
+      'ssh',
+      sshArgs(connection, `cat ${shellQuote(marker)} 2>/dev/null; true`),
+      {
+        onStdout: (c) => (markerOutput += c),
+      },
+    );
+    const [newestStamp, ...newestOwner] = markerOutput.trim().split(' ');
+    if (newestStamp && newestStamp !== manifest.stamp) {
+      return {
+        success: false,
+        error: `A newer push to ${environment.label} was made${newestOwner.length ? ` by ${newestOwner.join(' ')}` : ''}: undoing this one would overwrite it.`,
+      };
+    }
+
+    // Nothing the push wrote or deleted may have changed on the server since
+    if (manifest.added === null) {
+      return {
+        success: false,
+        error: `This push was made with a local rsync that cannot report what it changed (install rsync 3 with Homebrew), so undo cannot check what changed on ${environment.label} since. The files it replaced are in ${latest.base}-files.`,
+      };
+    }
+    const checks = changedSinceLines(
+      Object.fromEntries(
+        Object.entries(manifest.pushed || {}).filter(([file]) => isSafeListedPath(file)),
+      ),
+      (manifest.deleted || []).filter(isSafeListedPath),
+    );
+    const conflicts = parseChangedSince(
+      await runWithPathList(deps, sync, connection, changedSinceCommand(), checks),
+    );
+    if (conflicts.length) {
+      return {
+        success: false,
+        error: `${conflicts.length} file(s) changed on ${environment.label} after this push, so undoing it would overwrite them.`,
+        conflicts,
+      };
+    }
+
+    // Undo cannot be half-done: it runs to the end once started
+    const undoSync = freshSync();
+    sendProgress({
+      stage: 'files',
+      progress: 20,
+      message: `Restoring files on ${environment.label}...`,
+    });
+    await restorePushedFiles(deps, undoSync, connection, {
+      localFilesBackup: manifest.hasFilesBackup ? `${latest.base}-files` : null,
+      remoteFilesBackup: null,
+      added:
+        manifest.added && manifest.addedDirs
+          ? { files: manifest.added, dirs: manifest.addedDirs }
+          : null,
+    });
+    if (withDatabase) {
+      sendProgress({ stage: 'database', progress: 60, message: 'Restoring the database...' });
+      await importDatabaseOnServer(deps.runCommand, undoSync, connection, environment, sqlBackup);
+    }
+    if (environment.cacheCommand) {
+      try {
+        await deps.runCommand(
+          undoSync,
+          'ssh',
+          sshArgs(connection, inRemoteRoot(connection, environment.cacheCommand)),
+        );
+      } catch {
+        // non-fatal, as after a push
+      }
+    }
+    // Undone once: the backups stay until pruned, the manifest and the
+    // server's newest-push marker go
+    deps.fs.unlinkSync(`${latest.base}.json`);
+    await deps.runCommand(
+      freshSync(),
+      'ssh',
+      sshArgs(connection, `rm -f -- ${shellQuote(marker)}`),
+    );
+    sendProgress({ stage: 'done', progress: 100, message: 'Push undone!' });
+    const warning =
+      manifest.added === null
+        ? 'Files the push added were not removed: the local rsync could not list them (install rsync 3 with Homebrew).'
+        : null;
+    deps.notify(PRODUCT_NAME, `Undid the last push to ${environment.label}`);
+    return {
+      success: true,
+      warning,
+      note: withDatabase ? 'Files and database restored.' : 'Files restored.',
+    };
+  } catch (error: any) {
+    sendProgress({ stage: 'error', progress: 0, message: error.message });
+    return { success: false, error: error.message };
+  } finally {
+    deps.activeSyncs.delete(localSiteId);
+    try {
+      await deps.runCommand(
+        freshSync(),
+        'ssh',
+        sshArgs(connection, releaseLockCommand(lock, lockToken)),
+      );
+    } catch {}
     await connection.close();
   }
 }

@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'child_process';
 import * as net from 'net';
 
 import { REMOTE_TEMP_PREFIX } from './constants';
+import { remoteDomainFromUrl } from './validators';
 import { ActiveSync, RemoteConnection, RunOptions, ServerEnvironment } from './types';
 
 type RunCommand = (
@@ -126,7 +127,7 @@ export function parseRemoteTempPath(stdout: string): string | null {
 
 // What the probe run right after connecting reports about the WordPress root.
 export type RemoteProbeResult =
-  | { ok: true; remoteRoot: string }
+  | { ok: true; remoteRoot: string; siteUrl: string; homeUrl: string; remoteHome: string }
   | { ok: false; reason: 'path' | 'rsync' | 'wp' | 'unexpected' };
 
 const PROBE_MARKER = 'SSHSYNC_PROBE';
@@ -137,12 +138,15 @@ export function remoteProbeCommand(environment: ServerEnvironment): string {
     `printf '${PROBE_MARKER}_ROOT=%s\\n' "$(pwd -P)"`,
     // Our own dumps left by a sync that died mid-transfer (dropped connection,
     // Local closed) hold a full database: sweep any older than two hours.
-    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
-    // Our own dumps left by a sync that died mid-transfer (dropped connection,
-    // Local closed) hold a full database: sweep any older than two hours.
-    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
+    // Only mktemp's 8-character names: the lock and last-push marker stay.
+    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}????????' -mmin +120 -delete 2>/dev/null`,
     `command -v rsync >/dev/null 2>&1 || { echo ${PROBE_MARKER}=rsync; exit 0; }`,
     `${environment.wpCommand} --skip-plugins --skip-themes core is-installed >/dev/null 2>&1 || { echo ${PROBE_MARKER}=wp; exit 0; }`,
+    // The site WordPress says lives here, to catch a folder that belongs to
+    // another site on the same server
+    // site_url()/home_url() honour WP_SITEURL/WP_HOME from wp-config.php
+    `${environment.wpCommand} --skip-plugins --skip-themes eval 'echo "${PROBE_MARKER}_URL=" . site_url() . "\\n${PROBE_MARKER}_HOMEURL=" . home_url() . "\\n";' 2>/dev/null`,
+    `printf '${PROBE_MARKER}_HOME=%s\\n' "$HOME"`,
     `echo ${PROBE_MARKER}=ok`,
   ].join('; ');
 }
@@ -161,7 +165,35 @@ export function parseRemoteProbe(stdout: string): RemoteProbeResult {
   // The root goes into rsync's remote spec and every remote command: refuse
   // anything outside a conservative character set.
   if (!/^\/[A-Za-z0-9_./@+-]*$/.test(remoteRoot)) return { ok: false, reason: 'unexpected' };
-  return { ok: true, remoteRoot };
+  const siteUrl = (stdout.match(new RegExp(`${PROBE_MARKER}_URL=(.*)`)) || [])[1]?.trim() || '';
+  const homeUrl = (stdout.match(new RegExp(`${PROBE_MARKER}_HOMEURL=(.*)`)) || [])[1]?.trim() || '';
+  const remoteHome = (stdout.match(new RegExp(`${PROBE_MARKER}_HOME=(.*)`)) || [])[1]?.trim() || '';
+  if (!/^\/[A-Za-z0-9_./@+-]*$/.test(remoteHome)) return { ok: false, reason: 'unexpected' };
+  return { ok: true, remoteRoot, siteUrl, homeUrl, remoteHome };
+}
+
+// The site WordPress reports in that folder (home or siteurl, so WordPress in
+// a subfolder matches too) must be the configured one; http/https, `www.` and
+// a trailing slash do not matter. A different site usually means the folder
+// belongs to another site on the same server, but can be legitimate (a
+// staging cloned from production still says production): the caller decides.
+function comparableSite(url: string): string | null {
+  const domain = remoteDomainFromUrl(url);
+  return domain ? domain.toLowerCase().replace(/^www\./, '') : null;
+}
+
+export function siteUrlMismatch(
+  environment: ServerEnvironment,
+  siteUrl: string,
+  homeUrl = '',
+): string | null {
+  const expected = comparableSite(environment.remoteUrl);
+  const reported = [homeUrl, siteUrl].filter(Boolean);
+  if (!reported.length) {
+    return `Could not read the site URL of the WordPress in "${environment.remotePath}".`;
+  }
+  if (expected && reported.some((url) => comparableSite(url) === expected)) return null;
+  return `The WordPress in "${environment.remotePath}" says it is ${homeUrl || siteUrl}, not ${environment.remoteUrl}.`;
 }
 
 export function describeProbeFailure(
@@ -418,6 +450,9 @@ export async function openRemoteConnection(
     target,
     sshOptions: baseSshOptions(environment, controlPath),
     remoteRoot: '',
+    remoteHome: '',
+    siteUrl: '',
+    siteUrlMismatch: null,
     close,
   };
   registered = connection;
@@ -441,6 +476,9 @@ export async function openRemoteConnection(
     throw new Error(describeProbeFailure(probe.reason, environment));
   }
   connection.remoteRoot = probe.remoteRoot;
+  connection.remoteHome = probe.remoteHome;
+  connection.siteUrl = probe.homeUrl || probe.siteUrl;
+  connection.siteUrlMismatch = siteUrlMismatch(environment, probe.siteUrl, probe.homeUrl);
   return connection;
 }
 

@@ -4,7 +4,31 @@ import { Title, PrimaryButton, TextButton } from './localComponents';
 import { dispatchSyncAction } from './DrawerHost';
 import SyncIcon from './SyncIcon';
 import { environmentTarget, remoteDomainOf, sshCommandFor } from './pushHelpers';
+
+// Push backups are stamped like 2026-11-12T21-09-37-387Z
+function stampToLocalTime(stamp: string): string {
+  const iso = stamp.replace(/T(\d\d)-(\d\d)-(\d\d)-(\d{3})Z$/, 'T$1:$2:$3.$4Z');
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? stamp : date.toLocaleString();
+}
+
+interface UndoablePush {
+  stamp: string;
+  database: boolean;
+}
+
+interface UndoState {
+  stage: 'confirm' | 'busy' | 'done';
+  confirmDomain: string;
+  ok?: boolean;
+  message?: string;
+  // Files changed on the server after the push, which the undo refused to touch
+  conflicts?: string[];
+  // WordPress in the folder reports another site URL: confirm to go on
+  siteUrlMismatch?: SiteUrlMismatch;
+}
 import { STATUS, tint } from './colors';
+import SiteUrlConfirm, { SiteUrlMismatch } from './SiteUrlConfirm';
 import { ServerEnvironment, SiteProfile } from './types';
 
 const { ipcRenderer, shell } = window.require('electron');
@@ -58,6 +82,30 @@ const smallButtonStyle: React.CSSProperties = {
   opacity: 0.85,
 };
 
+const undoBoxStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '10px',
+  padding: '12px 14px',
+  margin: '0 0 12px',
+  borderRadius: '6px',
+  backgroundColor: tint(STATUS.warning, 0.08),
+  border: `1px solid ${tint(STATUS.warning, 0.3)}`,
+  fontSize: '13px',
+};
+
+const undoInputStyle: React.CSSProperties = {
+  boxSizing: 'border-box',
+  maxWidth: '280px',
+  padding: '6px 8px',
+  borderRadius: '4px',
+  border: '1px solid #3e3e3e',
+  backgroundColor: '#1e1e1e',
+  color: 'inherit',
+  fontSize: '13px',
+  fontFamily: 'monospace',
+};
+
 function formatTimestamp(ts?: string): string {
   if (!ts) return 'Never';
   try {
@@ -92,6 +140,8 @@ const SyncPage: React.FC<Props> = ({ site }) => {
   const [profile, setProfile] = useState<SiteProfile | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [copiedEnvId, setCopiedEnvId] = useState<string | null>(null);
+  const [undoable, setUndoable] = useState<Record<string, UndoablePush>>({});
+  const [undo, setUndo] = useState<Record<string, UndoState>>({});
   const [cli, setCli] = useState<{ installed: boolean; path: string; error?: string } | null>(null);
 
   useEffect(() => {
@@ -111,7 +161,133 @@ const SyncPage: React.FC<Props> = ({ site }) => {
     const stored: SiteProfile | null =
       (await ipcRenderer.invoke('sshsync:getProfile', site.id)) ?? null;
     setProfile(stored);
+    setUndoable((await ipcRenderer.invoke('sshsync:undoablePushes', site.id)) || {});
     setLoaded(true);
+  };
+
+  const setUndoFor = (environmentId: string, state: UndoState | null) => {
+    setUndo((current) => {
+      const next = { ...current };
+      if (state) next[environmentId] = state;
+      else delete next[environmentId];
+      return next;
+    });
+  };
+
+  // `acceptSiteUrl` re-runs the undo after the user confirmed the site URL
+  // WordPress reports in that folder (see SiteUrlConfirm)
+  const confirmUndo = async (env: ServerEnvironment, acceptSiteUrl?: string) => {
+    const state = undo[env.id];
+    const push = undoable[env.id];
+    if (!state || !push) return;
+    setUndoFor(env.id, { ...state, stage: 'busy', siteUrlMismatch: undefined });
+    const needsDomain = env.isProduction && push.database;
+    const result = await ipcRenderer.invoke(
+      'sshsync:undoLastPush',
+      site.id,
+      site,
+      env.id,
+      needsDomain ? state.confirmDomain : undefined,
+      acceptSiteUrl,
+    );
+    if (!result.success && result.siteUrlMismatch) {
+      // Back to the confirmation, now asking for the site URL as well
+      setUndoFor(env.id, {
+        ...state,
+        stage: 'confirm',
+        message: result.error,
+        siteUrlMismatch: result.siteUrlMismatch,
+      });
+      return;
+    }
+    setUndoFor(env.id, {
+      ...state,
+      stage: 'done',
+      ok: !!result.success,
+      message: result.success
+        ? [result.note || 'Push undone.', result.warning].filter(Boolean).join(' ')
+        : result.error || 'Undo failed.',
+      conflicts: result.success ? undefined : result.conflicts,
+    });
+    window.dispatchEvent(new CustomEvent('sshsync:state-changed', { detail: { siteId: site.id } }));
+  };
+
+  const renderUndo = (env: ServerEnvironment) => {
+    const state = undo[env.id];
+    const push = undoable[env.id];
+    if (!state) return null;
+    if (state.stage === 'done') {
+      return (
+        <div style={{ ...undoBoxStyle, color: state.ok ? STATUS.success : STATUS.danger }}>
+          <span>{state.message}</span>
+          {state.conflicts && state.conflicts.length > 0 && (
+            <ul
+              style={{ margin: 0, paddingLeft: '18px', fontSize: '12px', fontFamily: 'monospace' }}
+            >
+              {state.conflicts.slice(0, 10).map((file) => (
+                <li key={file}>{file}</li>
+              ))}
+              {state.conflicts.length > 10 && <li>…and {state.conflicts.length - 10} more</li>}
+            </ul>
+          )}
+          <TextButton onClick={() => setUndoFor(env.id, null)}>Dismiss</TextButton>
+        </div>
+      );
+    }
+    if (!push) return null;
+    const domain = remoteDomainOf(env.remoteUrl);
+    const needsDomain = env.isProduction && push.database;
+    const busy = state.stage === 'busy';
+    const canConfirm = !busy && (!needsDomain || state.confirmDomain.trim() === domain);
+    return (
+      <div style={undoBoxStyle}>
+        <span>
+          Undo the push of {stampToLocalTime(push.stamp)}: files
+          {push.database ? ' and database' : ''}?
+        </span>
+        {push.database && (
+          <span style={{ fontSize: '12px', color: STATUS.danger }}>
+            The database goes back to how it was before the push: anything saved on the server since
+            (orders, form entries, users) is lost.
+          </span>
+        )}
+        {state.siteUrlMismatch && (
+          <SiteUrlConfirm
+            mismatch={state.siteUrlMismatch}
+            busy={busy}
+            onContinue={(acceptSiteUrl) => confirmUndo(env, acceptSiteUrl)}
+          />
+        )}
+        {needsDomain && (
+          <label style={{ display: 'flex', flexDirection: 'column', gap: '6px', fontSize: '12px' }}>
+            <span>
+              Type <strong>{domain}</strong> to confirm
+            </span>
+            <input
+              type="text"
+              value={state.confirmDomain}
+              disabled={busy}
+              onChange={(e) => setUndoFor(env.id, { ...state, confirmDomain: e.target.value })}
+              style={undoInputStyle}
+            />
+          </label>
+        )}
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            style={{ ...smallButtonStyle, opacity: canConfirm ? 1 : 0.4 }}
+            disabled={!canConfirm}
+            onClick={() => confirmUndo(env)}
+          >
+            {busy ? 'Undoing...' : 'Confirm'}
+          </button>
+          {!busy && (
+            <button style={smallButtonStyle} onClick={() => setUndoFor(env.id, null)}>
+              Cancel
+            </button>
+          )}
+        </div>
+      </div>
+    );
   };
 
   useEffect(() => {
@@ -191,48 +367,60 @@ const SyncPage: React.FC<Props> = ({ site }) => {
             <div style={sectionTitleStyle}>Environments</div>
             <div style={cardStyle}>
               {environments.map((env, idx) => (
-                <div
-                  key={env.id}
-                  style={{
-                    ...(idx === environments.length - 1 ? lastRowStyle : rowStyle),
-                    gap: '16px',
-                  }}
-                >
+                <React.Fragment key={env.id}>
                   <div
-                    style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}
+                    style={{
+                      ...(idx === environments.length - 1 ? lastRowStyle : rowStyle),
+                      gap: '16px',
+                    }}
                   >
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <span style={{ fontWeight: 600 }}>{env.label}</span>
-                      {env.isProduction && <span style={productionBadgeStyle}>PRODUCTION</span>}
-                    </span>
-                    <span style={{ fontSize: '12px', opacity: 0.6 }}>
-                      {remoteDomainOf(env.remoteUrl)} · {environmentTarget(env)}
-                    </span>
+                    <div
+                      style={{ display: 'flex', flexDirection: 'column', gap: '3px', minWidth: 0 }}
+                    >
+                      <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontWeight: 600 }}>{env.label}</span>
+                        {env.isProduction && <span style={productionBadgeStyle}>PRODUCTION</span>}
+                      </span>
+                      <span style={{ fontSize: '12px', opacity: 0.6 }}>
+                        {remoteDomainOf(env.remoteUrl)} · {environmentTarget(env)}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                      <button
+                        style={smallButtonStyle}
+                        onClick={() => dispatchSyncAction('pull', site.id, env.id)}
+                      >
+                        ⬇ Pull
+                      </button>
+                      <button
+                        style={smallButtonStyle}
+                        onClick={() => dispatchSyncAction('push', site.id, env.id)}
+                      >
+                        ⬆ Push
+                      </button>
+                      <button
+                        style={smallButtonStyle}
+                        onClick={() => shell.openExternal(env.remoteUrl)}
+                      >
+                        Open site ↗
+                      </button>
+                      <button style={smallButtonStyle} onClick={() => handleCopySsh(env)}>
+                        {copiedEnvId === env.id ? 'Copied!' : 'Copy SSH'}
+                      </button>
+                      {undoable[env.id] && !undo[env.id] && (
+                        <button
+                          style={smallButtonStyle}
+                          onClick={() =>
+                            setUndoFor(env.id, { stage: 'confirm', confirmDomain: '' })
+                          }
+                        >
+                          Undo last push
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
-                    <button
-                      style={smallButtonStyle}
-                      onClick={() => dispatchSyncAction('pull', site.id, env.id)}
-                    >
-                      ⬇ Pull
-                    </button>
-                    <button
-                      style={smallButtonStyle}
-                      onClick={() => dispatchSyncAction('push', site.id, env.id)}
-                    >
-                      ⬆ Push
-                    </button>
-                    <button
-                      style={smallButtonStyle}
-                      onClick={() => shell.openExternal(env.remoteUrl)}
-                    >
-                      Open site ↗
-                    </button>
-                    <button style={smallButtonStyle} onClick={() => handleCopySsh(env)}>
-                      {copiedEnvId === env.id ? 'Copied!' : 'Copy SSH'}
-                    </button>
-                  </div>
-                </div>
+                  {renderUndo(env)}
+                </React.Fragment>
               ))}
             </div>
 

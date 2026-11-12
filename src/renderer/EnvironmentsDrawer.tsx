@@ -142,7 +142,7 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
   const [error, setError] = useState<string | null>(null);
   const [testState, setTestState] = useState<
     | { status: 'busy' }
-    | { status: 'ok'; remoteRoot: string }
+    | { status: 'ok'; remoteRoot: string; warning?: string }
     | { status: 'error'; error: string }
     | null
   >(null);
@@ -203,7 +203,7 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
     const result = await ipcRenderer.invoke('sshsync:testConnection', environmentFromForm(form));
     setTestState(
       result.success
-        ? { status: 'ok', remoteRoot: result.remoteRoot }
+        ? { status: 'ok', remoteRoot: result.remoteRoot, warning: result.warning }
         : { status: 'error', error: result.error || 'Connection failed' },
     );
   };
@@ -568,6 +568,21 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
                   </span>
                 )}
               </div>
+              {testState?.status === 'ok' && testState.warning && (
+                <div
+                  style={{
+                    marginTop: '8px',
+                    padding: '10px 14px',
+                    backgroundColor: tint(STATUS.warning, 0.1),
+                    border: `1px solid ${tint(STATUS.warning, 0.3)}`,
+                    borderRadius: '8px',
+                    color: STATUS.warning,
+                    fontSize: '13px',
+                  }}
+                >
+                  {testState.warning}
+                </div>
+              )}
               {testState?.status === 'error' && errorBox(testState.error)}
               {error && errorBox(error)}
             </>

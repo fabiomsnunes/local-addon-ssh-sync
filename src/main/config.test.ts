@@ -121,30 +121,35 @@ describe('recordSync', () => {
 });
 
 describe('prunePushBackups', () => {
-  it('keeps only the newest backups of that environment', () => {
+  it('keeps every artifact of the newest pushes to that environment only', () => {
     const dir = path.join(sandbox, 'backups');
     fs.mkdirSync(dir);
-    const names = [
-      'site-1-production-2026-11-01T10-00-00-000Z.sql',
-      'site-1-production-2026-11-02T10-00-00-000Z.sql',
-      'site-1-production-2026-11-03T10-00-00-000Z.sql',
-      'site-1-production-2026-11-04T10-00-00-000Z.sql',
-      'site-1-staging-2026-11-01T10-00-00-000Z.sql',
-      'site-1-production-eu-2026-10-01T10-00-00-000Z.sql',
-      'site-2-production-2026-11-01T10-00-00-000Z.sql',
+    const stamps = [
+      '2026-11-01T10-00-00-000Z',
+      '2026-11-02T10-00-00-000Z',
+      '2026-11-03T10-00-00-000Z',
+      '2026-11-04T10-00-00-000Z',
     ];
-    for (const n of names) fs.writeFileSync(path.join(dir, n), 'x');
+    for (const stamp of stamps) {
+      fs.writeFileSync(path.join(dir, `site-1-production-${stamp}.sql`), 'x');
+      fs.writeFileSync(path.join(dir, `site-1-production-${stamp}.json`), '{}');
+      fs.mkdirSync(path.join(dir, `site-1-production-${stamp}-files`));
+    }
+    fs.writeFileSync(path.join(dir, 'site-1-staging-2026-11-01T10-00-00-000Z.sql'), 'x');
+    fs.writeFileSync(path.join(dir, 'site-1-production-eu-2026-10-01T10-00-00-000Z.sql'), 'x');
 
     prunePushBackups(dir, 'site-1', 'production');
 
-    const left = fs.readdirSync(dir).sort();
-    expect(left.filter((n) => n.startsWith('site-1-production-2'))).toHaveLength(
-      PUSH_BACKUPS_TO_KEEP,
-    );
-    expect(left).not.toContain('site-1-production-2026-11-01T10-00-00-000Z.sql');
+    const left = fs.readdirSync(dir);
+    expect(
+      left.filter((n) => n.includes(stamps[0]) && n.startsWith('site-1-production-2')),
+    ).toHaveLength(0);
+    for (const stamp of stamps.slice(1)) {
+      expect(left.filter((n) => n.startsWith(`site-1-production-${stamp}`))).toHaveLength(3);
+    }
     expect(left).toContain('site-1-staging-2026-11-01T10-00-00-000Z.sql');
     expect(left).toContain('site-1-production-eu-2026-10-01T10-00-00-000Z.sql');
-    expect(left).toContain('site-2-production-2026-11-01T10-00-00-000Z.sql');
+    expect(PUSH_BACKUPS_TO_KEEP).toBe(3);
   });
 });
 

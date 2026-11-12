@@ -19,6 +19,7 @@ export type CliRequest =
       includeDatabase: boolean;
       includeUploads: boolean;
       makeSafe: boolean;
+      acceptSiteUrl?: string;
     }
   | {
       command: 'push';
@@ -29,6 +30,17 @@ export type CliRequest =
       mode: 'newer' | 'all';
       deletions: boolean;
       yes: boolean;
+      production: boolean;
+      includeStale: boolean;
+      acceptSiteUrl?: string;
+    }
+  | {
+      command: 'undo';
+      site: string;
+      environment: string;
+      yes: boolean;
+      production: boolean;
+      acceptSiteUrl?: string;
     };
 
 export type CliMessage =
@@ -149,4 +161,28 @@ export function cliLauncherScript(
     `SSHSYNC_SOCKET=${q(socketPath)} ELECTRON_RUN_AS_NODE=1 exec ${q(electronPath)} ${q(cliScript)} "$@"`,
     '',
   ].join('\n');
+}
+
+// A file only in Local, older than the last pull from that environment, was
+// most likely deleted on the server since (or is a leftover of the Local
+// install): pushing it would bring it back. Needs the mtime from the preview.
+export function isStaleLocalOnly(
+  row: { op: string; isDir?: boolean; localMtime?: number },
+  lastPullMs: number | null,
+): boolean {
+  return (
+    row.op === 'add' &&
+    !row.isDir &&
+    lastPullMs !== null &&
+    typeof row.localMtime === 'number' &&
+    row.localMtime < lastPullMs
+  );
+}
+
+export function lastPullFrom(
+  history: { mode: string; environmentId: string; at: string }[] | undefined,
+  environmentId: string,
+): number | null {
+  const pull = (history || []).find((h) => h.mode === 'pull' && h.environmentId === environmentId);
+  return pull ? Date.parse(pull.at) : null;
 }

@@ -12,6 +12,7 @@ import {
 import SyncIcon from './SyncIcon';
 import { environmentTarget, remoteDomainOf } from './pushHelpers';
 import { STATUS, tint } from './colors';
+import SiteUrlConfirm, { SiteUrlMismatch } from './SiteUrlConfirm';
 import { ServerEnvironment, SiteProfile, SyncProgress } from './types';
 
 const { ipcRenderer } = window.require('electron');
@@ -32,6 +33,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
   const [includeDatabase, setIncludeDatabase] = useState(true);
   const [includeUploads, setIncludeUploads] = useState(false);
   const [makeSafe, setMakeSafe] = useState(true);
+  const [siteUrlMismatch, setSiteUrlMismatch] = useState<SiteUrlMismatch | null>(null);
   const [safeCloneNote, setSafeCloneNote] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -81,7 +83,9 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
     await ipcRenderer.invoke('sshsync:cancelSync', site.id);
   };
 
-  const executeSync = async () => {
+  // `acceptSiteUrl` re-runs the pull after the user confirmed the site URL
+  // WordPress reports in that folder (see SiteUrlConfirm)
+  const executeSync = async (acceptSiteUrl?: string) => {
     const env = environments.find((e) => e.id === selectedEnvId);
     if (!env) {
       setError('Please select an environment');
@@ -90,6 +94,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
 
     setIsSyncing(true);
     setError(null);
+    setSiteUrlMismatch(null);
     setIsComplete(false);
     setSyncProgress({ stage: 'starting', progress: 0, message: 'Starting pull...' });
 
@@ -98,6 +103,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
       includeUploads,
       includeDatabase,
       makeSafe,
+      ...(acceptSiteUrl ? { acceptSiteUrl } : {}),
     });
 
     if (result.success) {
@@ -106,6 +112,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
     } else {
       // Cancelled syncs return to the form without an error banner
       setError(result.cancelled ? null : result.error);
+      setSiteUrlMismatch(result.siteUrlMismatch || null);
       setIsSyncing(false);
       setIsCancelling(false);
       setSyncProgress(null);
@@ -115,6 +122,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
   const handleClose = () => {
     if (!isSyncing) {
       setError(null);
+      setSiteUrlMismatch(null);
       setIsComplete(false);
       setIsCancelling(false);
       setSyncProgress(null);
@@ -371,6 +379,14 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
                   {error}
                 </div>
               )}
+
+              {siteUrlMismatch && (
+                <SiteUrlConfirm
+                  mismatch={siteUrlMismatch}
+                  busy={isSyncing}
+                  onContinue={(acceptSiteUrl) => executeSync(acceptSiteUrl)}
+                />
+              )}
             </>
           )}
 
@@ -482,7 +498,7 @@ const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
         {!isSyncing && !isComplete && (
           <div style={footerStyle}>
             <PrimaryButton
-              onClick={executeSync}
+              onClick={() => executeSync()}
               disabled={!selectedEnvId || environments.length === 0}
               style={{ width: '100%' }}
             >

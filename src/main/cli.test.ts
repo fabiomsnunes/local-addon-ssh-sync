@@ -4,7 +4,14 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { parseArgs } from './cli';
-import { findLocalSite, startCliServer, cliLauncherScript, CliMessage } from './cliProtocol';
+import {
+  findLocalSite,
+  startCliServer,
+  cliLauncherScript,
+  CliMessage,
+  isStaleLocalOnly,
+  lastPullFrom,
+} from './cliProtocol';
 
 describe('ssh-sync arguments', () => {
   it('pulls files and database, safely, by default', () => {
@@ -31,7 +38,19 @@ describe('ssh-sync arguments', () => {
       mode: 'newer',
       deletions: false,
       yes: false,
+      production: false,
+      includeStale: false,
     });
+    expect(parseArgs(['undo', 'mysite', 'staging'])).toEqual({
+      command: 'undo',
+      site: 'mysite',
+      environment: 'staging',
+      yes: false,
+      production: false,
+    });
+    expect(
+      parseArgs(['pull', 'mysite', 'staging', '--accept-site-url=https://live.example.com']),
+    ).toMatchObject({ acceptSiteUrl: 'https://live.example.com' });
     expect(
       parseArgs(['push', 'mysite', 'staging', '--yes', '--delete', '--db', '--all-modified']),
     ).toMatchObject({
@@ -47,6 +66,27 @@ describe('ssh-sync arguments', () => {
     expect(parseArgs(['pull', 'mysite'])).toHaveProperty('error');
     expect(parseArgs(['nope', 'mysite', 'x'])).toHaveProperty('error');
     expect(parseArgs(['envs', 'mysite'])).toEqual({ command: 'envs', site: 'mysite' });
+  });
+});
+
+describe('isStaleLocalOnly', () => {
+  it('flags only files that exist locally and predate the last pull', () => {
+    const pull = Date.parse('2026-11-12T10:00:00Z');
+    expect(isStaleLocalOnly({ op: 'add', localMtime: pull - 1000 }, pull)).toBe(true);
+    expect(isStaleLocalOnly({ op: 'add', localMtime: pull + 1000 }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'update', localMtime: pull - 1000 }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'add', localMtime: pull - 1000 }, null)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'add' }, pull)).toBe(false);
+    expect(
+      lastPullFrom(
+        [
+          { mode: 'push', environmentId: 'a', at: '2026-11-12T11:00:00Z' },
+          { mode: 'pull', environmentId: 'b', at: '2026-11-12T10:30:00Z' },
+          { mode: 'pull', environmentId: 'a', at: '2026-11-12T10:00:00Z' },
+        ],
+        'a',
+      ),
+    ).toBe(pull);
   });
 });
 

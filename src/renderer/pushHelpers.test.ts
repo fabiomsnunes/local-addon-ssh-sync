@@ -6,6 +6,8 @@ import {
   visibleDiffRows,
   summarizeSelection,
   buildPushFileSelection,
+  isStaleLocalOnly,
+  lastPullFrom,
 } from './pushHelpers';
 
 describe('environmentTarget', () => {
@@ -104,5 +106,35 @@ describe('buildPushFileSelection', () => {
   });
   it('never takes the fast path for an empty diff', () => {
     expect(buildPushFileSelection([], 'all')).toEqual({ files: [], deletions: [] });
+  });
+});
+
+describe('isStaleLocalOnly', () => {
+  const pull = Date.parse('2026-11-12T10:00:00Z');
+  it('marks only files added locally before the last pull', () => {
+    expect(isStaleLocalOnly({ op: 'add', localMtime: pull - 1000 }, pull)).toBe(true);
+    expect(isStaleLocalOnly({ op: 'add', localMtime: pull + 1000 }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'update', localMtime: pull - 1000 }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'add', isDir: true, localMtime: pull - 1000 }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'add' }, pull)).toBe(false);
+    expect(isStaleLocalOnly({ op: 'add', localMtime: 1 }, null)).toBe(false);
+  });
+
+  it('takes the newest pull from that environment', () => {
+    const history = [
+      { mode: 'push', environmentId: 'a', at: '2026-11-12T12:00:00Z' },
+      { mode: 'pull', environmentId: 'b', at: '2026-11-12T11:00:00Z' },
+      { mode: 'pull', environmentId: 'a', at: '2026-11-12T10:00:00Z' },
+    ];
+    expect(lastPullFrom(history, 'a')).toBe(pull);
+    expect(lastPullFrom(history, 'c')).toBeNull();
+  });
+
+  it('an unticked stale row forces the selective path', () => {
+    const rows = [
+      { op: 'update', path: 'a.php', selected: true },
+      { op: 'add', path: 'old.php', selected: false },
+    ];
+    expect(buildPushFileSelection(rows, 'all')).toEqual({ files: ['a.php'], deletions: [] });
   });
 });
