@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { useState, useEffect } from 'react';
-import { PrimaryButton, TextButton, Checkbox, FlySelect, Spinner, Title } from './localComponents';
+import { PrimaryButton, TextButton, Checkbox, Spinner, Title } from './localComponents';
 import SyncIcon from './SyncIcon';
 import { environmentTarget, remoteDomainOf } from './pushHelpers';
 import { STATUS, tint } from './colors';
@@ -332,13 +332,24 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
               </div>
 
               <div style={fieldStyle}>
-                <span style={fieldLabelStyle}>Connection</span>
-                <FlySelect
+                <label style={fieldLabelStyle} htmlFor="sshsync-connection">
+                  Connection
+                </label>
+                {/* A native select: FlySelect positions its menu with position:fixed,
+                    which this drawer's transform shifts off-screen, and it has no
+                    keyboard search for the dozens of hosts a ~/.ssh/config can hold. */}
+                <select
+                  id="sshsync-connection"
+                  style={inputStyle}
                   value={form.connection}
-                  options={connectionOptions}
-                  onChange={(value: string) => updateForm({ connection: value })}
-                  style={{ width: '100%' }}
-                />
+                  onChange={(e) => updateForm({ connection: e.target.value })}
+                >
+                  {Object.entries(connectionOptions).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
                 <span style={hintStyle}>
                   Pick a host from your ~/.ssh/config, or enter the server details.
                 </span>
