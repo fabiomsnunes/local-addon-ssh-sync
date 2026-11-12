@@ -393,6 +393,7 @@ async function handleCliRequest(
   userDataPath: string,
   request: CliRequest,
   send: (message: CliMessage) => void,
+  onDisconnect: (callback: () => void) => void,
 ): Promise<void> {
   const fail = (message: string) => send({ type: 'result', success: false, message });
   const site = readLocalSite(userDataPath, request.site);
@@ -419,6 +420,22 @@ async function handleCliRequest(
   const progress = (p: SyncProgress) =>
     send({ type: 'progress', progress: p.progress, message: p.message });
 
+  // Cancel the sync this request started (never one the UI started) when the
+  // client goes away. executePull/executePush register their ActiveSync
+  // before their first await, so it is in the map right after the call.
+  const runCancellable = async <T>(start: () => Promise<T>): Promise<T> => {
+    const before = activeSyncs.get(site.id);
+    const pending = start();
+    const started = activeSyncs.get(site.id);
+    if (started && started !== before) {
+      onDisconnect(() => {
+        started.cancelled = true;
+        started.child?.kill('SIGTERM');
+      });
+    }
+    return pending;
+  };
+
   if (request.command === 'test') {
     try {
       const connection = await connectRemote(environment);
@@ -434,18 +451,20 @@ async function handleCliRequest(
   }
 
   if (request.command === 'pull') {
-    const result = await executePull(
-      {
-        localSiteId: site.id,
-        site,
-        environment,
-        options: {
-          includeDatabase: request.includeDatabase,
-          includeUploads: request.includeUploads,
-          makeSafe: request.makeSafe,
+    const result = await runCancellable(() =>
+      executePull(
+        {
+          localSiteId: site.id,
+          site,
+          environment,
+          options: {
+            includeDatabase: request.includeDatabase,
+            includeUploads: request.includeUploads,
+            makeSafe: request.makeSafe,
+          },
         },
-      },
-      defaultPullPushDeps(progress),
+        defaultPullPushDeps(progress),
+      ),
     );
     if (!result.success) return fail(result.error || 'Pull failed.');
     if (result.note) send({ type: 'output', text: result.note });
@@ -489,20 +508,22 @@ async function handleCliRequest(
   if (!files.length && !(request.deletions && deletions.length) && !request.includeDatabase) {
     return send({ type: 'result', success: true, message: 'Nothing to push.' });
   }
-  const result = await executePush(
-    {
-      localSiteId: site.id,
-      site,
-      environment,
-      options: {
-        includeDatabase: request.includeDatabase,
-        includeUploads: request.includeUploads,
-        mode: request.mode,
-        files: files.map((r) => r.path),
-        deletions: request.deletions ? deletions.map((r) => r.path) : [],
+  const result = await runCancellable(() =>
+    executePush(
+      {
+        localSiteId: site.id,
+        site,
+        environment,
+        options: {
+          includeDatabase: request.includeDatabase,
+          includeUploads: request.includeUploads,
+          mode: request.mode,
+          files: files.map((r) => r.path),
+          deletions: request.deletions ? deletions.map((r) => r.path) : [],
+        },
       },
-    },
-    defaultPullPushDeps(progress),
+      defaultPullPushDeps(progress),
+    ),
   );
   if (!result.success) return fail(result.error || 'Push failed.');
   return send({
@@ -539,8 +560,8 @@ export default function (context: AddonMainContext): void {
   // The `ssh-sync` command's endpoint
   ensureConfigDir();
   const cliSocketPath = path.join(getConfigDir(), CLI_SOCKET_NAME);
-  const cliServer = startCliServer(cliSocketPath, (request, send) =>
-    handleCliRequest(userDataPath, request, send),
+  const cliServer = startCliServer(cliSocketPath, (request, send, onDisconnect) =>
+    handleCliRequest(userDataPath, request, send, onDisconnect),
   );
 
   // Quitting Local mid-sync must not leave ssh masters running

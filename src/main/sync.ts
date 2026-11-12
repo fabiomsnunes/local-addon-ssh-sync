@@ -218,6 +218,38 @@ async function neutralizeDatabase(
   return result;
 }
 
+// Plugins still installed locally keep their place in the record; the rest
+// were deleted on purpose and must not come back on the server.
+function keepInstalledPlugins(
+  record: NeutralizeRecord,
+  publicPath: string,
+  dfs: PullPushDeps['fs'],
+): { record: NeutralizeRecord; skipped: string[] } {
+  const pluginsDir = path.join(publicPath, 'wp-content', 'plugins');
+  const installed = (plugin: string) => dfs.existsSync(path.join(pluginsDir, plugin.split('/')[0]));
+  const skipped = new Set<string>();
+  const options: NeutralizeRecord['options'] = {};
+  for (const [suffix, entry] of Object.entries(record.options)) {
+    const deactivated = entry.deactivated.filter((plugin) => {
+      if (installed(plugin)) return true;
+      skipped.add(plugin.split('/')[0]);
+      return false;
+    });
+    if (deactivated.length || entry.stripeTestmode !== null) {
+      options[suffix] = { deactivated, stripeTestmode: entry.stripeTestmode };
+    }
+  }
+  const sitewideDeactivated: Record<string, number> = {};
+  for (const [plugin, time] of Object.entries(record.sitewideDeactivated)) {
+    if (installed(plugin)) sitewideDeactivated[plugin] = time;
+    else skipped.add(plugin.split('/')[0]);
+  }
+  return {
+    record: { environmentId: record.environmentId, options, sitewideDeactivated },
+    skipped: [...skipped],
+  };
+}
+
 // After a database push: put back on the server what the safe copy changed
 // locally, so the server never ends up with its backups, mail or Stripe off.
 async function restoreNeutralizedOnServer(
@@ -688,7 +720,7 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
         const phpBin = deps.findServiceBinary(['php-'], 'php');
         if (!phpBin) throw new Error("Could not find PHP binary in Local's lightning-services");
         const result = await neutralizeDatabase(deps, sync, publicPath, { phpBin, socketPath, db });
-        deps.saveNeutralizeRecord(localSiteId, result.record);
+        deps.saveNeutralizeRecord(localSiteId, { ...result.record, environmentId: environment.id });
         neutralized = result;
       }
       safeCloneNote = describeSafeClone(neutralized);
@@ -849,6 +881,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   let remoteImportStarted = false;
   let remoteDatabaseFinished = false;
   let restoredOnServer: string[] = [];
+  let restoreWarning: string | null = null;
+  let prefixReconciled = true;
   let cancelledLate = false;
   let remoteBackupPath: string | null = null;
   const publicPath = localPublicPath(site);
@@ -1089,6 +1123,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           );
         }
       } catch (prefixError: any) {
+        prefixReconciled = false;
         console.warn(
           '[SSH Sync] Remote table-prefix reconcile failed (non-fatal):',
           prefixError?.message,
@@ -1099,26 +1134,52 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         );
       }
 
-      // What the safe local copy turned off goes back on, on the server
-      const neutralizeRecord = deps.loadNeutralizeRecord(localSiteId);
-      if (neutralizeRecord && !isEmptyRecord(neutralizeRecord)) {
-        sendProgress({
-          stage: 'search-replace',
-          progress: 97,
-          message: 'Restoring plugins the safe local copy turned off...',
-        });
-        restoredOnServer = await restoreNeutralizedOnServer(
-          deps,
-          serverDbSync,
-          connection,
-          environment,
-          neutralizeRecord,
-        );
-      }
-
       // The server database is complete and consistent: nothing after this
       // point may roll it back, a late cancel included.
       remoteDatabaseFinished = true;
+
+      // What the safe local copy turned off goes back on, on the server it
+      // was pulled from only: on any other environment it would switch on
+      // that server's live payments, backups and mail. Plugins whose folder
+      // is gone locally were removed on purpose and stay off. Non-fatal: the
+      // push itself has landed.
+      const neutralizeRecord = deps.loadNeutralizeRecord(localSiteId);
+      if (
+        neutralizeRecord &&
+        neutralizeRecord.environmentId === environment.id &&
+        prefixReconciled
+      ) {
+        const { record, skipped } = keepInstalledPlugins(neutralizeRecord, publicPath, dfs);
+        if (!isEmptyRecord(record)) {
+          sendProgress({
+            stage: 'search-replace',
+            progress: 97,
+            message: 'Restoring plugins the safe local copy turned off...',
+          });
+          try {
+            restoredOnServer = await restoreNeutralizedOnServer(
+              deps,
+              serverDbSync,
+              connection,
+              environment,
+              record,
+            );
+          } catch (e: any) {
+            console.warn('[SSH Sync] Restoring neutralized plugins failed:', e?.message);
+            restoreWarning = `Push done, but re-enabling what the safe local copy turned off failed on ${environment.label}: check its active plugins${record.options.options?.stripeTestmode !== null ? ' and Stripe mode' : ''}.`;
+          }
+        }
+        if (skipped.length) {
+          restoreWarning = [
+            restoreWarning,
+            `Left off on ${environment.label} (deleted locally): ${skipped.join(', ')}.`,
+          ]
+            .filter(Boolean)
+            .join(' ');
+        }
+      } else if (neutralizeRecord && neutralizeRecord.environmentId === environment.id) {
+        restoreWarning = `The table prefix could not be updated, so the plugins the safe local copy turned off were not re-enabled on ${environment.label}.`;
+      }
     }
 
     // A cancel that arrived while the server database was being replaced only
@@ -1152,7 +1213,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     const lateCancelWarning = cancelledLate
       ? 'Cancel arrived after the server was updated, so the push was completed.'
       : null;
-    const warning = [fileWarning, lateCancelWarning].filter(Boolean).join(' ') || null;
+    const warning =
+      [fileWarning, lateCancelWarning, restoreWarning].filter(Boolean).join(' ') || null;
 
     deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
     sendProgress({

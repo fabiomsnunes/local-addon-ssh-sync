@@ -78,7 +78,11 @@ export function readLocalSite(userDataPath: string, nameIdOrDomain: string): Sit
 
 export function startCliServer(
   socketPath: string,
-  handle: (request: CliRequest, send: (message: CliMessage) => void) => Promise<void>,
+  handle: (
+    request: CliRequest,
+    send: (message: CliMessage) => void,
+    onDisconnect: (callback: () => void) => void,
+  ) => Promise<void>,
 ): net.Server {
   try {
     fs.unlinkSync(socketPath); // a stale socket from a crashed session
@@ -86,8 +90,15 @@ export function startCliServer(
     // none
   }
   const server = net.createServer((socket) => {
+    socket.setEncoding('utf8');
     let buffer = '';
     let handled = false;
+    // A client that goes away (Ctrl-C, closed terminal) cancels its sync
+    const disconnectCallbacks: Array<() => void> = [];
+    let finished = false;
+    socket.on('close', () => {
+      if (!finished) disconnectCallbacks.forEach((callback) => callback());
+    });
     const send = (message: CliMessage) => {
       if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`);
     };
@@ -105,9 +116,12 @@ export function startCliServer(
         socket.end();
         return;
       }
-      handle(request, send)
+      handle(request, send, (callback) => disconnectCallbacks.push(callback))
         .catch((e: any) => send({ type: 'result', success: false, message: e?.message }))
-        .finally(() => socket.end());
+        .finally(() => {
+          finished = true;
+          socket.end();
+        });
     });
     socket.on('error', () => socket.destroy());
   });

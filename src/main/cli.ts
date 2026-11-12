@@ -82,17 +82,24 @@ function run(): void {
   let buffer = '';
   let exitCode = 1;
   const socket = net.connect(socketPath!);
+  socket.setEncoding('utf8');
   socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
   socket.on('error', () => {
     process.stderr.write('Could not reach SSH Sync: is Local running with the add-on enabled?\n');
     process.exit(1);
   });
-  socket.on('data', (chunk) => {
-    buffer += chunk.toString();
+  socket.on('data', (chunk: string) => {
+    buffer += chunk;
     let newline: number;
     while ((newline = buffer.indexOf('\n')) >= 0) {
-      const message = JSON.parse(buffer.slice(0, newline)) as CliMessage;
+      const line = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
+      let message: CliMessage;
+      try {
+        message = JSON.parse(line) as CliMessage;
+      } catch {
+        continue;
+      }
       if (message.type === 'progress') {
         const line = `${String(message.progress).padStart(3)}% ${message.message}`;
         if (tty) process.stdout.write(`\r\x1b[K${line}`);
@@ -110,7 +117,10 @@ function run(): void {
       }
     }
   });
-  socket.on('end', () => process.exit(exitCode));
+  // Let stdout drain (a pipe is asynchronous): set the code, do not exit()
+  socket.on('end', () => {
+    process.exitCode = exitCode;
+  });
 }
 
 if (require.main === module) run();

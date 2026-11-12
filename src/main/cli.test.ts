@@ -105,6 +105,26 @@ describe('cli socket', () => {
   });
 });
 
+describe('cli socket disconnect', () => {
+  it('tells the handler when the client goes away mid-request', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-cli-'));
+    const socketPath = path.join(dir, 'cli.sock');
+    let disconnected!: () => void;
+    const gone = new Promise<void>((r) => (disconnected = r));
+    const server = startCliServer(socketPath, async (_request, _send, onDisconnect) => {
+      onDisconnect(disconnected);
+      await gone;
+    });
+    await new Promise((r) => server.once('listening', r));
+    const c = net.connect(socketPath, () => {
+      c.write(`${JSON.stringify({ command: 'envs', site: 'x' })}\n`);
+      setTimeout(() => c.destroy(), 50);
+    });
+    await gone;
+    await new Promise((r) => server.close(r));
+  });
+});
+
 describe('cliLauncherScript', () => {
   it('quotes every path for sh', () => {
     const script = cliLauncherScript(

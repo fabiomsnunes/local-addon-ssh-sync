@@ -84,6 +84,9 @@ add_filter( 'action_scheduler_allow_async_request_runner', '__return_false' );
 // prefix, so it still applies after a prefix change): plugins it deactivated
 // and the Stripe test mode it replaced.
 export interface NeutralizeRecord {
+  // The environment the database was pulled from: the only one a database
+  // push may restore these settings on
+  environmentId?: string;
   options: Record<string, { deactivated: string[]; stripeTestmode: string | null }>;
   sitewideDeactivated: Record<string, number>;
 }
@@ -176,7 +179,11 @@ foreach ( $tables as $suffix ) {
 
 $sitemeta = $prefix . 'sitemeta';
 if ( $db->query( "SHOW TABLES LIKE '" . $db->real_escape_string( str_replace( '_', '\\\\_', $sitemeta ) ) . "'" )->num_rows ) {
-	$network = $get( $sitemeta, 'meta_key', 'meta_value', 'active_sitewide_plugins' );
+	// The main network only (site_id 1): every network has its own row
+	$st = $db->prepare( "SELECT meta_value FROM \`$sitemeta\` WHERE meta_key = 'active_sitewide_plugins' AND site_id = 1 LIMIT 1" );
+	$st->execute();
+	$row     = $st->get_result()->fetch_row();
+	$network = $row ? @unserialize( $row[0] ) : null;
 	if ( is_array( $network ) ) {
 		$removed = array();
 		foreach ( $network as $plugin => $time ) {
@@ -186,7 +193,13 @@ if ( $db->query( "SHOW TABLES LIKE '" . $db->real_escape_string( str_replace( '_
 			}
 		}
 		if ( $removed ) {
-			$set( $sitemeta, 'meta_key', 'meta_value', 'active_sitewide_plugins', $network );
+			$st = $db->prepare( "UPDATE \`$sitemeta\` SET meta_value = ? WHERE meta_key = 'active_sitewide_plugins' AND site_id = 1" );
+			$v  = serialize( $network );
+			$st->bind_param( 's', $v );
+			if ( ! $st->execute() ) {
+				fwrite( STDERR, 'Could not update active_sitewide_plugins' );
+				exit( 1 );
+			}
 			$record['sitewideDeactivated'] = $removed;
 			$deactivated                   = array_merge( $deactivated, array_keys( $removed ) );
 		}
@@ -226,7 +239,9 @@ export function parseNeutralizeOutput(stdout: string): NeutralizeResult | null {
   }
 }
 
-export function isEmptyRecord(record: NeutralizeRecord): boolean {
+export function isEmptyRecord(
+  record: Pick<NeutralizeRecord, 'options' | 'sitewideDeactivated'>,
+): boolean {
   return (
     Object.keys(record.options).length === 0 && Object.keys(record.sitewideDeactivated).length === 0
   );
@@ -247,11 +262,18 @@ foreach ( $record['options'] as $suffix => $entry ) {
 		continue;
 	}
 	$table = $wpdb->base_prefix . $suffix;
+	if ( $table !== $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) ) {
+		fwrite( STDERR, "No table $table on the server" );
+		exit( 1 );
+	}
 	$read  = function ( $option ) use ( $wpdb, $table ) {
 		return maybe_unserialize( $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM \`$table\` WHERE option_name = %s", $option ) ) );
 	};
 	$write = function ( $option, $value ) use ( $wpdb, $table ) {
-		$wpdb->update( $table, array( 'option_value' => maybe_serialize( $value ) ), array( 'option_name' => $option ) );
+		if ( false === $wpdb->update( $table, array( 'option_value' => maybe_serialize( $value ) ), array( 'option_name' => $option ) ) ) {
+			fwrite( STDERR, "Could not update $option in $table" );
+			exit( 1 );
+		}
 	};
 	if ( ! empty( $entry['deactivated'] ) ) {
 		$active = $read( 'active_plugins' );
@@ -271,10 +293,14 @@ foreach ( $record['options'] as $suffix => $entry ) {
 	}
 }
 if ( ! empty( $record['sitewideDeactivated'] ) && ! empty( $wpdb->sitemeta ) ) {
-	$network = maybe_unserialize( $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->sitemeta} WHERE meta_key = %s", 'active_sitewide_plugins' ) ) );
+	// The main network only, like the neutralize step
+	$network = maybe_unserialize( $wpdb->get_var( $wpdb->prepare( "SELECT meta_value FROM {$wpdb->sitemeta} WHERE meta_key = %s AND site_id = 1", 'active_sitewide_plugins' ) ) );
 	$network = is_array( $network ) ? $network : array();
 	$network = $network + $record['sitewideDeactivated'];
-	$wpdb->update( $wpdb->sitemeta, array( 'meta_value' => maybe_serialize( $network ) ), array( 'meta_key' => 'active_sitewide_plugins' ) );
+	if ( false === $wpdb->update( $wpdb->sitemeta, array( 'meta_value' => maybe_serialize( $network ) ), array( 'meta_key' => 'active_sitewide_plugins', 'site_id' => 1 ) ) ) {
+		fwrite( STDERR, 'Could not update active_sitewide_plugins' );
+		exit( 1 );
+	}
 	$restored = array_merge( $restored, array_keys( $record['sitewideDeactivated'] ) );
 }
 wp_cache_flush();
