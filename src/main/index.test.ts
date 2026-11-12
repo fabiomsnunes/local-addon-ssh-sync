@@ -789,6 +789,7 @@ describe('EXCLUDE_PATTERNS', () => {
       // either way would point one host at the other's cache backend.
       'wp-content/object-cache.php',
       'wp-content/advanced-cache.php',
+      'wp-content/.litespeed_conf.php',
     ]) {
       expect(EXCLUDE_PATTERNS).toContain(required);
     }
