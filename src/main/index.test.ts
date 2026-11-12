@@ -1,4 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import {
   isValidHostname,
   isValidPort,
@@ -34,6 +39,10 @@ import {
   sshTarget,
   baseSshOptions,
   masterSshArgs,
+  askpassEnvironment,
+  askpassHelperPath,
+  serveAskpass,
+  openRemoteConnection,
   sshArgs,
   scpArgs,
   rsyncRemoteShell,
@@ -855,5 +864,39 @@ describe('EXCLUDE_PATTERNS', () => {
     // page-cache exclude must be anchored to wp-content/cache.
     expect(EXCLUDE_PATTERNS).not.toContain('cache/');
     expect(EXCLUDE_PATTERNS).toContain('wp-content/cache/');
+  });
+});
+
+describe('password authentication', () => {
+  it('tries the password once, never keys, and never batch mode', () => {
+    const args = masterSshArgs(env({ auth: 'password' }), '/tmp/cm-1');
+    expect(args).toContain('PubkeyAuthentication=no');
+    expect(args).toContain('NumberOfPasswordPrompts=1');
+    expect(args).not.toContain('BatchMode=yes');
+  });
+
+  it('points ssh at the askpass helper without putting the password in the environment', () => {
+    const environment = askpassEnvironment('/tmp/x/askpass.sh', '/tmp/x/ap-1');
+    expect(environment.SSH_ASKPASS).toBe('/tmp/x/askpass.sh');
+    expect(environment.SSH_ASKPASS_REQUIRE).toBe('force');
+    expect(environment.SSHSYNC_ASKPASS_SOCKET).toBe('/tmp/x/ap-1');
+    expect(Object.values(environment)).not.toContain('s3cret');
+  });
+
+  it('the helper prints the password served on the socket, once per answer', async () => {
+    const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-test-')), 'ap');
+    const server = serveAskpass(socketPath, "pa ss'word", 1);
+    const helper = askpassHelperPath();
+    const { stdout } = await promisify(execFile)(helper, [], {
+      env: askpassEnvironment(helper, socketPath),
+    });
+    expect(stdout).toBe("pa ss'word\n");
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  it('refuses to connect a password environment with no password', async () => {
+    await expect(
+      openRemoteConnection(env({ auth: 'password' }), async () => ({ code: 0, stderr: '' }), null),
+    ).rejects.toThrow(/No password saved/);
   });
 });

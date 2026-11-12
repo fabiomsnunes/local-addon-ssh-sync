@@ -27,6 +27,10 @@ interface EnvironmentForm {
   sshHost: string;
   sshUser: string;
   sshPort: string;
+  auth: 'key' | 'password';
+  // Typed in this form only; empty keeps the saved password
+  password: string;
+  hasPassword: boolean;
   remotePath: string;
   remoteUrl: string;
   wpCommand: string;
@@ -43,6 +47,9 @@ function formFromEnvironment(env: ServerEnvironment): EnvironmentForm {
     sshHost: env.sshHost || '',
     sshUser: env.sshUser || '',
     sshPort: env.sshPort || '22',
+    auth: env.auth,
+    password: '',
+    hasPassword: Boolean(env.hasPassword),
     remotePath: env.remotePath,
     remoteUrl: env.remoteUrl,
     wpCommand: env.wpCommand || 'wp',
@@ -59,6 +66,9 @@ function newForm(isFirst: boolean): EnvironmentForm {
     sshHost: '',
     sshUser: '',
     sshPort: '22',
+    auth: 'key',
+    password: '',
+    hasPassword: false,
     remotePath: '',
     remoteUrl: '',
     wpCommand: 'wp',
@@ -68,7 +78,9 @@ function newForm(isFirst: boolean): EnvironmentForm {
   };
 }
 
-function environmentFromForm(form: EnvironmentForm): Partial<ServerEnvironment> {
+function environmentFromForm(
+  form: EnvironmentForm,
+): Partial<ServerEnvironment> & { password?: string } {
   const usesAlias = form.connection !== MANUAL_CONNECTION;
   return {
     id: form.id,
@@ -77,7 +89,8 @@ function environmentFromForm(form: EnvironmentForm): Partial<ServerEnvironment> 
     sshHost: usesAlias ? undefined : form.sshHost,
     sshUser: usesAlias ? undefined : form.sshUser,
     sshPort: usesAlias ? undefined : form.sshPort,
-    auth: 'key',
+    auth: form.auth,
+    password: form.auth === 'password' && form.password ? form.password : undefined,
     remotePath: form.remotePath,
     remoteUrl: form.remoteUrl,
     wpCommand: form.wpCommand,
@@ -151,7 +164,9 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
     setTestState(null);
   };
 
-  const persist = async (next: Partial<ServerEnvironment>[]): Promise<boolean> => {
+  const persist = async (
+    next: (Partial<ServerEnvironment> & { password?: string })[],
+  ): Promise<boolean> => {
     setIsSaving(true);
     setError(null);
     const result = await ipcRenderer.invoke('sshsync:saveEnvironments', site.id, next);
@@ -402,7 +417,13 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
                 <label
                   style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}
                 >
-                  <input type="radio" checked readOnly /> SSH key (your SSH agent or ~/.ssh/config)
+                  <input
+                    type="radio"
+                    name="sshsync-auth"
+                    checked={form.auth === 'key'}
+                    onChange={() => updateForm({ auth: 'key' })}
+                  />{' '}
+                  SSH key (your SSH agent or ~/.ssh/config)
                 </label>
                 <label
                   style={{
@@ -411,11 +432,35 @@ const EnvironmentsDrawer: React.FC<Props> = ({ isOpen, onClose, onSaved, site, e
                     gap: '8px',
                     fontSize: '13px',
                     marginTop: '6px',
-                    opacity: 0.45,
                   }}
                 >
-                  <input type="radio" disabled /> Password (coming soon)
+                  <input
+                    type="radio"
+                    name="sshsync-auth"
+                    checked={form.auth === 'password'}
+                    onChange={() => updateForm({ auth: 'password' })}
+                  />{' '}
+                  Password
                 </label>
+                {form.auth === 'password' && (
+                  <div style={{ marginTop: '10px' }}>
+                    <input
+                      id="sshsync-password"
+                      type="password"
+                      autoComplete="off"
+                      style={inputStyle}
+                      value={form.password}
+                      placeholder={
+                        form.hasPassword ? 'Saved (leave empty to keep it)' : 'SSH password'
+                      }
+                      onChange={(e) => updateForm({ password: e.target.value })}
+                    />
+                    <span style={hintStyle}>
+                      Stored encrypted in your system keychain. A key is safer when the server
+                      allows it.
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div style={fieldStyle}>

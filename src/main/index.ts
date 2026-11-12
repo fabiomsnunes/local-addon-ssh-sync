@@ -35,7 +35,13 @@ import {
   getBackupsDir,
   ensureConfigDir,
   getProfile,
+  loadProfiles,
   findEnvironment,
+  canStorePasswords,
+  savePassword,
+  getPassword,
+  hasPassword,
+  prunePasswords,
   saveEnvironments,
   deleteProfile,
   recordSync,
@@ -194,12 +200,42 @@ function watchRendererBundle(electron: AddonMainContext['electron']): void {
   }
 }
 
-async function connectRemote(environment: ServerEnvironment): Promise<RemoteConnection> {
-  if (environment.auth === 'password') {
-    throw new Error('Password authentication is not available yet. Use an SSH key for now.');
-  }
-  return openRemoteConnection(environment, runCommand);
+// `password` overrides the saved one (Test connection on an edited form)
+async function connectRemote(
+  environment: ServerEnvironment,
+  password: string | null = null,
+): Promise<RemoteConnection> {
+  const effectivePassword =
+    environment.auth === 'password' ? password || getPassword(environment.id) : null;
+  return openRemoteConnection(environment, runCommand, effectivePassword);
 }
+
+// Passwords live only as long as a password environment that uses them
+function pruneOrphanPasswords(): void {
+  const keep = new Set<string>();
+  for (const profile of Object.values(loadProfiles())) {
+    for (const environment of profile.environments) {
+      if (environment.auth === 'password') keep.add(environment.id);
+    }
+  }
+  prunePasswords(keep);
+}
+
+// What the renderer may know about a profile: whether a password is saved,
+// never the password itself.
+function profileForRenderer(localSiteId: string) {
+  const profile = getProfile(localSiteId);
+  if (!profile) return null;
+  return {
+    ...profile,
+    environments: profile.environments.map((environment) => ({
+      ...environment,
+      hasPassword: environment.auth === 'password' && hasPassword(environment.id),
+    })),
+  };
+}
+
+type EnvironmentInput = Partial<ServerEnvironment> & { password?: string };
 
 // Wire the orchestration seams to the real implementations. Called per IPC
 // invocation with a `sendProgress` bound to the requesting renderer.
@@ -271,7 +307,7 @@ export default function (context: AddonMainContext): void {
   const userDataPath = String(context.environment.userDataPath || '');
   const appPath = String(context.environment.appPath || '');
   initLocalPaths(userDataPath, appPath);
-  initConfig(userDataPath);
+  initConfig(userDataPath, electron.safeStorage);
 
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
@@ -292,6 +328,7 @@ export default function (context: AddonMainContext): void {
   try {
     hooks.addAction('siteDeleted', (siteId: string) => {
       if (deleteProfile(siteId)) {
+        pruneOrphanPasswords();
         console.log(`[SSH Sync] Removed profile for deleted site ${siteId}`);
       }
     });
@@ -300,22 +337,38 @@ export default function (context: AddonMainContext): void {
   }
 
   ipcMain.handle('sshsync:getProfile', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
-    return getProfile(localSiteId);
+    return profileForRenderer(localSiteId);
   });
+
+  ipcMain.handle('sshsync:canStorePasswords', async () => canStorePasswords());
 
   ipcMain.handle('sshsync:listSshHosts', async () => listSshConfigHosts());
 
   ipcMain.handle(
     'sshsync:saveEnvironments',
-    async (
-      _event: IpcMainInvokeEvent,
-      localSiteId: string,
-      input: Partial<ServerEnvironment>[],
-    ) => {
-      const result = normalizeEnvironments(Array.isArray(input) ? input : []);
+    async (_event: IpcMainInvokeEvent, localSiteId: string, input: EnvironmentInput[]) => {
+      const inputs = Array.isArray(input) ? input : [];
+      const result = normalizeEnvironments(inputs);
       if ('error' in result) return { success: false, error: result.error };
+      // normalizeEnvironments keeps the order, so inputs[i] is environments[i]
+      for (let i = 0; i < result.environments.length; i++) {
+        const environment = result.environments[i];
+        const typedPassword = typeof inputs[i].password === 'string' ? inputs[i].password : '';
+        if (environment.auth !== 'password') continue;
+        if (typedPassword) {
+          if (!savePassword(environment.id, typedPassword)) {
+            return {
+              success: false,
+              error: 'This computer cannot store the password encrypted, so it was not saved.',
+            };
+          }
+        } else if (!hasPassword(environment.id)) {
+          return { success: false, error: `${environment.label}: enter the SSH password.` };
+        }
+      }
       saveEnvironments(localSiteId, result.environments);
-      return { success: true, profile: getProfile(localSiteId) };
+      pruneOrphanPasswords();
+      return { success: true, profile: profileForRenderer(localSiteId) };
     },
   );
 
@@ -323,6 +376,7 @@ export default function (context: AddonMainContext): void {
     'sshsync:deleteProfile',
     async (_event: IpcMainInvokeEvent, localSiteId: string) => {
       deleteProfile(localSiteId);
+      pruneOrphanPasswords();
       return { success: true };
     },
   );
@@ -330,11 +384,14 @@ export default function (context: AddonMainContext): void {
   // Connect and probe an environment as typed in the form (not yet saved)
   ipcMain.handle(
     'sshsync:testConnection',
-    async (_event: IpcMainInvokeEvent, input: Partial<ServerEnvironment>) => {
+    async (_event: IpcMainInvokeEvent, input: EnvironmentInput) => {
       const result = normalizeEnvironments([input]);
       if ('error' in result) return { success: false, error: result.error };
       try {
-        const connection = await connectRemote(result.environments[0]);
+        const connection = await connectRemote(
+          result.environments[0],
+          typeof input.password === 'string' ? input.password : null,
+        );
         await connection.close();
         return { success: true, remoteRoot: connection.remoteRoot };
       } catch (e: any) {
