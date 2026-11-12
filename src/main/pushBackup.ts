@@ -109,9 +109,28 @@ export function removeListedEmptyDirsCommand(): string {
 
 // Undo safety: a pushed file that no longer has the size and mtime the push
 // gave it, or a deleted file that exists again, changed on the server since.
-// stdin lines: "<size> <mtime> <path>" for pushed files, "- - <path>" for deleted ones.
+// stdin lines, tab-separated so names keep every space: "<size>\t<mtime>\t<path>"
+// for pushed files, "-\t-\t<path>" for deleted ones. GNU stat, then BSD stat.
 export function changedSinceCommand(): string {
-  return 'while IFS=" " read -r size mtime p; do if [ "$size" = - ]; then [ -e "$p" ] && echo "SSHSYNC_CHANGED|$p"; else now=$(stat -c "%s %Y" -- "$p" 2>/dev/null); [ "$now" = "$size $mtime" ] || echo "SSHSYNC_CHANGED|$p"; fi; done; true';
+  return [
+    `tab=$(printf '\\t');`,
+    'while IFS= read -r line; do',
+    'size=${line%%"$tab"*}; rest=${line#*"$tab"}; mtime=${rest%%"$tab"*}; p=${rest#*"$tab"};',
+    'if [ "$size" = - ]; then { [ -e "$p" ] || [ -L "$p" ]; } && printf "SSHSYNC_CHANGED|%s\\n" "$p";',
+    'else now=$(stat -c "%s %Y" -- "$p" 2>/dev/null || stat -f "%z %m" -- "$p" 2>/dev/null);',
+    '[ "$now" = "$size $mtime" ] || printf "SSHSYNC_CHANGED|%s\\n" "$p"; fi;',
+    'done; true',
+  ].join(' ');
+}
+
+export function changedSinceLines(
+  pushed: Record<string, [number, number]>,
+  deleted: string[],
+): string[] {
+  return [
+    ...Object.entries(pushed).map(([file, [size, mtime]]) => `${size}\t${mtime}\t${file}`),
+    ...deleted.map((file) => `-\t-\t${file}`),
+  ];
 }
 
 export function parseChangedSince(stdout: string): string[] {
@@ -138,7 +157,10 @@ export function acquireLockCommand(lock: string, owner: string, token: string): 
   return [
     `l=${q}`,
     `if mkdir "$l" 2>/dev/null; then :`,
-    `elif [ -n "$(find "$l" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mv "$l" "$l.stale.$$" 2>/dev/null && mkdir "$l" 2>/dev/null; then rm -rf -- "$l.stale.$$"`,
+    // Take over a dead lock: rename it away (only one taker's mv succeeds),
+    // and if what was renamed turns out to be fresh (another taker got there
+    // first), put it back and report busy
+    `elif [ -n "$(find "$l" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mv "$l" "$l.stale.$$" 2>/dev/null; then if [ -n "$(find "$l.stale.$$" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mkdir "$l" 2>/dev/null; then rm -rf -- "$l.stale.$$"; else mv "$l.stale.$$" "$l" 2>/dev/null; printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
     `else printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
     `printf '%s\\n' ${shellQuote(owner)} > "$l/owner"`,
     `printf '%s\\n' ${shellQuote(token)} > "$l/token"`,

@@ -63,6 +63,8 @@ import {
   outermostPaths,
   isSafeListedPath,
   releaseLockCommand,
+  changedSinceCommand,
+  changedSinceLines,
   acquireLockCommand,
   parseLockOutput,
   lockDir,
@@ -1095,5 +1097,37 @@ describe('push backups and lock', () => {
       ok: false,
       owner: 'mac (site) since x',
     });
+  });
+});
+
+describe("changedSinceCommand (run for real with this machine's sh)", () => {
+  it('reports files whose size or mtime changed and deletions that came back, keeping spaces', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-changed-'));
+    const same = ' lead and trail .txt ';
+    fs.writeFileSync(path.join(dir, same), 'abc');
+    fs.writeFileSync(path.join(dir, 'edited.php'), 'abcdef');
+    fs.writeFileSync(path.join(dir, 'café (1).txt'), 'x');
+    const stat = (f: string) => {
+      const st = fs.statSync(path.join(dir, f));
+      return [st.size, Math.floor(st.mtimeMs / 1000)] as [number, number];
+    };
+    const lines = changedSinceLines(
+      { [same]: stat(same), 'edited.php': [3, stat('edited.php')[1]] },
+      ['café (1).txt', 'still-gone.txt'],
+    );
+    const input = path.join(dir, 'list');
+    fs.writeFileSync(input, `${lines.join('\n')}\n`);
+    const { stdout } = await promisify(execFile)('sh', [
+      '-c',
+      `cd "$1" && { ${changedSinceCommand()}; } < "$2"`,
+      'sh',
+      dir,
+      input,
+    ]);
+    expect(stdout.trim().split('\n').sort()).toEqual([
+      'SSHSYNC_CHANGED|café (1).txt',
+      'SSHSYNC_CHANGED|edited.php',
+    ]);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -57,6 +57,7 @@ import {
   removeListedFilesCommand,
   removeListedEmptyDirsCommand,
   changedSinceCommand,
+  changedSinceLines,
   parseChangedSince,
   refreshLockCommand,
   newLockToken,
@@ -98,13 +99,13 @@ function siteUrlRefusal(
   acceptSiteUrl: string | undefined,
 ): SyncResult | null {
   if (!connection.siteUrlMismatch) return null;
-  if (connection.siteUrl && acceptSiteUrl === connection.siteUrl) return null;
+  // With no readable URL, the folder itself is what the user confirms
+  const confirmValue = connection.siteUrl || connection.remoteRoot;
+  if (acceptSiteUrl && acceptSiteUrl === confirmValue) return null;
   return {
     success: false,
-    error: connection.siteUrl
-      ? `${connection.siteUrlMismatch} If that is right, type ${connection.siteUrl} to continue.`
-      : connection.siteUrlMismatch,
-    siteUrlMismatch: { actual: connection.siteUrl, expected: environment.remoteUrl },
+    error: `${connection.siteUrlMismatch} If that is right, type ${confirmValue} to continue.`,
+    siteUrlMismatch: { actual: confirmValue, expected: environment.remoteUrl },
   };
 }
 
@@ -1235,16 +1236,18 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         // gone locally since: undo will not check it
       }
     }
-    writePushManifest(deps, backupBase, {
-      environmentId: environment.id,
-      stamp,
-      added: changes ? changes.files : null,
-      addedDirs: changes ? changes.dirs : null,
-      pushed,
-      deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
-      hasFilesBackup: Boolean(localFilesBackup),
-      hasDatabaseBackup: Boolean(options.includeDatabase),
-    });
+    // A push that changed nothing on the server leaves nothing to undo
+    if (filesChanged || options.includeDatabase)
+      writePushManifest(deps, backupBase, {
+        environmentId: environment.id,
+        stamp,
+        added: changes ? changes.files : null,
+        addedDirs: changes ? changes.dirs : null,
+        pushed,
+        deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
+        hasFilesBackup: Boolean(localFilesBackup),
+        hasDatabaseBackup: Boolean(options.includeDatabase),
+      });
     prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
 
     sendProgress({
@@ -1469,30 +1472,35 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       : null;
     const warning =
       [fileWarning, lateCancelWarning, restoreWarning].filter(Boolean).join(' ') || null;
+    const pushWarning = () => [warning, markerWarning].filter(Boolean).join(' ') || null;
 
     // The newest push to this folder, for undo from any computer to check
-    try {
-      await run(
-        freshSync(),
-        'ssh',
-        sshArgs(
-          connection,
-          `printf '%s %s\\n' ${shellQuote(stamp)} ${shellQuote(lockOwner(os.hostname(), site.name || site.domain))} > ${shellQuote(lastPushMarker(connection.remoteHome, connection.remoteRoot))}`,
-        ),
-      );
-    } catch (e: any) {
-      console.warn('[SSH Sync] Could not record the push on the server:', e?.message);
+    let markerWarning: string | null = null;
+    if (filesChanged || options.includeDatabase) {
+      try {
+        await run(
+          freshSync(),
+          'ssh',
+          sshArgs(
+            connection,
+            `printf '%s %s\\n' ${shellQuote(stamp)} ${shellQuote(lockOwner(os.hostname(), site.name || site.domain))} > ${shellQuote(lastPushMarker(connection.remoteHome, connection.remoteRoot))}`,
+          ),
+        );
+      } catch (e: any) {
+        console.warn('[SSH Sync] Could not record the push on the server:', e?.message);
+        markerWarning = `This push could not be recorded on ${environment.label}, so an undo of an older push from another computer cannot see it.`;
+      }
     }
     deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
     sendProgress({
       stage: 'done',
       progress: 100,
-      message: warning ? `Push complete — ${warning}` : 'Push complete!',
+      message: pushWarning() ? `Push complete — ${pushWarning()}` : 'Push complete!',
     });
     deps.notify(
       PRODUCT_NAME,
-      warning
-        ? `Push complete for ${site.name || site.domain} — ${warning}`
+      pushWarning()
+        ? `Push complete for ${site.name || site.domain} — ${pushWarning()}`
         : `Push complete for ${site.name || site.domain}`,
     );
     const restoredNote = restoredOnServer.length
@@ -1500,7 +1508,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           .map((p) => (p === 'stripe-testmode' ? 'Stripe live mode' : p.split('/')[0]))
           .join(', ')}.`
       : null;
-    return { success: true, warning, note: restoredNote };
+    return { success: true, warning: pushWarning(), note: restoredNote };
   } catch (error: any) {
     // The remote DB was (partially) overwritten — restore the backup exported
     // right before the import.
@@ -1676,12 +1684,18 @@ export async function executeUndoPush(
     }
 
     // Nothing the push wrote or deleted may have changed on the server since
-    const checks = [
-      ...Object.entries(manifest.pushed || {})
-        .filter(([file]) => isSafeListedPath(file))
-        .map(([file, [size, mtime]]) => `${size} ${mtime} ${file}`),
-      ...(manifest.deleted || []).filter(isSafeListedPath).map((file) => `- - ${file}`),
-    ];
+    if (manifest.added === null) {
+      return {
+        success: false,
+        error: `This push was made with a local rsync that cannot report what it changed (install rsync 3 with Homebrew), so undo cannot check what changed on ${environment.label} since. The files it replaced are in ${latest.base}-files.`,
+      };
+    }
+    const checks = changedSinceLines(
+      Object.fromEntries(
+        Object.entries(manifest.pushed || {}).filter(([file]) => isSafeListedPath(file)),
+      ),
+      (manifest.deleted || []).filter(isSafeListedPath),
+    );
     const conflicts = parseChangedSince(
       await runWithPathList(deps, sync, connection, changedSinceCommand(), checks),
     );

@@ -1083,9 +1083,57 @@ describe('executePush', () => {
     );
     expect(result).toMatchObject({ success: false, conflicts: ['wp-content/x.php'] });
     const check = undoRunner.calls.find((c) => c.step === 'remote-changed-since')!;
-    expect(check.stdin).toContain(' wp-content/x.php');
-    expect(check.stdin).toContain('- - gone.php');
+    expect(check.stdin).toMatch(/^1\t\d+\twp-content\/x\.php$/m);
+    expect(check.stdin).toContain('-\t-\tgone.php');
     expect(steps(undoRunner.calls)).not.toContain('rsync'); // nothing restored
+  });
+
+  it('a push that changed nothing leaves nothing to undo and no marker', async () => {
+    const runner = makeFakeRunner();
+    const { deps } = makeDeps({ runner });
+    const result = await executePush(pushParams({ includeDatabase: false, files: [] }), deps);
+    expect(result.success).toBe(true);
+    expect(latestPushManifest(backupsDir, SITE_ID, 'staging')).toBeNull();
+    expect(steps(runner.calls)).not.toContain('remote-write-marker');
+  });
+
+  it('undo refuses a push made by an rsync that could not report its changes', async () => {
+    const openrsync = makeDeps({
+      runner: makeFakeRunner(),
+      resolveRsync: () => ({
+        ...FAKE_RSYNC,
+        supportsOutFormat: false,
+        supportsItemizeChanges: false,
+      }),
+    });
+    await executePush(pushParams({ includeDatabase: false }), openrsync.deps);
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: makeFakeRunner() }).deps,
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/cannot check what changed/);
+  });
+
+  it('a folder whose site URL cannot be read is confirmed by typing the folder', async () => {
+    const unreadable = () =>
+      fakeConnection({
+        siteUrl: '',
+        siteUrlMismatch: 'Could not read the site URL of the WordPress in "/var/www/example.com".',
+      });
+    const refused = await executePull(
+      pullParams(),
+      makeDeps({ connectRemote: async () => unreadable() }).deps,
+    );
+    expect(refused.siteUrlMismatch).toEqual({
+      actual: '/var/www/example.com',
+      expected: 'https://example.com',
+    });
+    const accepted = await executePull(
+      pullParams({ includeDatabase: false, acceptSiteUrl: '/var/www/example.com' }),
+      makeDeps({ connectRemote: async () => unreadable() }).deps,
+    );
+    expect(accepted.success).toBe(true);
   });
 
   it('refuses a folder that reports another site unless its URL is typed back', async () => {
