@@ -40,7 +40,6 @@ import {
   rsyncRemoteRoot,
   inRemoteRoot,
   remoteWp,
-  remoteDbExportCommand,
   parseRemoteTempPath,
   REMOTE_MKTEMP,
 } from './ssh';
@@ -75,39 +74,13 @@ async function removeRemoteFile(
   }
 }
 
-// Export the remote database and download it to `localFile`. The remote copy
-// is always removed, whether or not the download worked.
-async function downloadRemoteDatabase(
+// A private temp file on the server, created on its own so its path is known
+// before anything is written to it: whatever happens next, it can be removed.
+async function createRemoteTempFile(
   run: Run,
   sync: ActiveSync,
   connection: RemoteConnection,
-  environment: ServerEnvironment,
-  localFile: string,
-): Promise<void> {
-  let exportOutput = '';
-  await run(sync, 'ssh', sshArgs(connection, remoteDbExportCommand(connection, environment)), {
-    onStdout: (chunk) => (exportOutput += chunk),
-  });
-  const remoteFile = parseRemoteTempPath(exportOutput);
-  if (!remoteFile) {
-    throw new Error('The server did not report where it exported the database.');
-  }
-  try {
-    await run(sync, 'scp', scpArgs(connection, remoteFileSpec(connection, remoteFile), localFile));
-  } finally {
-    await removeRemoteFile(run, connection, remoteFile);
-  }
-}
-
-// Upload a local dump to a fresh private temp file on the server, import it,
-// and remove it again.
-async function importDatabaseOnServer(
-  run: Run,
-  sync: ActiveSync,
-  connection: RemoteConnection,
-  environment: ServerEnvironment,
-  localFile: string,
-): Promise<void> {
+): Promise<string> {
   let mktempOutput = '';
   await run(sync, 'ssh', sshArgs(connection, REMOTE_MKTEMP), {
     onStdout: (chunk) => (mktempOutput += chunk),
@@ -116,10 +89,56 @@ async function importDatabaseOnServer(
   if (!remoteFile) {
     throw new Error('Could not create a temporary file on the server.');
   }
+  return remoteFile;
+}
+
+// Export the remote database and download it to `localFile`. The remote copy
+// is always removed, whether or not the export or the download worked.
+async function downloadRemoteDatabase(
+  run: Run,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  localFile: string,
+): Promise<void> {
+  const remoteFile = await createRemoteTempFile(run, sync, connection);
   try {
-    await run(sync, 'scp', scpArgs(connection, localFile, remoteFileSpec(connection, remoteFile)));
     await run(
       sync,
+      'ssh',
+      sshArgs(
+        connection,
+        remoteWp(
+          connection,
+          environment,
+          `--skip-plugins --skip-themes db export ${shellQuote(remoteFile)}`,
+        ),
+      ),
+    );
+    await run(sync, 'scp', scpArgs(connection, remoteFileSpec(connection, remoteFile), localFile));
+  } finally {
+    await removeRemoteFile(run, connection, remoteFile);
+  }
+}
+
+// Upload a local dump to a fresh private temp file on the server, import it,
+// and remove it again. `onImportStart` fires right before the server database
+// starts changing. The import itself cannot be cancelled: killing the local ssh
+// client would leave `wp db import` running on the server, racing any restore.
+async function importDatabaseOnServer(
+  run: Run,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  localFile: string,
+  onImportStart: () => void = () => {},
+): Promise<void> {
+  const remoteFile = await createRemoteTempFile(run, sync, connection);
+  try {
+    await run(sync, 'scp', scpArgs(connection, localFile, remoteFileSpec(connection, remoteFile)));
+    onImportStart();
+    await run(
+      freshSync(),
       'ssh',
       sshArgs(connection, remoteWp(connection, environment, `db import ${shellQuote(remoteFile)}`)),
     );
@@ -695,6 +714,8 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   // Once the remote DB import starts, a cancel/crash leaves the remote
   // database half-written — lets the catch block restore the backup.
   let remoteImportStarted = false;
+  let remoteDatabaseFinished = false;
+  let cancelledLate = false;
   let remoteBackupPath: string | null = null;
   const publicPath = localPublicPath(site);
 
@@ -845,9 +866,14 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         progress: 70,
         message: `Importing database on ${environment.label}...`,
       });
-      remoteImportStarted = true;
+      // From here until the database steps finish, the server is changed by
+      // commands a cancel cannot stop (see importDatabaseOnServer): they run on
+      // their own ActiveSync, and a cancel takes effect once they are done.
+      const serverDbSync = freshSync();
       try {
-        await importDatabaseOnServer(run, sync, connection, environment, dbDumpPath);
+        await importDatabaseOnServer(run, sync, connection, environment, dbDumpPath, () => {
+          remoteImportStarted = true;
+        });
       } finally {
         try {
           dfs.unlinkSync(dbDumpPath);
@@ -871,15 +897,17 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           progress: 84 + i * 3,
           message: `Replacing ${from} → ${to}`,
         });
+        // Plugins and themes stay off: the freshly imported local database must
+        // not boot on the server (cron, emails, fatals) before the URLs are right.
         await run(
-          sync,
+          serverDbSync,
           'ssh',
           sshArgs(
             connection,
             remoteWp(
               connection,
               environment,
-              `search-replace ${shellQuote(from)} ${shellQuote(to)} --all-tables --skip-columns=guid${networkFlag}`,
+              `--skip-plugins --skip-themes search-replace ${shellQuote(from)} ${shellQuote(to)} --all-tables --skip-columns=guid${networkFlag}`,
             ),
           ),
         );
@@ -900,7 +928,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         if (localPrefix) {
           let remotePrefixRaw = '';
           await run(
-            sync,
+            serverDbSync,
             'ssh',
             sshArgs(connection, remoteWp(connection, environment, 'config get table_prefix')),
             { onStdout: (c: string) => (remotePrefixRaw += c) },
@@ -914,7 +942,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
             message: `Updating remote table prefix to ${localPrefix}...`,
           });
           await run(
-            sync,
+            serverDbSync,
             'ssh',
             sshArgs(
               connection,
@@ -927,7 +955,6 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           );
         }
       } catch (prefixError: any) {
-        if (prefixError instanceof CancelledError) throw prefixError;
         console.warn(
           '[SSH Sync] Remote table-prefix reconcile failed (non-fatal):',
           prefixError?.message,
@@ -937,10 +964,20 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           `Push done, but updating the remote table prefix failed — if the site looks empty, set $table_prefix in wp-config.php on ${environment.label} to match Local.`,
         );
       }
+
+      // The server database is complete and consistent: nothing after this
+      // point may roll it back, a late cancel included.
+      remoteDatabaseFinished = true;
+    }
+
+    // A cancel that arrived while the server database was being replaced only
+    // skips what is left (the cache command): the push itself already landed.
+    if (sync.cancelled) {
+      cancelledLate = true;
     }
 
     // 4. The environment's cache command (non-fatal)
-    if (environment.cacheCommand) {
+    if (environment.cacheCommand && !cancelledLate) {
       sendProgress({ stage: 'cache', progress: 98, message: 'Clearing cache...' });
       try {
         await run(
@@ -949,32 +986,40 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
           sshArgs(connection, inRemoteRoot(connection, environment.cacheCommand)),
         );
       } catch (e: any) {
-        if (e instanceof CancelledError) throw e;
-        console.warn('[SSH Sync] Cache command after push failed:', e?.message);
-        deps.notify(
-          PRODUCT_NAME,
-          `Push done, but the cache command failed on ${environment.label}.`,
-        );
+        if (e instanceof CancelledError) {
+          cancelledLate = true;
+        } else {
+          console.warn('[SSH Sync] Cache command after push failed:', e?.message);
+          deps.notify(
+            PRODUCT_NAME,
+            `Push done, but the cache command failed on ${environment.label}.`,
+          );
+        }
       }
     }
+
+    const lateCancelWarning = cancelledLate
+      ? 'Cancel arrived after the server was updated, so the push was completed.'
+      : null;
+    const warning = [fileWarning, lateCancelWarning].filter(Boolean).join(' ') || null;
 
     deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
     sendProgress({
       stage: 'done',
       progress: 100,
-      message: fileWarning ? `Push complete — ${fileWarning}` : 'Push complete!',
+      message: warning ? `Push complete — ${warning}` : 'Push complete!',
     });
     deps.notify(
       PRODUCT_NAME,
-      fileWarning
-        ? `Push complete for ${site.name || site.domain} — some files were skipped (legacy filenames)`
+      warning
+        ? `Push complete for ${site.name || site.domain} — ${warning}`
         : `Push complete for ${site.name || site.domain}`,
     );
-    return { success: true, warning: fileWarning };
+    return { success: true, warning };
   } catch (error: any) {
     // The remote DB was (partially) overwritten — restore the backup exported
     // right before the import.
-    if (remoteImportStarted && remoteBackupPath) {
+    if (remoteImportStarted && !remoteDatabaseFinished && remoteBackupPath) {
       try {
         sendProgress({
           stage: 'database',

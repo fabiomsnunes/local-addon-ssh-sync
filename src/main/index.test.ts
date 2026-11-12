@@ -39,7 +39,7 @@ import {
   rsyncRemoteShell,
   rsyncRemoteRoot,
   remoteWp,
-  remoteDbExportCommand,
+  REMOTE_MKTEMP,
   parseRemoteTempPath,
   remoteProbeCommand,
   parseRemoteProbe,
@@ -103,6 +103,8 @@ describe('injection guards (validators)', () => {
     expect(isValidUsername('deploy')).toBe(true);
     expect(isValidUsername('user name')).toBe(false);
     expect(isValidUsername('user;id')).toBe(false);
+    expect(isValidUsername('-J')).toBe(false);
+    expect(isValidUsername('first.last')).toBe(true);
     expect(isValidDomain('example.com')).toBe(true);
     expect(isValidDomain("dom'ain.se")).toBe(false);
   });
@@ -284,18 +286,17 @@ describe('ssh helpers', () => {
     ).toBe(`cd '/var/www/example.com' && php8.2 ~/wp config get table_prefix`);
   });
 
-  it('exports the database to a private mktemp file in home and cleans up on failure', () => {
-    const command = remoteDbExportCommand(connection(), env());
-    expect(command).toContain('mktemp "$HOME/.ssh-sync-XXXXXXXX"');
-    expect(command).toContain('--skip-plugins --skip-themes db export "$f"');
-    expect(command).toContain('rm -f -- "$f"');
-    expect(command).not.toContain('/tmp');
+  it('creates remote temp files privately in home, never in /tmp', () => {
+    expect(REMOTE_MKTEMP).toBe('mktemp "$HOME/.ssh-sync-XXXXXXXX"');
   });
 
   it('accepts only a mktemp path it created', () => {
     expect(parseRemoteTempPath('/home/u/.ssh-sync-Ab12Cd34\n')).toBe('/home/u/.ssh-sync-Ab12Cd34');
     expect(parseRemoteTempPath('banner\n/home/u/.ssh-sync-Ab12Cd34\n')).toBe(
       '/home/u/.ssh-sync-Ab12Cd34',
+    );
+    expect(parseRemoteTempPath('/home/u+x@y/.ssh-sync-Ab12Cd34')).toBe(
+      '/home/u+x@y/.ssh-sync-Ab12Cd34',
     );
     expect(parseRemoteTempPath('/etc/passwd')).toBeNull();
     expect(parseRemoteTempPath('/home/u/.ssh-sync-x; rm -rf /')).toBeNull();
@@ -306,6 +307,7 @@ describe('ssh helpers', () => {
     const command = remoteProbeCommand(env({ remotePath: '~/public_html' }));
     expect(command).toContain(`cd ~/'public_html'`);
     expect(command).toContain('core is-installed');
+    expect(command).toContain(`-name '.ssh-sync-*' -mmin +120 -delete`);
     expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE=ok\n')).toEqual({
       ok: true,
       remoteRoot: '/home/u/public_html',

@@ -95,21 +95,8 @@ export function remoteWp(
 // shared /tmp, where other accounts on the server could read or pre-create it.
 export const REMOTE_MKTEMP = `mktemp "$HOME/${REMOTE_TEMP_PREFIX}XXXXXXXX"`;
 
-// Export the remote database to a fresh temp file and print its path. The file
-// is removed again if the export fails, so nothing is left behind.
-export function remoteDbExportCommand(
-  connection: RemoteConnection,
-  environment: ServerEnvironment,
-): string {
-  return [
-    `f=$(${REMOTE_MKTEMP}) || exit 1`,
-    `cd ${shellQuote(connection.remoteRoot)} && ${environment.wpCommand} --skip-plugins --skip-themes db export "$f" >/dev/null || { rm -f -- "$f"; exit 1; }`,
-    `printf '%s\\n' "$f"`,
-  ].join('; ');
-}
-
 const REMOTE_TEMP_FILE_RE = new RegExp(
-  `^/[A-Za-z0-9_./-]*/${REMOTE_TEMP_PREFIX.replace(/\./g, '\\.')}[A-Za-z0-9]+$`,
+  `^/[A-Za-z0-9_./@+-]*/${REMOTE_TEMP_PREFIX.replace(/\./g, '\\.')}[A-Za-z0-9]+$`,
 );
 
 // The path a remote mktemp printed (last line of stdout), validated before it
@@ -138,6 +125,12 @@ export function remoteProbeCommand(environment: ServerEnvironment): string {
   return [
     `cd ${remoteCdPath(environment.remotePath)} 2>/dev/null || { echo ${PROBE_MARKER}=path; exit 0; }`,
     `printf '${PROBE_MARKER}_ROOT=%s\\n' "$(pwd -P)"`,
+    // Our own dumps left by a sync that died mid-transfer (dropped connection,
+    // Local closed) hold a full database: sweep any older than two hours.
+    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
+    // Our own dumps left by a sync that died mid-transfer (dropped connection,
+    // Local closed) hold a full database: sweep any older than two hours.
+    `find "$HOME" -maxdepth 1 -type f -name '${REMOTE_TEMP_PREFIX}*' -mmin +120 -delete 2>/dev/null`,
     `command -v rsync >/dev/null 2>&1 || { echo ${PROBE_MARKER}=rsync; exit 0; }`,
     `${environment.wpCommand} --skip-plugins --skip-themes core is-installed >/dev/null 2>&1 || { echo ${PROBE_MARKER}=wp; exit 0; }`,
     `echo ${PROBE_MARKER}=ok`,
@@ -178,6 +171,13 @@ export function describeProbeFailure(
 }
 
 let controlDir: string | null = null;
+
+// Open connections, so quitting Local mid-sync can still close their masters
+const openConnections = new Set<RemoteConnection>();
+
+export async function closeAllConnections(): Promise<void> {
+  await Promise.all([...openConnections].map((connection) => connection.close()));
+}
 
 // Short per-user folder for the multiplexing sockets: unix socket paths are
 // capped at ~104 bytes on macOS, which rules out Local's
@@ -249,7 +249,9 @@ export async function openRemoteConnection(
 
   // Ask through the socket even when our child already exited: the master
   // may still be alive elsewhere if ssh forked it after all.
+  let registered: RemoteConnection | null = null;
   const close = async (): Promise<void> => {
+    if (registered) openConnections.delete(registered);
     spawnSync('ssh', ['-o', `ControlPath=${controlPath}`, '-O', 'exit', target], {
       stdio: 'ignore',
     });
@@ -277,6 +279,8 @@ export async function openRemoteConnection(
     remoteRoot: '',
     close,
   };
+  registered = connection;
+  openConnections.add(connection);
 
   let probeOutput = '';
   try {

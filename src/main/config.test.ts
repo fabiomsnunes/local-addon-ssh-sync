@@ -124,6 +124,7 @@ describe('prunePushBackups', () => {
       'site-1-production-2026-11-03T10-00-00-000Z.sql',
       'site-1-production-2026-11-04T10-00-00-000Z.sql',
       'site-1-staging-2026-11-01T10-00-00-000Z.sql',
+      'site-1-production-eu-2026-10-01T10-00-00-000Z.sql',
       'site-2-production-2026-11-01T10-00-00-000Z.sql',
     ];
     for (const n of names) fs.writeFileSync(path.join(dir, n), 'x');
@@ -131,11 +132,12 @@ describe('prunePushBackups', () => {
     prunePushBackups(dir, 'site-1', 'production');
 
     const left = fs.readdirSync(dir).sort();
-    expect(left.filter((n) => n.startsWith('site-1-production-'))).toHaveLength(
+    expect(left.filter((n) => n.startsWith('site-1-production-2'))).toHaveLength(
       PUSH_BACKUPS_TO_KEEP,
     );
     expect(left).not.toContain('site-1-production-2026-11-01T10-00-00-000Z.sql');
     expect(left).toContain('site-1-staging-2026-11-01T10-00-00-000Z.sql');
+    expect(left).toContain('site-1-production-eu-2026-10-01T10-00-00-000Z.sql');
     expect(left).toContain('site-2-production-2026-11-01T10-00-00-000Z.sql');
   });
 });

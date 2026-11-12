@@ -20,7 +20,13 @@ import {
 } from './types';
 import { validateEnvironment } from './validators';
 import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, localPublicPath } from './rsync';
-import { openRemoteConnection, listSshConfigHosts, rsyncRemoteShell, rsyncRemoteRoot } from './ssh';
+import {
+  openRemoteConnection,
+  closeAllConnections,
+  listSshConfigHosts,
+  rsyncRemoteShell,
+  rsyncRemoteRoot,
+} from './ssh';
 import { executePull, executePush } from './sync';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
 import {
@@ -269,6 +275,15 @@ export default function (context: AddonMainContext): void {
 
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
+
+  // Quitting Local mid-sync must not leave ssh masters running
+  try {
+    electron.app.on('before-quit', () => {
+      void closeAllConnections();
+    });
+  } catch (e) {
+    console.error('[SSH Sync] Could not register the quit handler:', e);
+  }
 
   // Hot-reload Local's renderer when the compiled renderer bundle changes
   watchRendererBundle(electron);

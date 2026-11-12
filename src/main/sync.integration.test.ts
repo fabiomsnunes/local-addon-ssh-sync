@@ -728,6 +728,54 @@ describe('executePush', () => {
     expect(result.success).toBe(true);
   });
 
+  it('does not restore the backup when the upload fails before the server DB changed', async () => {
+    const { deps, calls } = makeDeps({ runner: makeFakeRunner({ failAt: 'scp' }) });
+    // The first scp is the backup download; fail only uploads by failing the second one
+    let scpSeen = 0;
+    const runner = makeFakeRunner();
+    deps.runCommand = async (sync, cmd, args, opts) => {
+      if (cmd === 'scp' && ++scpSeen === 2) throw new Error('upload dropped');
+      return runner.run(sync, cmd, args, opts);
+    };
+    const result = await executePush(pushParams(), deps);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('upload dropped');
+    expect(steps(runner.calls)).not.toContain('remote-db-import');
+    expect(steps(runner.calls)).not.toContain('remote-db-restore');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a cancel during the cache command completes the push instead of rolling it back', async () => {
+    const { deps, calls } = makeDeps({ runner: makeFakeRunner({ cancelAt: 'remote-cache' }) });
+    const result = await executePush(
+      pushParams({ includeDatabase: true }, { cacheCommand: 'wp cache flush' }),
+      deps,
+    );
+    expect(result.success).toBe(true);
+    expect(result.warning).toMatch(/Cancel arrived after the server was updated/);
+    expect(steps(calls)).not.toContain('remote-db-restore');
+  });
+
+  it('runs the server DB import and search-replace even after a cancel request', async () => {
+    // A cancel cannot stop `wp db import` on the server, so the import and the
+    // search-replace run on their own ActiveSync and the push completes.
+    const runner = makeFakeRunner();
+    const { deps } = makeDeps({ runner });
+    deps.runCommand = async (sync, cmd, args, opts) => {
+      const result = await runner.run(sync, cmd, args, opts);
+      if (String(args[args.length - 1]).includes('db import')) {
+        deps.activeSyncs.get(SITE_ID)!.cancelled = true;
+      }
+      return result;
+    };
+    const result = await executePush(pushParams(), deps);
+    expect(steps(runner.calls)).toContain('remote-search-replace');
+    expect(steps(runner.calls)).not.toContain('remote-db-restore');
+    expect(result.success).toBe(true);
+    const sr = runner.calls.find((c) => c.step === 'remote-search-replace')!;
+    expect(sr.args[sr.args.length - 1]).toContain('--skip-plugins --skip-themes search-replace');
+  });
+
   it('downgrades MySQL 8 collations in the dump before uploading (MariaDB servers)', async () => {
     // Local (MySQL 8) emits utf8mb4_0900_* collations MariaDB can't import.
     const runner = makeFakeRunner({
