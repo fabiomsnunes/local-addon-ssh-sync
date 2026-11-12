@@ -17,6 +17,7 @@ import {
   RunOptions,
   PullPushDeps,
   RemoteConnection,
+  PushDiffRow,
 } from './types';
 import { validateEnvironment } from './validators';
 import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, localPublicPath } from './rsync';
@@ -28,11 +29,20 @@ import {
   rsyncRemoteRoot,
 } from './ssh';
 import { executePull, executePush } from './sync';
+import {
+  CliRequest,
+  CliMessage,
+  CLI_SOCKET_NAME,
+  readLocalSite,
+  startCliServer,
+  cliLauncherScript,
+} from './cliProtocol';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
 import {
   initConfig,
   getTempDir,
   getBackupsDir,
+  getConfigDir,
   ensureConfigDir,
   getProfile,
   loadProfiles,
@@ -46,6 +56,8 @@ import {
   deleteProfile,
   recordSync,
   cleanupTempFiles,
+  saveNeutralizeRecord,
+  loadNeutralizeRecord,
 } from './config';
 
 // Re-export the public API from the extracted modules so existing imports
@@ -253,6 +265,8 @@ function defaultPullPushDeps(sendProgress: (progress: SyncProgress) => void): Pu
     findWpCliPhar,
     recordSync,
     notify,
+    saveNeutralizeRecord,
+    loadNeutralizeRecord,
     ensureConfigDir,
     tempDir: getTempDir(),
     backupsDir: getBackupsDir(),
@@ -295,6 +309,215 @@ export function normalizeEnvironments(
   return { environments };
 }
 
+interface PreviewOptions {
+  mode?: 'newer' | 'all';
+  includeUploads?: boolean;
+}
+
+// rsync dry-run diff of what a push would change on the server. Read-only.
+async function previewPush(
+  localSiteId: string,
+  site: SiteInfo,
+  environment: ServerEnvironment,
+  options: PreviewOptions = {},
+): Promise<
+  | { success: true; rows: PushDiffRow[]; degraded: boolean; mode: 'newer' | 'all' }
+  | { success: false; error: string; mode: 'newer' | 'all' }
+> {
+  const mode = options.mode || 'newer';
+  if (activeSyncs.has(localSiteId)) {
+    return { success: false, error: 'A sync is already running for this site', mode };
+  }
+
+  const excludeArgs = [...EXCLUDE_PATTERNS, ...environment.extraExcludes].map(
+    (p) => `--exclude=${p}`,
+  );
+  if (!options.includeUploads) {
+    excludeArgs.push('--exclude=wp-content/uploads/');
+  }
+
+  // One preview at a time per site: kill the previous dry-run if the renderer
+  // re-fires (mode/env/uploads toggles) so orphaned SSH sessions don't pile up
+  // against the server's connection limit.
+  activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
+  const preview: ActiveSync = { cancelled: false, child: null };
+  activePreviews.set(localSiteId, preview);
+
+  let connection: RemoteConnection | null = null;
+  try {
+    connection = await connectRemote(environment);
+    const rsync = resolveRsync();
+    const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
+
+    // %M carries the local file's mtime so we never stat thousands of files
+    // in the main process (which would block Local's entire UI)
+    const args = ['-az', '--delete', '-n'];
+    if (mode === 'newer') args.push('--update');
+    args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
+    args.push(
+      ...excludeArgs,
+      '-e',
+      rsyncRemoteShell(connection),
+      `${localPublicPath(site)}/`,
+      rsyncRemoteRoot(connection),
+    );
+
+    const chunks: string[] = [];
+    await runCommand(preview, rsync.bin, args, {
+      okCodes: [23, 24],
+      onStdout: (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+    const stdout = chunks.join('');
+
+    const rows = degraded ? parseVerboseDryRun(stdout) : parseItemizeOutput(stdout);
+    return { success: true, rows, degraded, mode };
+  } catch (error: any) {
+    return { success: false, error: error.message, mode };
+  } finally {
+    await connection?.close();
+    if (activePreviews.get(localSiteId) === preview) activePreviews.delete(localSiteId);
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// One `ssh-sync` request: the same engine and guards as the UI. Connection
+// details always come from the stored profile.
+async function handleCliRequest(
+  userDataPath: string,
+  request: CliRequest,
+  send: (message: CliMessage) => void,
+): Promise<void> {
+  const fail = (message: string) => send({ type: 'result', success: false, message });
+  const site = readLocalSite(userDataPath, request.site);
+  if (!site) return fail(`No Local site called "${request.site}".`);
+  const environments = getProfile(site.id)?.environments || [];
+
+  if (request.command === 'envs') {
+    if (!environments.length) return fail(`${site.name} has no server environments yet.`);
+    for (const e of environments) {
+      const target = e.sshAlias || `${e.sshUser}@${e.sshHost}:${e.sshPort || '22'}`;
+      send({
+        type: 'output',
+        text: `${e.label}${e.isProduction ? ' (production)' : ''}  ${target}  ${e.remoteUrl}  [${e.id}]`,
+      });
+    }
+    return send({ type: 'result', success: true });
+  }
+
+  const wanted = request.environment.toLowerCase();
+  const environment = environments.find(
+    (e) => e.id === request.environment || e.label.toLowerCase() === wanted,
+  );
+  if (!environment) return fail(`${site.name} has no environment "${request.environment}".`);
+  const progress = (p: SyncProgress) =>
+    send({ type: 'progress', progress: p.progress, message: p.message });
+
+  if (request.command === 'test') {
+    try {
+      const connection = await connectRemote(environment);
+      await connection.close();
+      return send({
+        type: 'result',
+        success: true,
+        message: `Connected · WordPress at ${connection.remoteRoot}`,
+      });
+    } catch (e: any) {
+      return fail(e.message);
+    }
+  }
+
+  if (request.command === 'pull') {
+    const result = await executePull(
+      {
+        localSiteId: site.id,
+        site,
+        environment,
+        options: {
+          includeDatabase: request.includeDatabase,
+          includeUploads: request.includeUploads,
+          makeSafe: request.makeSafe,
+        },
+      },
+      defaultPullPushDeps(progress),
+    );
+    if (!result.success) return fail(result.error || 'Pull failed.');
+    if (result.note) send({ type: 'output', text: result.note });
+    return send({
+      type: 'result',
+      success: true,
+      message: result.warning ? `Pull complete. ${result.warning}` : 'Pull complete.',
+    });
+  }
+
+  // push: always from a fresh preview, so only what it lists can change
+  progress({ stage: 'preview', progress: 1, message: `Comparing with ${environment.label}...` });
+  const preview = await previewPush(site.id, site, environment, {
+    mode: request.mode,
+    includeUploads: request.includeUploads,
+  });
+  if (!preview.success) return fail(preview.error);
+  const rows = preview.rows.filter((r) => !(r.isDir && r.op !== 'delete'));
+  const files = rows.filter((r) => r.op !== 'delete');
+  const deletions = rows.filter((r) => r.op === 'delete');
+  for (const r of files) {
+    send({
+      type: 'output',
+      text: `${r.op === 'add' ? '+' : '~'} ${r.path}  ${formatBytes(r.sizeBytes)}`,
+    });
+  }
+  for (const r of deletions) {
+    send({
+      type: 'output',
+      text: `- ${r.path}${request.deletions ? '' : '  (kept: add --delete)'}`,
+    });
+  }
+  const summary = `${files.length} to upload, ${deletions.length} only on the server${request.includeDatabase ? ', database' : ''}`;
+  if (!request.yes) {
+    return send({
+      type: 'result',
+      success: true,
+      message: `Dry run: ${summary}. Add --yes to push.`,
+    });
+  }
+  if (!files.length && !(request.deletions && deletions.length) && !request.includeDatabase) {
+    return send({ type: 'result', success: true, message: 'Nothing to push.' });
+  }
+  const result = await executePush(
+    {
+      localSiteId: site.id,
+      site,
+      environment,
+      options: {
+        includeDatabase: request.includeDatabase,
+        includeUploads: request.includeUploads,
+        mode: request.mode,
+        files: files.map((r) => r.path),
+        deletions: request.deletions ? deletions.map((r) => r.path) : [],
+      },
+    },
+    defaultPullPushDeps(progress),
+  );
+  if (!result.success) return fail(result.error || 'Push failed.');
+  return send({
+    type: 'result',
+    success: true,
+    message: result.warning
+      ? `Push complete (${summary}). ${result.warning}`
+      : `Push complete (${summary}).`,
+  });
+}
+
+function cliLauncherPath(userDataPath: string): string {
+  return path.join(userDataPath, 'bin', 'ssh-sync');
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -313,9 +536,17 @@ export default function (context: AddonMainContext): void {
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
 
+  // The `ssh-sync` command's endpoint
+  ensureConfigDir();
+  const cliSocketPath = path.join(getConfigDir(), CLI_SOCKET_NAME);
+  const cliServer = startCliServer(cliSocketPath, (request, send) =>
+    handleCliRequest(userDataPath, request, send),
+  );
+
   // Quitting Local mid-sync must not leave ssh masters running
   try {
     electron.app.on('before-quit', () => {
+      cliServer.close();
       void closeAllConnections();
     });
   } catch (e) {
@@ -345,28 +576,56 @@ export default function (context: AddonMainContext): void {
 
   ipcMain.handle('sshsync:listSshHosts', async () => listSshConfigHosts());
 
+  ipcMain.handle('sshsync:cliStatus', async () => {
+    const launcher = cliLauncherPath(userDataPath);
+    return { installed: fs.existsSync(launcher), path: launcher };
+  });
+
+  // Writes the `ssh-sync` launcher next to Local's own `localwp`
+  ipcMain.handle('sshsync:installCli', async () => {
+    const launcher = cliLauncherPath(userDataPath);
+    try {
+      fs.mkdirSync(path.dirname(launcher), { recursive: true });
+      fs.writeFileSync(
+        launcher,
+        cliLauncherScript(process.execPath, path.join(__dirname, 'cli.js'), cliSocketPath),
+        { mode: 0o755 },
+      );
+      return { success: true, path: launcher };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
   ipcMain.handle(
     'sshsync:saveEnvironments',
     async (_event: IpcMainInvokeEvent, localSiteId: string, input: EnvironmentInput[]) => {
       const inputs = Array.isArray(input) ? input : [];
       const result = normalizeEnvironments(inputs);
       if ('error' in result) return { success: false, error: result.error };
-      // normalizeEnvironments keeps the order, so inputs[i] is environments[i]
+      // normalizeEnvironments keeps the order, so inputs[i] is environments[i].
+      // Check every environment before saving any password.
+      const typedPasswords = result.environments.map((environment, i) =>
+        environment.auth === 'password' && typeof inputs[i].password === 'string'
+          ? inputs[i].password!
+          : '',
+      );
       for (let i = 0; i < result.environments.length; i++) {
         const environment = result.environments[i];
-        const typedPassword = typeof inputs[i].password === 'string' ? inputs[i].password : '';
-        if (environment.auth !== 'password') continue;
-        if (typedPassword) {
-          if (!savePassword(environment.id, typedPassword)) {
-            return {
-              success: false,
-              error: 'This computer cannot store the password encrypted, so it was not saved.',
-            };
-          }
-        } else if (!hasPassword(environment.id)) {
+        if (environment.auth !== 'password' || typedPasswords[i]) continue;
+        if (!hasPassword(environment.id)) {
           return { success: false, error: `${environment.label}: enter the SSH password.` };
         }
       }
+      if (typedPasswords.some(Boolean) && !canStorePasswords()) {
+        return {
+          success: false,
+          error: 'This computer cannot store the password encrypted, so it was not saved.',
+        };
+      }
+      result.environments.forEach((environment, i) => {
+        if (typedPasswords[i]) savePassword(environment.id, typedPasswords[i]);
+      });
       saveEnvironments(localSiteId, result.environments);
       pruneOrphanPasswords();
       return { success: true, profile: profileForRenderer(localSiteId) };
@@ -410,65 +669,13 @@ export default function (context: AddonMainContext): void {
       localSiteId: string,
       site: SiteInfo,
       environmentId: string,
-      options: { mode?: 'newer' | 'all'; includeUploads?: boolean } = {},
+      options: PreviewOptions = {},
     ) => {
-      const mode = options.mode || 'newer';
-      if (activeSyncs.has(localSiteId)) {
-        return { success: false, error: 'A sync is already running for this site', mode };
-      }
       const environment = findEnvironment(localSiteId, environmentId);
-      if (!environment) return { success: false, error: 'Unknown environment.', mode };
-
-      const excludeArgs = [...EXCLUDE_PATTERNS, ...environment.extraExcludes].map(
-        (p) => `--exclude=${p}`,
-      );
-      if (!options.includeUploads) {
-        excludeArgs.push('--exclude=wp-content/uploads/');
+      if (!environment) {
+        return { success: false, error: 'Unknown environment.', mode: options.mode || 'newer' };
       }
-
-      // One preview at a time per site: kill the previous dry-run if the
-      // renderer re-fires (mode/env/uploads toggles) so orphaned SSH sessions
-      // don't pile up against the server's connection limit.
-      activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
-      const preview: ActiveSync = { cancelled: false, child: null };
-      activePreviews.set(localSiteId, preview);
-
-      let connection: RemoteConnection | null = null;
-      try {
-        connection = await connectRemote(environment);
-        const rsync = resolveRsync();
-        const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
-
-        // %M carries the local file's mtime so we never stat thousands of files
-        // in the main process (which would block Local's entire UI)
-        const args = ['-az', '--delete', '-n'];
-        if (mode === 'newer') args.push('--update');
-        args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
-        args.push(
-          ...excludeArgs,
-          '-e',
-          rsyncRemoteShell(connection),
-          `${localPublicPath(site)}/`,
-          rsyncRemoteRoot(connection),
-        );
-
-        const chunks: string[] = [];
-        await runCommand(preview, rsync.bin, args, {
-          okCodes: [23, 24],
-          onStdout: (chunk) => {
-            chunks.push(chunk);
-          },
-        });
-        const stdout = chunks.join('');
-
-        const rows = degraded ? parseVerboseDryRun(stdout) : parseItemizeOutput(stdout);
-        return { success: true, rows, degraded, mode };
-      } catch (error: any) {
-        return { success: false, error: error.message, mode };
-      } finally {
-        await connection?.close();
-        if (activePreviews.get(localSiteId) === preview) activePreviews.delete(localSiteId);
-      }
+      return previewPush(localSiteId, site, environment, options);
     },
   );
 

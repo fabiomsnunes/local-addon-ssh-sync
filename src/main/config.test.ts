@@ -166,6 +166,14 @@ describe('passwords', () => {
     expect(fs.statSync(file).mode & 0o077).toBe(0);
   });
 
+  it('refuses the hardcoded-key basic_text backend (Linux without a keyring)', () => {
+    const storage = Object.assign(fakeSafeStorage(), {
+      getSelectedStorageBackend: () => 'basic_text',
+    }) as unknown as SafeStorage;
+    initConfig(sandbox, storage);
+    expect(canStorePasswords()).toBe(false);
+  });
+
   it('refuses to save when the OS cannot encrypt', () => {
     initConfig(sandbox, fakeSafeStorage(false));
     expect(canStorePasswords()).toBe(false);

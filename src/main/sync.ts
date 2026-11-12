@@ -49,9 +49,13 @@ import {
   SAFETY_MU_PLUGIN_SOURCE,
   NEUTRALIZE_SCRIPT,
   UNSAFE_PLUGIN_FOLDERS,
+  NeutralizeRecord,
+  NeutralizeResult,
   parseNeutralizeOutput,
-  ensureLocalEnvironmentType,
+  ensureLocalCopyConfig,
   describeSafeClone,
+  isEmptyRecord,
+  restoreNeutralizedScript,
 } from './safeClone';
 
 // ---------------------------------------------------------------------------
@@ -156,10 +160,20 @@ async function importDatabaseOnServer(
   }
 }
 
-// Neutralize a pulled copy before WordPress loads (see safeClone.ts): the
-// safety mu-plugin and WP_ENVIRONMENT_TYPE=local always, and when the database
-// was pulled, the unsafe plugins deactivated and Stripe put in test mode.
-async function makeCloneSafe(
+// Step 1 of a safe copy (see safeClone.ts), before anything is transferred:
+// the safety mu-plugin and the wp-config constants that switch it on.
+function installSafetyNet(deps: PullPushDeps, publicPath: string): void {
+  const dfs = deps.fs;
+  const muPluginFile = path.join(publicPath, ...SAFETY_MU_PLUGIN_PATH.split('/'));
+  dfs.mkdirSync(path.dirname(muPluginFile), { recursive: true });
+  dfs.writeFileSync(muPluginFile, SAFETY_MU_PLUGIN_SOURCE);
+  const wpConfigPath = path.join(publicPath, 'wp-config.php');
+  dfs.writeFileSync(wpConfigPath, ensureLocalCopyConfig(dfs.readFileSync(wpConfigPath, 'utf8')));
+}
+
+// Step 2, right after the database import and before WordPress loads: the
+// unsafe plugins deactivated and Stripe switched to test mode, with Local's PHP.
+async function neutralizeDatabase(
   deps: PullPushDeps,
   sync: ActiveSync,
   publicPath: string,
@@ -167,22 +181,12 @@ async function makeCloneSafe(
     phpBin: string;
     socketPath: string;
     db: { user: string; password: string; database: string };
-  } | null,
-): Promise<string> {
+  },
+): Promise<NeutralizeResult> {
   const dfs = deps.fs;
-  const muPluginFile = path.join(publicPath, ...SAFETY_MU_PLUGIN_PATH.split('/'));
-  dfs.mkdirSync(path.dirname(muPluginFile), { recursive: true });
-  dfs.writeFileSync(muPluginFile, SAFETY_MU_PLUGIN_SOURCE);
-
-  const wpConfigPath = path.join(publicPath, 'wp-config.php');
-  const wpConfig = dfs.readFileSync(wpConfigPath, 'utf8');
-  dfs.writeFileSync(wpConfigPath, ensureLocalEnvironmentType(wpConfig));
-
-  if (!database) return describeSafeClone({ deactivated: [], stripe: false });
-
   // The prefix the site reads now, after any prefix adoption
   const prefix = normalizeTablePrefix(
-    parseTablePrefix(dfs.readFileSync(wpConfigPath, 'utf8')) || '',
+    parseTablePrefix(dfs.readFileSync(path.join(publicPath, 'wp-config.php'), 'utf8')) || '',
   );
   if (!prefix) throw new Error('Could not read the table prefix to make the local copy safe.');
 
@@ -211,7 +215,42 @@ async function makeCloneSafe(
   }
   const result = parseNeutralizeOutput(output);
   if (!result) throw new Error('Could not make the local copy safe: unexpected output.');
-  return describeSafeClone(result);
+  return result;
+}
+
+// After a database push: put back on the server what the safe copy changed
+// locally, so the server never ends up with its backups, mail or Stripe off.
+async function restoreNeutralizedOnServer(
+  deps: PullPushDeps,
+  sync: ActiveSync,
+  connection: RemoteConnection,
+  environment: ServerEnvironment,
+  record: NeutralizeRecord,
+): Promise<string[]> {
+  const scriptPath = path.join(deps.tempDir, 'ssh-sync-restore.php');
+  deps.fs.writeFileSync(scriptPath, restoreNeutralizedScript(record));
+  let output = '';
+  try {
+    await deps.runCommand(
+      sync,
+      'ssh',
+      sshArgs(
+        connection,
+        remoteWp(connection, environment, '--skip-plugins --skip-themes eval-file -'),
+      ),
+      { stdinFile: scriptPath, onStdout: (chunk) => (output += chunk) },
+    );
+  } finally {
+    try {
+      deps.fs.unlinkSync(scriptPath);
+    } catch {}
+  }
+  try {
+    const parsed = JSON.parse(output.trim().split('\n').pop() || '');
+    return Array.isArray(parsed.restored) ? parsed.restored.map(String) : [];
+  } catch {
+    throw new Error('Could not restore the plugins the safe local copy turned off on the server.');
+  }
 }
 
 // Sage/Acorn (and other Laravel-based) themes COMPILE their Blade views and
@@ -328,6 +367,10 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   const publicPath = localPublicPath(site);
 
   try {
+    // 0. A safe copy gets its safety net before anything arrives from the
+    //    server, so nothing pulled can reach real services, even mid-pull.
+    if (options.makeSafe !== false) installSafetyNet(deps, publicPath);
+
     // 1. Sync files (live progress, flags adapted to the rsync version)
     sendProgress({
       stage: 'files',
@@ -636,17 +679,22 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
     //    the database back (catch below): an unsafe copy is worse than none.
     let safeCloneNote: string | null = null;
     if (options.makeSafe !== false) {
-      sendProgress({ stage: 'safety', progress: 98, message: 'Making the local copy safe...' });
-      const phpBin = deps.findServiceBinary(['php-'], 'php');
-      if (options.includeDatabase && !phpBin) {
-        throw new Error("Could not find PHP binary in Local's lightning-services");
+      let neutralized: Pick<NeutralizeResult, 'deactivated' | 'stripe'> = {
+        deactivated: [],
+        stripe: false,
+      };
+      if (options.includeDatabase) {
+        sendProgress({ stage: 'safety', progress: 98, message: 'Making the local copy safe...' });
+        const phpBin = deps.findServiceBinary(['php-'], 'php');
+        if (!phpBin) throw new Error("Could not find PHP binary in Local's lightning-services");
+        const result = await neutralizeDatabase(deps, sync, publicPath, { phpBin, socketPath, db });
+        deps.saveNeutralizeRecord(localSiteId, result.record);
+        neutralized = result;
       }
-      safeCloneNote = await makeCloneSafe(
-        deps,
-        sync,
-        publicPath,
-        options.includeDatabase ? { phpBin: phpBin!, socketPath, db } : null,
-      );
+      safeCloneNote = describeSafeClone(neutralized);
+    } else if (options.includeDatabase) {
+      // The local database is the server's again, untouched: nothing to put back
+      deps.saveNeutralizeRecord(localSiteId, null);
     }
 
     // Clear compiled Sage/Acorn caches that bake absolute server paths (see
@@ -800,6 +848,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   // database half-written — lets the catch block restore the backup.
   let remoteImportStarted = false;
   let remoteDatabaseFinished = false;
+  let restoredOnServer: string[] = [];
   let cancelledLate = false;
   let remoteBackupPath: string | null = null;
   const publicPath = localPublicPath(site);
@@ -1050,6 +1099,23 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         );
       }
 
+      // What the safe local copy turned off goes back on, on the server
+      const neutralizeRecord = deps.loadNeutralizeRecord(localSiteId);
+      if (neutralizeRecord && !isEmptyRecord(neutralizeRecord)) {
+        sendProgress({
+          stage: 'search-replace',
+          progress: 97,
+          message: 'Restoring plugins the safe local copy turned off...',
+        });
+        restoredOnServer = await restoreNeutralizedOnServer(
+          deps,
+          serverDbSync,
+          connection,
+          environment,
+          neutralizeRecord,
+        );
+      }
+
       // The server database is complete and consistent: nothing after this
       // point may roll it back, a late cancel included.
       remoteDatabaseFinished = true;
@@ -1100,7 +1166,12 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         ? `Push complete for ${site.name || site.domain} — ${warning}`
         : `Push complete for ${site.name || site.domain}`,
     );
-    return { success: true, warning };
+    const restoredNote = restoredOnServer.length
+      ? `Re-enabled on ${environment.label} what the safe local copy had turned off: ${restoredOnServer
+          .map((p) => (p === 'stripe-testmode' ? 'Stripe live mode' : p.split('/')[0]))
+          .join(', ')}.`
+      : null;
+    return { success: true, warning, note: restoredNote };
   } catch (error: any) {
     // The remote DB was (partially) overwritten — restore the backup exported
     // right before the import.

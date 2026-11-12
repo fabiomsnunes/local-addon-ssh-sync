@@ -4,6 +4,7 @@ import type { SafeStorage } from 'electron';
 
 import { DATA_DIR_NAME, HISTORY_LIMIT, PUSH_BACKUPS_TO_KEEP } from './constants';
 import { ServerEnvironment, SiteProfile } from './types';
+import type { NeutralizeRecord } from './safeClone';
 
 // Config paths — resolved once userDataPath is known
 let CONFIG_DIR = '';
@@ -28,6 +29,10 @@ export function initConfig(userDataPath: string, newSafeStorage: SafeStorage | n
 
 export function getTempDir(): string {
   return TEMP_DIR;
+}
+
+export function getConfigDir(): string {
+  return CONFIG_DIR;
 }
 
 export function getBackupsDir(): string {
@@ -173,8 +178,14 @@ function saveSecrets(secrets: Record<string, string>): void {
   fs.writeFileSync(SECRETS_FILE, JSON.stringify(secrets, null, 2), { mode: 0o600 });
 }
 
+// On Linux without a keyring Electron falls back to `basic_text`, a hardcoded
+// key: as good as plain text, so passwords are refused there.
 export function canStorePasswords(): boolean {
-  return Boolean(safeStorage && safeStorage.isEncryptionAvailable());
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return false;
+  const backend = (
+    safeStorage as SafeStorage & { getSelectedStorageBackend?: () => string }
+  ).getSelectedStorageBackend?.();
+  return backend !== 'basic_text';
 }
 
 // Refuses (returns false) when the OS cannot encrypt: a password is never
@@ -206,4 +217,32 @@ export function prunePasswords(keepIds: Set<string>): void {
   const secrets = loadSecrets();
   const kept = Object.fromEntries(Object.entries(secrets).filter(([id]) => keepIds.has(id)));
   if (Object.keys(kept).length !== Object.keys(secrets).length) saveSecrets(kept);
+}
+
+// What the safe-copy step changed in a Local site's database, so a database
+// push can put it back on the server (see safeClone.ts). No secrets inside.
+function neutralizeRecordFile(localSiteId: string): string {
+  return path.join(CONFIG_DIR, 'neutralized', `${localSiteId.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
+}
+
+export function saveNeutralizeRecord(localSiteId: string, record: NeutralizeRecord | null): void {
+  const file = neutralizeRecordFile(localSiteId);
+  if (!record) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // none saved
+    }
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(record, null, 2), { mode: 0o600 });
+}
+
+export function loadNeutralizeRecord(localSiteId: string): NeutralizeRecord | null {
+  try {
+    return JSON.parse(fs.readFileSync(neutralizeRecordFile(localSiteId), 'utf8'));
+  } catch {
+    return null;
+  }
 }

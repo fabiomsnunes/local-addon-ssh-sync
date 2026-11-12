@@ -52,7 +52,16 @@ export function baseSshOptions(environment: ServerEnvironment, controlPath?: str
     options.push('-o', `Port=${environment.sshPort}`);
   }
   if (controlPath) {
-    options.push('-o', `ControlPath=${controlPath}`, '-o', 'ControlMaster=no');
+    // Clients only ride the master: if it is gone they fail instead of
+    // authenticating again (and possibly prompting on Local's terminal).
+    options.push(
+      '-o',
+      `ControlPath=${controlPath}`,
+      '-o',
+      'ControlMaster=no',
+      '-o',
+      'BatchMode=yes',
+    );
   }
   return options;
 }
@@ -268,8 +277,9 @@ export function askpassEnvironment(helper: string, socketPath: string): NodeJS.P
   };
 }
 
-// Answers the helper with the password, at most `maxAnswers` times, then closes.
-export function serveAskpass(socketPath: string, password: string, maxAnswers = 2): net.Server {
+// Answers the helper with the password, at most `maxAnswers` times, then
+// closes: a wrong password is tried once, not once per auth method.
+export function serveAskpass(socketPath: string, password: string, maxAnswers = 1): net.Server {
   let answers = 0;
   const server = net.createServer((socket) => {
     answers += 1;
