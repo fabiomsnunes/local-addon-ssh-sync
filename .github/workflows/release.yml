@@ -59,7 +59,7 @@ jobs:
                 "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$prev_tag" "$GITHUB_REF_NAME" >> "$notes_file"
             fi
             gh release create "$GITHUB_REF_NAME" \
-              --title "Kinsta Sync ${GITHUB_REF_NAME#v}" \
+              --title "SSH Sync ${GITHUB_REF_NAME#v}" \
               --notes-file "$notes_file"
           fi
-          gh release upload "$GITHUB_REF_NAME" local-addon-kinsta-*.tgz --clobber
+          gh release upload "$GITHUB_REF_NAME" local-addon-ssh-sync-*.tgz --clobber

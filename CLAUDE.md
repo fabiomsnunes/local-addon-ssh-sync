@@ -1,6 +1,6 @@
-# Kinsta Sync — Local Add-on
+# SSH Sync — Local Add-on
 
-A Local (by WP Engine) add-on that syncs WordPress sites between Local and Kinsta hosting (pull/push of files + database, search-replace, encrypted API keys, production/staging support).
+A Local (by WP Engine) add-on that pulls and pushes WordPress sites (files + database) between Local and any server reachable over SSH: environments per site, SSH key or password, search-replace, safety backups and rollback, a "safe local copy" step after every pull, and an `ssh-sync` command line. Started from [local-addon-kinsta](https://github.com/landerss0n/local-addon-kinsta) v1.1.12 (commit `dcae5e1`, MIT); the sync engine still follows its design.
 
 ## Documentation (ALWAYS READ FIRST)
 
@@ -23,47 +23,30 @@ Both modules `export default function (context) {...}` — Local passes a `conte
 
 ### Main Process (`src/main/`)
 
-The main process is split into focused modules (a strict dependency DAG, leaves first). `index.ts` (~550 lines) keeps only the `export default function(context)` entry point, IPC handlers, the push-preview handler, `runCommand`, `preflightRemote`, `notify`, `watchRendererBundle`, `defaultPullPushDeps`, and the `activeSyncs`/`activePreviews` maps — and **re-exports the whole public API** (`export * from './sync'`, etc.) so tests and callers can keep importing `from './index'`:
-
-- `types.ts` — all shared interfaces + the `CancelledError` class
-- `constants.ts` — `EXCLUDE_PATTERNS`, `REMOTE_PUSH_BACKUP`, API base, limits
-- `validators.ts` — `isValid*`, `validateEnvironmentInfo`, `expandPath`, `isLikelyValidSqlDump`, `isTransientApiError`, `getDbCredentials`, `searchReplacePairs`
-- `rsync.ts` — `resolveRsync`, progress/itemize parsers, `safeRemoteRelPath`, `buildPushRsyncArgs`, `sshArgs`, `describePartialTransfer`
-- `kinstaApi.ts` — `getKinstaClient`, `waitForKinstaOperation`, `createKinstaBackup`, `clearKinstaCaches`
-- `sync.ts` — `executePull`/`executePush` (pure of module state — everything comes via `PullPushDeps`)
-- `localPaths.ts` / `config.ts` — the only **stateful** modules; module-level paths/`safeStorage` are set via `initLocalPaths(userDataPath, appPath)` / `initConfig(userDataPath, safeStorage)`, which the entry point calls at startup (order: initLocalPaths → initConfig → migrateLegacyConfig → cleanupTempFiles). `config.ts` exposes `getTempDir()` for `defaultPullPushDeps`.
-
-- Handles IPC communication with renderer
-- Manages Kinsta API calls (axios — `context.request` was removed in Local 8.0); `getKinstaClient` sets a 30s timeout and retries transient failures (network/timeout/5xx/429) twice with linear backoff via a response interceptor (`isTransientApiError`)
-- Runs rsync/SSH/mysql via **async `spawn` with arg arrays** (`runCommand` helper) — never `execSync` (blocks Local's main process) and never shell strings (injection surface). `child_process` is allowed per docs.
-- Real rsync progress via `--info=progress2` parsing; `mysqldump`/`mysql` stream via stdout/stdin file pipes
-- **Cancellable syncs**: one `ActiveSync` per site in `activeSyncs`; `kinsta:cancelSync` kills the current child; every step rejects with `CancelledError` after cancellation
-- **Safety backups before destructive steps**: pull backs up local DB to tmp (`<siteId>-pre-pull-backup.sql`), push exports remote DB to `~/kinsta-sync-pre-push-backup.sql` (home dir, outside `~/public`). Each backup is size-checked (`isLikelyValidSqlDump`, ≥200 bytes) before the destructive import — a 0-byte/truncated dump aborts the sync (the rollback net is only as good as the backup)
-- **Native Kinsta backup before push** (checkbox, default on): `POST /sites/environments/{env_id}/manual-backups {tag: 'kinsta-sync-pre-push'}` → poll `GET /operations/{id}` (200 done / 202 in progress / 500 failed). Max 5 manual slots per environment — `createKinstaBackup` frees a slot by deleting the oldest backup tagged `kinsta-sync` (never the user's own); if all 5 are the user's, the Kinsta backup is skipped with a notify. If enabled and creation fails, the push is ABORTED.
-- **Automatic rollback**: if a sync is cancelled or fails after the DB import started (`dbImportStarted`/`remoteImportStarted` flags), the catch block restores the respective backup — a half-imported or half-search-replaced DB is unusable. Uses a fresh `ActiveSync` for the restore (the cancelled one rejects all commands). Pushed files (rsync --delete) cannot be rolled back — only the DB.
-- Pre-flight checks (fail fast with a clear message, before any backup/transfer): DB sync requires the local site running (MySQL socket exists); and `preflightRemote` runs `ssh … 'cd ~/public && wp --version'` (ConnectTimeout=15) to confirm SSH + remote WP-CLI are reachable — so a bad key / unreachable host surfaces immediately instead of mid-sync
-- DB credentials from `site.mysql.{database,user,password}` (fallback root/root/local); multisite adds `--network` to search-replace (`MultiSite.No` is the empty string — truthiness check)
-- Search-replace covers `https://`, `http://`, protocol-relative `//`, AND JSON-escaped `\/\/` URLs in both directions (the escaped pass catches URLs stored inside JSON — block attributes, plugin settings — that plain `//` would miss; one `\/\/domain` pass also covers `https:\/\/`/`http:\/\/`)
-- Stores API keys encrypted via `context.electron.safeStorage`
-- Desktop notifications via `context.notifier.notify()` on sync complete/fail
-- `siteDeleted` action hook removes stale site links
+- `index.ts` — entry point: IPC handlers (`sshsync:*`), `runCommand` (async `spawn` with arg arrays, cancellable), `connectRemote`, the push preview, the `ssh-sync` socket server and `defaultPullPushDeps`. Re-exports every module so tests import `from './index'`.
+- `types.ts` — `ServerEnvironment`, `SiteProfile`, `RemoteConnection`, `PullPushDeps` (the injectable seam), `CancelledError`.
+- `ssh.ts` — the SSH layer. `openRemoteConnection` starts one multiplexed master per sync (`ControlMaster=yes`, `ControlPersist=no` so a user's own `ControlPersist` cannot background it, socket in a 0700 `mkdtemp` dir because unix socket paths are capped at ~104 bytes), waits for `ssh -O check`, then probes the WordPress folder (path, rsync, `wp core is-installed`) and resolves it to an absolute root. Clients reuse the master with `ControlMaster=no` + `BatchMode=yes`. Password auth: `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force`, the helper reads the password from a one-shot unix socket (never argv, env or a file), one attempt. Remote temp files: `mktemp "$HOME/.ssh-sync-XXXXXXXX"`, removed right after use, stale ones swept on connect.
+- `sync.ts` — `executePull` / `executePush` (pure of module state, everything via `PullPushDeps`), the production database guard, the safe-copy steps and the restore after a database push.
+- `safeClone.ts` — the safety mu-plugin, the neutralize script (Local's PHP + mysqli on the site socket), `NeutralizeRecord` and the server-side restore script.
+- `rsync.ts` / `validators.ts` / `constants.ts` — rsync capability probing and parsers, every validator for values that reach ssh or a remote shell, `EXCLUDE_PATTERNS`.
+- `config.ts` / `localPaths.ts` — the only stateful modules: profiles (`profiles.json`), encrypted passwords (`secrets.json`, safeStorage), neutralize records, pre-push backups; Local's binaries and sockets.
+- `cliProtocol.ts` / `cli.ts` — the `ssh-sync` socket protocol, site lookup in Local's `sites.json`, the launcher script, and the client.
 
 ### Renderer Process (`src/renderer/`)
 
-- `index.tsx` — Registers hooks with Local (drawer host + Kinsta page route + More-menu navigation + preferences)
-- `KinstaPage.tsx` — The add-on's home: a dedicated page under the site's More tab (route `/main/site-info/:siteId/kinsta`). Shows link status, last pulled/pushed, and Pull/Push/Link/Unlink actions. Title bar says "Kinsta" (docs requirement for new tabs).
-- `KinstaSitePanel.tsx` — `KinstaDrawerHost`: invisible component mounted via `SiteInfo_TabNav_Items`; owns the drawers and listens for `kinsta:action` events
-- `KinstaLinkDrawer.tsx` — Drawer for connecting API and linking sites (success view with "Pull from Kinsta" shortcut after linking)
-- `KinstaPullDrawer.tsx` — Pull-only drawer (cancel button, last-synced info). Uses the shared `KinstaIcon` and `pushHelpers.buildEnvInfo`. (Push moved entirely to `KinstaPushScreen`; the old `KinstaSyncDrawer` and its dead push paths were removed.)
-- `KinstaPushScreen.tsx` — Full-screen Magic Sync-style push preview (branch `feat/push-preview-fullscreen`): `FlyModal` styled fullscreen via injected CSS classes (native overlay → focus trap/ESC/X for free), left sidebar (env `FlySelect`, option checkboxes, push button), right pane (`VirtualTable` file diff with select-all `mixed` checkbox, mode `FlySelect` newer/all, ⟳/✕/mb counts). Data from `kinsta:pushPreview` (rsync dry-run `--itemize-changes --out-format='%i|%l|%n'`, parsed by exported `parseItemizeLine`; degraded name-only mode when openrsync lacks the flags). Selective push: checked files via `--files-from` (no `--delete`), checked deletions via strictly-validated single-quoted paths (`safeRemoteRelPath`) in chunked `ssh rm -rf --` commands.
-- `KinstaSettings.tsx` — Preferences panel for API configuration
-- Shared renderer helpers: `pushHelpers.ts` (`buildEnvInfo`, `sanitizeSshUser`, `envLabel`, diff/selection helpers — unit-tested), `types.ts` (`Environment`/`EnvironmentInfo`/`SyncProgress`), `colors.ts` (`STATUS` palette + `tint(hex, alpha)` for the rgba backgrounds; unit-tested to emit the exact rgba strings). Use these instead of re-declaring per file.
+- `index.tsx` — registers the hooks (drawer host, the SSH Sync page route, More-menu item, status badge).
+- `SyncPage.tsx` — the add-on's home under the site's More tab (route `/main/site-info/:siteId/ssh-sync`): environments with Pull/Push, last syncs, history, command line install.
+- `DrawerHost.tsx` — invisible host mounted via `SiteInfo_TabNav_Items`; owns the drawers and listens for `sshsync:action`.
+- `EnvironmentsDrawer.tsx` — add/edit/remove environments, Test connection. Native `<select>`/`<input>` (no text input in local-components; `FlySelect` positions its menu with `position:fixed`, which a transformed drawer pushes off-screen).
+- `PullDrawer.tsx` — pull options, including "Make the local copy safe".
+- `PushScreen.tsx` — full-screen push preview (rsync dry-run diff, selective files and deletions), production confirmation, Migration mode for production databases.
+- `pushHelpers.ts`, `colors.ts`, `types.ts` — pure helpers (unit-tested) and shared shapes.
 
 ### UI architecture (native pattern per "Giving your add-on a home")
 
-- **More menu** holds ONE navigation item ("Kinsta") → `events.send('goToRoute', '/main/site-info/${site.id}/kinsta')`. Per Local's docs and their own Volumes example, More is for navigation to add-on tabs — not raw actions.
-- **The Kinsta page** is registered via the `routes[site-info]` content hook. Local renders the hook's result inside its react-router `<Switch>` and passes `{ routeChildrenProps }` (contains `site`, `siteStatus`, `params`, ...). Return a real `<Route>` (obtained as `context.ReactRouter.Route`, NOT imported from `react-router-dom` — see Build & deps conventions) with an explicit `path` — Switch matches on the child's `path` prop, and a pathless element would swallow the overview fallback route below it.
-- **Event flow:** page/menu dispatch `kinsta:action` (link/pull/push/unlink) → `KinstaDrawerHost` opens the right drawer (link-drawer fallback if unlinked). Host dispatches `kinsta:state-changed` after link/unlink/drawer-close → page refreshes its data. No re-render hacks needed since the menu item is static.
+- **More menu** holds ONE navigation item ("SSH Sync") → `events.send('goToRoute', '/main/site-info/${site.id}/ssh-sync')`. Per Local's docs and their own Volumes example, More is for navigation to add-on tabs — not raw actions.
+- **The SSH Sync page** is registered via the `routes[site-info]` content hook. Local renders the hook's result inside its react-router `<Switch>` and passes `{ routeChildrenProps }` (contains `site`, `siteStatus`, `params`, ...). Return a real `<Route>` (obtained as `context.ReactRouter.Route`, NOT imported from `react-router-dom` — see Build & deps conventions) with an explicit `path` — Switch matches on the child's `path` prop, and a pathless element would swallow the overview fallback route below it.
+- **Event flow:** page/menu dispatch `sshsync:action` (link/pull/push/unlink) → `DrawerHost` opens the right drawer (link-drawer fallback if unlinked). Host dispatches `sshsync:state-changed` after link/unlink/drawer-close → page refreshes its data. No re-render hacks needed since the menu item is static.
 
 ## Hooks API (via `context.hooks`)
 
@@ -75,11 +58,10 @@ Modeled on WordPress' Plugin API. Three types:
 
 ### Hooks we use
 
-- `SiteInfo_TabNav_Items` (content) — mounts the invisible `KinstaDrawerHost` (no visible UI)
-- `SiteInfo_Top_TopRight` (content) — `KinstaStatusBadge`: "Linked to Kinsta" / live "Pulling… 42%" in the site view's top-right; click navigates to the Kinsta page. Hidden for unlinked sites. Sync-progress IPC events carry `siteId` + `mode` so badge and drawer filter per site; `error`/`cancelled` stages clear the badge.
-- `routes[site-info]` (content) — registers the Kinsta page route inside Local's site-info `<Switch>`
-- `siteInfoMoreMenu` (filter) — single "Kinsta" navigation item (Local only reads `label` + `click` from each item)
-- `preferencesMenuItems` (filter) — Kinsta section in Preferences
+- `SiteInfo_TabNav_Items` (content) — mounts the invisible `DrawerHost` (no visible UI)
+- `SiteInfo_Top_TopRight` (content) — `StatusBadge`: "SSH Sync" / live "Pulling… 42%" in the site view's top-right; click navigates to the SSH Sync page. Hidden for unlinked sites. Sync-progress IPC events carry `siteId` + `mode` so badge and drawer filter per site; `error`/`cancelled` stages clear the badge.
+- `routes[site-info]` (content) — registers the SSH Sync page route inside Local's site-info `<Switch>`
+- `siteInfoMoreMenu` (filter) — single "SSH Sync" navigation item (Local only reads `label` + `click` from each item)
 - `siteDeleted` (action, main process) — removes the stored site link when a site is deleted in Local
 
 ### Other useful hooks (from docs)
@@ -104,7 +86,7 @@ Modeled on WordPress' Plugin API. Three types:
 
 ## Why we DON'T integrate with the Connect tab (investigated 2026-06)
 
-Integrating Kinsta into Local's Connect → "Hosting platforms" UI is **not possible** via the add-on API. Verified by extracting Local's `app.asar` (renderer bundle):
+Integrating a third-party host into Local's Connect → "Hosting platforms" UI is **not possible** via the add-on API. Verified by extracting Local's `app.asar` (renderer bundle):
 
 - The Connect tab exposes **zero** content hooks or filters (full list of all 22 `doContent` + 18 filter call sites extracted — none touch Connect).
 - The platform list is hardcoded: `ConnectHostAdaptersStore` registers exactly `HostId.FLYWHEEL` and `HostId.WPE` in its constructor; the `HostId` enum has no other values.
@@ -132,7 +114,7 @@ Our approach (native More-menu items + drawers) is the officially documented pat
 
 ## Build & deps conventions
 
-- **webpack `externals` = `react` + `react-dom` ONLY.** That is the entire set Local exposes to an add-on's renderer `require()` path — **verified empirically** via Local's `local-lightning.log` on a real `.tgz` install. They stay external so Local's single React instance is used (bundling React → React error #130). EVERYTHING ELSE MUST BE BUNDLED by webpack. The renderer bundle is loaded by a plain Node `require()` from the installed add-on dir (`.../Local/addons/local-addon-kinsta/`, OUTSIDE Local's `app.asar`), so any `external` left in the bundle must resolve from there on a CLEAN install — and Local exposes nothing else.
+- **webpack `externals` = `react` + `react-dom` ONLY.** That is the entire set Local exposes to an add-on's renderer `require()` path — **verified empirically** via Local's `local-lightning.log` on a real `.tgz` install. They stay external so Local's single React instance is used (bundling React → React error #130). EVERYTHING ELSE MUST BE BUNDLED by webpack. The renderer bundle is loaded by a plain Node `require()` from the installed add-on dir (`.../Local/addons/local-addon-ssh-sync/`, OUTSIDE Local's `app.asar`), so any `external` left in the bundle must resolve from there on a CLEAN install — and Local exposes nothing else.
   - **`@getflywheel/local-components` must NOT be externalized — webpack bundles it.** Local does NOT expose it to add-ons. (The dev machine masks this: the installed add-on is a symlink to the repo, whose `node_modules` has everything.) An eager `require("@getflywheel/local-components")` in the bundle → `MODULE_NOT_FOUND` at load → `RendererAddonLoader` swallows the throw → the add-on's `export default` never runs → **no hooks register (no UI), and Local's shell then crashes with `Cannot read properties of undefined (reading 'toString')`.**
   - **`react-router-dom`**: consume via `context.ReactRouter` (do NOT import it). If imported it would become a bundled second router instance; the context one is Local's.
   - **`@getflywheel/local`**: type-only in our code (erased at compile), so it needs no runtime entry.
@@ -148,11 +130,11 @@ npm run build           # Both
 npm test                # vitest — unit tests for main-process helpers
 ```
 
-**Releasing:** bump `version` in `package.json`, commit, then push a `v<version>` tag (e.g. `git tag v1.1.6 && git push origin v1.1.6`). The `.github/workflows/release.yml` workflow builds, runs `npm pack`, and attaches the `local-addon-kinsta-<version>.tgz` to the matching GitHub release. **The release notes are the tagged commit's message** (subject + body) plus a computed Full Changelog link — so write a descriptive release commit message, since it becomes the user-facing changelog. (`--generate-notes` was dropped: with direct-to-`main` pushes there are no PR titles, so it only emitted the bare compare link.) The tarball is the install artifact users download (README → "Install from disk"), so the tag is the only manual step — never upload the `.tgz` by hand. The workflow fails fast if the tag and `package.json` version disagree.
+**Releasing:** bump `version` in `package.json`, commit, then push a `v<version>` tag (e.g. `git tag v1.1.6 && git push origin v1.1.6`). The `.github/workflows/release.yml` workflow builds, runs `npm pack`, and attaches the `local-addon-ssh-sync-<version>.tgz` to the matching GitHub release. **The release notes are the tagged commit's message** (subject + body) plus a computed Full Changelog link — so write a descriptive release commit message, since it becomes the user-facing changelog. (`--generate-notes` was dropped: with direct-to-`main` pushes there are no PR titles, so it only emitted the bare compare link.) The tarball is the install artifact users download (README → "Install from disk"), so the tag is the only manual step — never upload the `.tgz` by hand. The workflow fails fast if the tag and `package.json` version disagree.
 
 Tests live in `src/main/index.test.ts` (pure-helper unit tests), `src/main/sync.integration.test.ts` (pull/push orchestration), and `src/renderer/pushHelpers.test.ts` + `src/renderer/colors.test.ts` (pure renderer helpers) — all excluded from the tsc build via `**/*.test.ts`. The `@getflywheel` imports are type-only (now in `types.ts`) so every module is importable outside Electron; the pure helpers live in their modules (`validators.ts`, `rsync.ts`, …) but are re-exported from `index.ts`, so the tests still import them `from './index'`.
 
-The pull/push orchestration is extracted from the IPC closures into exported `executePull(params, deps)` / `executePush(params, deps)`; the `kinsta:pull`/`kinsta:push` handlers are thin wrappers that build a `sendProgress` and call `defaultPullPushDeps(sendProgress)`. `PullPushDeps` is the injectable seam (runCommand, fs, the Kinsta API client + backup/cache fns, binary/socket/rsync resolvers, preflight, notify/recordSync, the `activeSyncs`/`activePreviews` maps). The integration test passes fakes: a command runner that matches on command name/args (simulates rsync progress, writes the size-checked SQL dumps, and can fail/cancel at a chosen step), an in-memory link store, and a real `fs` pointed at an `os.tmpdir()` sandbox — no network or spawned processes. It covers happy-path pull/push, import-failure→DB restore (local + remote), cancel-mid-import→rollback, invalid/empty backup→abort-before-import, preflight failure, Kinsta-native-backup failure→push aborted, and the "sync already running" guard.
+The pull/push orchestration is extracted from the IPC closures into exported `executePull(params, deps)` / `executePush(params, deps)`; the `sshsync:pull`/`sshsync:push` IPC handlers (and the `ssh-sync` socket handler) are thin wrappers that build a `sendProgress` and call `defaultPullPushDeps(sendProgress)`. `PullPushDeps` is the injectable seam (runCommand, fs, connectRemote, binary/socket/rsync resolvers, notify/recordSync, the neutralize record store, the `activeSyncs`/`activePreviews` maps). The integration test passes fakes: a command runner that matches on command name/args (simulates rsync progress, writes the size-checked SQL dumps, and can fail/cancel at a chosen step), a fake connection, and a real `fs` pointed at an `os.tmpdir()` sandbox — no network or spawned processes. It covers happy-path pull/push, import-failure→DB restore (local + remote), cancel-mid-import→rollback, invalid/empty backup→abort-before-import, connect failure, the production database guard, late cancels, the safe-copy steps and the restore after a database push, and the "sync already running" guard.
 
 **Reload workflow:** the add-on's main process watches `lib/renderer/` (`watchRendererBundle`) and reloads Local's windows automatically when webpack rewrites the bundle — renderer changes hot-reload in ~1s with no restart. Main-process changes still require a full Local restart (Electron can't swap the main process):
 
@@ -162,84 +144,60 @@ osascript -e 'quit app "Local"' && sleep 3 && open -a "Local"
 
 ## UI verification via CDP (ALWAYS when building UI)
 
-**Always verify UI changes yourself** with CDP + Playwright before asking Lucas to look — iterate on screenshots until it looks right:
+**Always verify UI changes yourself** with CDP + Playwright before asking anyone to look — iterate on screenshots until it looks right:
 
 1. Relaunch Local with the debug port: `osascript -e 'quit app "Local"' && sleep 3 && open -a "Local" --args --remote-debugging-port=9222`
 2. Connect with playwright-core (`connectOverCDP('http://localhost:9222')`) — scratch project lives in `/tmp/pw-local` (recreate with `npm i playwright-core` if gone)
-3. Find the page whose URL includes `app.html`, navigate via `location.hash = '#/main/site-info/<siteId>'`, open add-on screens by dispatching `kinsta:action` CustomEvents (e.g. `{action: 'push', siteId}`)
+3. Find the page whose URL includes `app.html`, navigate via `location.hash = '#/main/site-info/<siteId>'`, open add-on screens by dispatching `sshsync:action` CustomEvents (e.g. `{action: 'push', siteId}`)
 4. `page.screenshot()` (use `clip` for detail crops) and Read the image; `page.evaluate()` to measure computed styles/heights when debugging layout
 5. Renderer changes hot-reload (~1s after `npm run build:renderer`) — no restart between iterations; main-process changes need the restart in step 1
 
-**HARD RULE: never trigger actual pulls/pushes, confirm dialogs, unlink, disconnect, or any destructive action — only open screens, inspect DOM, screenshot.** The read-only preview dry-run that runs when the push screen opens is fine. Test site: GBD Shop = `heaKB3eQ3`.
+**HARD RULE: never trigger actual pulls/pushes, confirm dialogs, unlink, disconnect, or any destructive action — only open screens, inspect DOM, screenshot.** The read-only preview dry-run that runs when the push screen opens is fine. Real pulls and pushes run only against a staging or a server you own, never from an automated UI check.
 
 ## UI Components
-
-### Kinsta Icons
-
-Two versions of the official Kinsta icon are embedded as React components:
-
-- `KinstaIconLight` — light/beige background (#F9F5F3) — for dark theme
-- `KinstaIconDark` — dark background (#181516) — for light theme
-- `KinstaIcon` — theme-aware wrapper that auto-selects based on Local's theme
 
 ### Local Components Used
 
 - `PrimaryButton`, `TextButton` — action buttons
 - `FlyModal` — confirmation dialogs only (push to production)
-- `InputSearch` — search input with icon
-- `RadioBlock` — environment selection (Production/Staging)
+- `RadioBlock` — environment selection in the pull drawer
+- `FlySelect` — environment and mode selection inside the push screen's FlyModal
 - `Checkbox` — sync options
-- `ProgressBar` — sync progress
-- `Spinner` — loading states
-- `Title` — headers
+- `ProgressBar`, `Spinner`, `Title`, `VirtualTable`
 
 ## Data Storage
 
-Config stored in `<userDataPath>/addons-data/kinsta-sync/` (from `context.environment.userDataPath`; legacy `~/.kinsta-sync/` is auto-migrated on first run):
+Under `<userDataPath>/addons-data/ssh-sync/` (0700):
 
-- `config.json` — Company ID
-- `.api-key.enc` — Encrypted API key
-- `sites.json` — Site links (Local site ID → Kinsta site, not environment) + `lastPullAt`/`lastPushAt` timestamps
-- `tmp/` — Temporary SQL dumps + pre-pull DB backups
-
-## Site Linking
-
-Sites are linked at the Kinsta site level (not environment level). When syncing, users select the target environment (Production or Staging) from a dropdown. This allows syncing to different environments without relinking.
-
-The link drawer includes:
-
-- Search functionality for sites (important for accounts with many sites)
-- Alphabetical sorting
-- Kinsta icons for each site
+- `profiles.json` — environments per Local site, last pull/push, history
+- `secrets.json` — SSH passwords encrypted with safeStorage, keyed by environment id (refused on the `basic_text` backend)
+- `neutralized/<siteId>.json` — what the safe-copy step changed in that site's database
+- `backups/` — remote databases exported before each database push (last 3 per environment)
+- `tmp/` — dumps in transit, removed on startup
+- `cli.sock` — the `ssh-sync` endpoint (0600)
 
 ## Sync Process
 
 ### Pull
 
-1. Pre-flight: site running? (socket check)
-2. rsync files from Kinsta (excluding system files, real progress)
-3. Backup local DB to tmp (safety net)
-4. Export database on Kinsta via SSH + WP-CLI
-5. Download SQL dump via SCP
-6. `downgradeMariaDBCollations` rewrites `utf8mb4_uca1400_*` → `utf8mb4_unicode_520_ci` in the downloaded dump (Kinsta's MariaDB 11.4+ defaults to uca1400, which Local's MySQL 8 rejects with `Unknown collation`), then import to Local's MySQL via socket (stdin pipe)
-7. Run WP-CLI search-replace ×3 passes (https/http/protocol-relative; modifies wp-config.php temporarily for socket)
-8. Reconcile table prefix (see below) — adopt production's prefix locally + drop stale old-prefix tables
-9. Clear compiled Sage/Acorn caches (see below) — `clearCompiledFrameworkCaches`, runs for every pull
-10. Cleanup temp files (pre-pull backup is kept until next pull)
+1. Validate the environment; local site running when the database is included
+2. Connect (one multiplexed master) and probe the WordPress folder
+3. Safe copy: install the safety mu-plugin and `SSH_SYNC_LOCAL_COPY` / `WP_ENVIRONMENT_TYPE=local` in the local wp-config.php
+4. rsync files from the resolved root (anchored excludes plus the environment's own)
+5. Back up the local database, export the remote one to a private temp file, download it, remove it
+6. Rewrite MariaDB `uca1400` collations, import into Local's MySQL, search-replace (4 passes)
+7. Adopt the server's table prefix when it differs
+8. Safe copy: deactivate unsafe plugins and switch Stripe to test mode in the database, save the record
+9. Clear compiled Sage/Acorn caches; any failure after the import rolls the local database back
 
 ### Push
 
-1. Confirmation modal for production pushes
-2. Pre-flight: site running? (socket check)
-3. Backup remote DB to `~/kinsta-sync-pre-push-backup.sql` on Kinsta (`wp --skip-plugins --skip-themes db export` — a broken/heavy plugin must not break the rollback net)
-4. rsync files to Kinsta (with --delete, real progress)
-5. Export Local database via mysqldump (stdout pipe), then `downgradeMySQL8Collations` rewrites `utf8mb4_0900_*` → `utf8mb4_unicode_520_ci` in the dump (Local ships MySQL 8; Kinsta runs MariaDB, which rejects 0900 collations). Pull has the symmetric `downgradeMariaDBCollations` for MariaDB's `uca1400` family — both helpers live in `validators.ts` and target the same collation, understood by both engines. Both rewrites read and write the dump as `latin1`, never `utf8`: latin1 maps bytes 1:1, so binary column data (Wordfence's varbinary IPs) survives; a utf8 round trip turns it into U+FFFD and the import dies on `Duplicate entry … PRIMARY`
-6. Upload SQL dump via SCP
-7. Import on Kinsta via SSH + WP-CLI
-8. Run search-replace ×3 passes on Kinsta
-9. Reconcile remote table prefix (see below) — symmetric with pull; non-fatal
-10. Clear Kinsta cache via API
-11. Cleanup temp files
+1. Production database guard (Migration mode + typed domain), validation, connect
+2. With the database: export the remote database and download it as the rollback backup
+3. rsync the selected files (`--files-from`, never `--delete`), then the ticked deletions
+4. With the database: dump Local's database, rewrite MySQL 8 collations, upload to a private temp file, import, search-replace with plugins and themes skipped, reconcile the table prefix, restore what the safe copy turned off — all on an uncancellable ActiveSync; a cancel takes effect afterwards
+5. The environment's cache command (optional)
+6. Rollback only if the server import started and did not finish
 
 ## Important Notes
 
@@ -252,7 +210,7 @@ The link drawer includes:
 - **Sage/Acorn compiled caches bake absolute paths → cleared post-pull** (`clearCompiledFrameworkCaches` in `sync.ts`): Roots/Acorn compiles Blade views (`storage/framework/views/*.php`) and caches config/services/packages (`storage/framework/cache/*.php`, `bootstrap/cache/*.php`) with ABSOLUTE paths baked in (`/www/<install>/...`). Pulled from production, Acorn then looks for the asset manifest at the remote path → `ManifestNotFoundException` → near-blank page (~990 bytes). After every pull (compiled views are files, synced regardless of the DB option) the add-on deletes those compiled `*.php` files under each theme's `storage/framework/{views,cache}` + `bootstrap/cache`, KEEPING the dirs and any `.gitkeep`/`.gitignore` so Acorn regenerates them locally. No-op for non-Sage sites. All three pull fixes (prefix reconcile, anchored cache exclude, compiled-cache clear) verified end-to-end on Persiennkompaniet via CDP: clean automatic pull → 1111 posts, full render, zero PHP warnings, no manual steps.
 - Search-replace must use `--skip-columns=guid` to avoid breaking WordPress
 - **SSH keepalive** (`rsync.ts` `sshArgs` + `sshCommandForRsync`): every ssh/rsync invocation carries `-o ServerAliveInterval=60 -o ServerAliveCountMax=120` so a long step (big rsync, slow mysqldump/import) can't be dropped by an idle NAT/firewall mid-sync. We deliberately do NOT add `IdentitiesOnly=yes` (which WP Engine's own Magic Sync uses): WPE manages its own key and passes `-i`, but we never specify a key path (`EnvironmentInfo` has only host/port/user), so `IdentitiesOnly=yes` without `-i` would ignore agent-only keys (1Password/yubikey) and break auth for those users.
-- wp-config.php is temporarily modified to use socket path, then restored (finally-block + crash recovery via `.kinsta-sync-bak`)
+- wp-config.php is temporarily modified to use socket path, then restored (finally-block + crash recovery via `.ssh-sync-bak`)
 - "Live" environment renamed to "Production" throughout UI
 
 ## Known Issues / Workarounds
@@ -261,7 +219,7 @@ The link drawer includes:
 
 - **progress2 % jumps backwards without `--no-inc-recursive`**: `--info=progress2` divides transferred bytes by the file-list total, but rsync's default _incremental recursion_ streams the list while transferring, so that total keeps growing as more of the tree is scanned — the % shoots up early (e.g. 95% when only one subdir is known) then drops (27%) once the rest of `wp-content` is discovered. `rsyncProgressArgs()` therefore pairs `--info=progress2` with `--no-inc-recursive` (builds the full list up front → final denominator → monotonic %). The flag exists in GNU rsync ≥3.0 and progress2 in ≥3.1, so progress2 support guarantees it; openrsync/2.6.9 get neither. Note modern rsync prints `to-chk=`/`ir-chk=`, NOT the `to-check=` that `makeRsyncProgressParser` matches (that regex only fires for the 2.6.9 fallback).
 
-- **Preferences Apply button can't be hidden via the API**: every add-on settings section gets Local's Apply footer (`AddonSettingsItem` has no `noApply`, though Local's own "Connected accounts" page uses an internal `noApply` flag). The wrapper does pass an undocumented `setApplyButtonDisabled(bool)` prop for dirty-state forms. We replicate `noApply` in `KinstaSettings` by injecting `[class*="SettingsPane_Footer"] { display: none; }` while mounted (removed on unmount; substring match survives CSS Modules hash changes).
+- **Preferences Apply button can't be hidden via the API**: every add-on settings section gets Local's Apply footer (`AddonSettingsItem` has no `noApply`, though Local's own "Connected accounts" page uses an internal `noApply` flag). The wrapper does pass an undocumented `setApplyButtonDisabled(bool)` prop for dirty-state forms. We replicate `noApply` in `(removed)` by injecting `[class*="SettingsPane_Footer"] { display: none; }` while mounted (removed on unmount; substring match survives CSS Modules hash changes).
 - **FlyModal fullscreen gotchas**: (1) `overlayClassName` REPLACES FlyModal's overlay class (you lose the fixed backdrop/centering/z-index) — only pass `className`, which is _appended_ to their `.FlyModal` content class. (2) FlyModal styles its direct child div via `.FlyModal > div { max-height: 93vh; padding: 60px; overflow-y: auto }` — must be overridden (`!important`) for fullscreen layouts.
 - **VirtualTable `cellRenderer`**: returning `false` renders an EMPTY cell — the docs comment says "false to bypass and use default" but the code does `null != r ? r : children`. Return `null`/`undefined`/`args.children` for the default rendering (first-party code returns `null`).
 - `Button` component from local-components with `privateOptions` causes React error #130
