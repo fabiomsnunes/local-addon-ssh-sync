@@ -55,7 +55,8 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
-  ensureLocalEnvironmentType,
+  ensureLocalCopyConfig,
+  restoreNeutralizedScript,
   parseNeutralizeOutput,
 } from './index';
 
@@ -266,6 +267,8 @@ describe('ssh helpers', () => {
     const options = baseSshOptions(env(), '/tmp/cm-1');
     expect(options).toContain('ControlPath=/tmp/cm-1');
     expect(options).toContain('ControlMaster=no');
+    // A client never authenticates on its own (no prompt if the master died)
+    expect(options).toContain('BatchMode=yes');
   });
 
   it('keeps the master in the foreground even when ssh_config sets ControlPersist', () => {
@@ -905,31 +908,60 @@ describe('password authentication', () => {
   });
 });
 
-describe('ensureLocalEnvironmentType', () => {
-  it('replaces an existing value', () => {
-    expect(
-      ensureLocalEnvironmentType("<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'production' );\n"),
-    ).toBe("<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'local' );\n");
+describe('ensureLocalCopyConfig', () => {
+  const settings = "require_once ABSPATH . 'wp-settings.php';\n";
+
+  it('adds the safety constant and WP_ENVIRONMENT_TYPE before wp-settings.php', () => {
+    const out = ensureLocalCopyConfig(`<?php\n${settings}`);
+    expect(out).toContain("define( 'SSH_SYNC_LOCAL_COPY', true );");
+    expect(out).toContain("define( 'WP_ENVIRONMENT_TYPE', 'local' );");
+    expect(out.indexOf('SSH_SYNC_LOCAL_COPY')).toBeLessThan(out.indexOf('wp-settings'));
   });
 
-  it('adds it before "That\'s all, stop editing!"', () => {
-    const out = ensureLocalEnvironmentType(
-      "<?php\n$table_prefix = 'wp_';\n/* That's all, stop editing! Happy publishing. */\nrequire_once ABSPATH . 'wp-settings.php';\n",
+  it('switches a literal WP_ENVIRONMENT_TYPE to local and is idempotent', () => {
+    const once = ensureLocalCopyConfig(
+      `<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'production' );\n/* That's all, stop editing! */\n${settings}`,
     );
-    expect(out.indexOf('WP_ENVIRONMENT_TYPE')).toBeLessThan(out.indexOf("That's all"));
+    expect(once).not.toContain("'production'");
+    expect(ensureLocalCopyConfig(once)).toBe(once);
+    expect(once.match(/SSH_SYNC_LOCAL_COPY/g)).toHaveLength(1);
   });
 
-  it('adds it before wp-settings.php when there is no marker', () => {
-    const out = ensureLocalEnvironmentType("<?php\nrequire_once ABSPATH . 'wp-settings.php';\n");
-    expect(out.indexOf('WP_ENVIRONMENT_TYPE')).toBeLessThan(out.indexOf('wp-settings'));
+  it('leaves a non-literal WP_ENVIRONMENT_TYPE alone instead of redefining it', () => {
+    const out = ensureLocalCopyConfig(
+      `<?php\ndefine( 'WP_ENVIRONMENT_TYPE', getenv( 'ENV' ) );\n${settings}`,
+    );
+    expect(out.match(/WP_ENVIRONMENT_TYPE/g)).toHaveLength(1);
+    expect(out).toContain("define( 'SSH_SYNC_LOCAL_COPY', true );");
+  });
+});
+
+describe('restoreNeutralizedScript', () => {
+  it('embeds the record as base64 and only touches options tables it recognizes', () => {
+    const script = restoreNeutralizedScript({
+      options: { options: { deactivated: ["evil'/x.php"], stripeTestmode: 'no' } },
+      sitewideDeactivated: {},
+    });
+    expect(script).not.toContain("evil'");
+    expect(script).toContain('base64_decode');
+    expect(script).toContain("preg_match( '/^([0-9]+_)?options$/', $suffix )");
+    expect(script).toContain('wp_cache_flush()');
   });
 });
 
 describe('parseNeutralizeOutput', () => {
   it('reads the JSON summary and rejects anything else', () => {
-    expect(parseNeutralizeOutput('{"deactivated":["a/a.php"],"stripe":false}')).toEqual({
+    expect(
+      parseNeutralizeOutput(
+        '{"deactivated":["a/a.php"],"stripe":false,"record":{"options":{"options":{"deactivated":["a/a.php"],"stripeTestmode":null}},"sitewideDeactivated":[]}}',
+      ),
+    ).toEqual({
       deactivated: ['a/a.php'],
       stripe: false,
+      record: {
+        options: { options: { deactivated: ['a/a.php'], stripeTestmode: null } },
+        sitewideDeactivated: {},
+      },
     });
     expect(parseNeutralizeOutput('Warning: x')).toBeNull();
   });

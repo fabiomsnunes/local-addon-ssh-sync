@@ -92,6 +92,20 @@ const SyncPage: React.FC<Props> = ({ site }) => {
   const [profile, setProfile] = useState<SiteProfile | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [copiedEnvId, setCopiedEnvId] = useState<string | null>(null);
+  const [cli, setCli] = useState<{ installed: boolean; path: string; error?: string } | null>(null);
+
+  useEffect(() => {
+    ipcRenderer.invoke('sshsync:cliStatus').then(setCli);
+  }, []);
+
+  const installCli = async () => {
+    const result = await ipcRenderer.invoke('sshsync:installCli');
+    setCli(
+      result.success
+        ? { installed: true, path: result.path }
+        : { installed: false, path: cli?.path || '', error: result.error },
+    );
+  };
 
   const refresh = async () => {
     const stored: SiteProfile | null =
@@ -264,6 +278,31 @@ const SyncPage: React.FC<Props> = ({ site }) => {
               ) : (
                 <div style={{ ...lastRowStyle, opacity: 0.5 }}>No syncs yet</div>
               )}
+            </div>
+
+            {/* Command line */}
+            <div style={sectionTitleStyle}>Command line</div>
+            <div style={cardStyle}>
+              <div style={lastRowStyle}>
+                <span style={{ fontSize: '13px', opacity: 0.8 }}>
+                  {cli?.installed ? (
+                    <>
+                      <code>ssh-sync pull {site.name} &lt;environment&gt;</code> from any terminal
+                      where Local&apos;s <code>localwp</code> works.
+                    </>
+                  ) : (
+                    'Pull and push from the terminal with the ssh-sync command.'
+                  )}
+                  {cli?.error && (
+                    <span style={{ display: 'block', color: STATUS.danger }}>{cli.error}</span>
+                  )}
+                </span>
+                {!cli?.installed && (
+                  <button style={smallButtonStyle} onClick={installCli}>
+                    Install ssh-sync
+                  </button>
+                )}
+              </div>
             </div>
           </>
         )}

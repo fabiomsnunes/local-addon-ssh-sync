@@ -2,6 +2,7 @@
 import type * as Local from '@getflywheel/local';
 import type * as fs from 'fs';
 import type { ChildProcess } from 'child_process';
+import type { NeutralizeRecord } from './safeClone';
 
 export type SshAuthMethod = 'key' | 'password';
 
@@ -196,6 +197,9 @@ export interface PullPushDeps {
     durationMs: number,
   ) => void;
   notify: (title: string, message: string) => void;
+  // What the safe-copy step changed in the local database (null clears it)
+  saveNeutralizeRecord: (localSiteId: string, record: NeutralizeRecord | null) => void;
+  loadNeutralizeRecord: (localSiteId: string) => NeutralizeRecord | null;
   ensureConfigDir: () => void;
   tempDir: string;
   // Remote databases exported before a push land here (the rollback source)
