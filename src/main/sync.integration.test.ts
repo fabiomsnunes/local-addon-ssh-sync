@@ -6,7 +6,8 @@ import {
   executePull,
   executePush,
   CancelledError,
-  EnvironmentInfo,
+  ServerEnvironment,
+  RemoteConnection,
   SiteInfo,
   SyncOptions,
   SyncParams,
@@ -21,7 +22,7 @@ import {
 //
 // The orchestration is exercised end-to-end with injected seams: a fake command
 // runner that matches on the command name/args (no real spawn), an in-memory
-// site-link store, fake binary paths, a fake Kinsta API client, and a real `fs`
+// connection, fake binary paths, and a real `fs`
 // pointed at an os.tmpdir() sandbox. No network, no spawned processes.
 //
 // The fake runner can simulate rsync progress, write the SQL dump files the
@@ -30,6 +31,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const SITE_ID = 'site-1';
+const REMOTE_TEMP = '/home/deploy/.ssh-sync-Ab12Cd34';
 
 // Classify a runCommand call into a stable step label used for assertions and
 // for failAt/cancelAt matching. Mirrors the actual commands the code issues.
@@ -50,16 +52,13 @@ function describeStep(cmd: string, args: string[], opts: RunOptions): string {
     const remote = args[args.length - 1] || '';
     // Match 'db export' (not 'wp db export') so inserted global flags like
     // --skip-plugins/--skip-themes between `wp` and the subcommand don't break it.
-    if (remote.includes('db export') && remote.includes('pre-push-backup'))
-      return 'remote-backup-export';
     if (remote.includes('db export')) return 'remote-db-export';
-    if (remote.includes('wp config get table_prefix')) return 'remote-config-prefix';
+    if (remote.includes('mktemp')) return 'remote-mktemp';
+    if (remote.includes('config get table_prefix')) return 'remote-config-prefix';
     if (remote.includes('config set table_prefix')) return 'remote-config-set-prefix';
-    if (remote.includes('wc -c')) return 'remote-backup-wc';
-    if (remote.includes('wp db import') && remote.includes('pre-push-backup'))
-      return 'remote-db-restore';
-    if (remote.includes('wp db import')) return 'remote-db-import';
-    if (remote.includes('wp search-replace')) return 'remote-search-replace';
+    if (remote.includes('db import')) return 'remote-db-import';
+    if (remote.includes('search-replace')) return 'remote-search-replace';
+    if (remote.includes('cache flush')) return 'remote-cache';
     if (remote.includes('rm -rf')) return 'remote-rm';
     if (remote.includes('rm -f')) return 'remote-cleanup';
     return 'ssh';
@@ -72,8 +71,9 @@ interface FakeRunnerConfig {
   cancelAt?: string;
   // Bytes written for any stdoutFile (mysqldump). <200 makes a backup "invalid".
   stdoutBytes?: number;
-  // What `wc -c < backup` reports on the remote (push backup size check).
-  remoteBackupWc?: string;
+  // Bytes the remote database export downloads as (pull dump and pre-push
+  // backup). <200 makes the pre-push backup "invalid".
+  remoteDumpBytes?: number;
   // What `wp config get table_prefix` reports for the remote site (pull prefix
   // reconciliation). Unset → empty → reconciliation is skipped.
   remotePrefix?: string;
@@ -97,15 +97,19 @@ interface RecordedCall {
 function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
   const calls: RecordedCall[] = [];
   // Records the on-disk content of each scp source at upload time — so a test
-  // can assert what would actually land on Kinsta (after any local transform).
+  // can assert what would actually land on the server (after any local transform).
   const uploads: { src: string; content: string; bytes: Buffer }[] = [];
   // Records the content piped into each `mysql` import (stdinFile) at import
   // time — what Local's MySQL would actually receive.
   const imports: { src: string; content: string; bytes: Buffer }[] = [];
+  // The pre-push backup is uploaded back only by the rollback: an import that
+  // follows that upload is the restore, not the push import.
+  let lastUploadWasBackup = false;
   const run = async (sync: ActiveSync, cmd: string, args: string[], opts: RunOptions = {}) => {
     // Faithful to runCommand's contract: a cancelled sync rejects everything.
     if (sync.cancelled) throw new CancelledError();
-    const step = describeStep(cmd, args, opts);
+    let step = describeStep(cmd, args, opts);
+    if (step === 'remote-db-import' && lastUploadWasBackup) step = 'remote-db-restore';
     calls.push({ step, cmd, args, opts });
 
     // Capture what scp would upload (source is the second-to-last arg), or
@@ -113,12 +117,14 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     if (step === 'scp') {
       const src = args[args.length - 2];
       const dest = args[args.length - 1];
-      try {
-        const bytes = fs.readFileSync(src);
-        uploads.push({ src, content: bytes.toString('utf8'), bytes });
-      } catch {}
-      if (!dest.includes(':')) {
-        fs.writeFileSync(dest, cfg.pullDumpSql ?? 'x'.repeat(500));
+      if (dest.includes(':')) {
+        lastUploadWasBackup = src.includes(`${path.sep}backups${path.sep}`);
+        try {
+          const bytes = fs.readFileSync(src);
+          uploads.push({ src, content: bytes.toString('utf8'), bytes });
+        } catch {}
+      } else {
+        fs.writeFileSync(dest, cfg.pullDumpSql ?? 'x'.repeat(cfg.remoteDumpBytes ?? 500));
       }
     }
     if (step === 'mysql-import' && opts.stdinFile) {
@@ -140,9 +146,9 @@ function makeFakeRunner(cfg: FakeRunnerConfig = {}) {
     if (step === 'rsync' && opts.onStdout) {
       opts.onStdout('   1,234,567  42%   1.00MB/s    0:00:01');
     }
-    // Remote backup size check reads `wc -c` over stdout.
-    if (step === 'remote-backup-wc' && opts.onStdout) {
-      opts.onStdout(`${cfg.remoteBackupWc ?? '5000'}\n`);
+    // Remote mktemp (export or upload target) prints the private temp path.
+    if ((step === 'remote-db-export' || step === 'remote-mktemp') && opts.onStdout) {
+      opts.onStdout(`${REMOTE_TEMP}\n`);
     }
     // Remote table prefix lookup (pull reconciliation).
     if (step === 'remote-config-prefix' && opts.onStdout) {
@@ -168,12 +174,14 @@ const steps = (calls: RecordedCall[]) => calls.map((c) => c.step);
 
 let sandbox: string;
 let tempDir: string;
+let backupsDir: string;
 let socketPath: string;
 let sitePath: string;
 
 beforeEach(() => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'kinsta-sync-it-'));
+  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-it-'));
   tempDir = path.join(sandbox, 'tmp');
+  backupsDir = path.join(sandbox, 'backups');
   fs.mkdirSync(tempDir, { recursive: true });
 
   // MySQL socket file — its mere existence satisfies the pre-flight check.
@@ -203,14 +211,26 @@ const FAKE_RSYNC: RsyncInfo = {
   supportsOutFormat: true,
 };
 
-const envInfo = (overrides: Partial<EnvironmentInfo> = {}): EnvironmentInfo => ({
-  envId: 'env-1',
-  envType: 'live',
+const environment = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironment => ({
+  id: 'staging',
+  label: 'Staging',
   sshHost: '35.1.2.3',
   sshPort: '12345',
-  sshUser: 'gbdbutik',
-  remoteDomain: 'gbdbutik.se',
+  sshUser: 'deploy',
+  auth: 'key',
+  remotePath: '/var/www/example.com',
+  remoteUrl: 'https://example.com',
+  wpCommand: 'wp',
+  extraExcludes: [],
+  isProduction: false,
   ...overrides,
+});
+
+const fakeConnection = (): RemoteConnection => ({
+  target: 'deploy@35.1.2.3',
+  sshOptions: ['-o', 'Port=12345', '-o', 'ControlPath=/tmp/cm-test', '-o', 'ControlMaster=no'],
+  remoteRoot: '/var/www/example.com',
+  close: vi.fn(async () => {}),
 });
 
 const site = (): SiteInfo => ({
@@ -220,8 +240,6 @@ const site = (): SiteInfo => ({
   domain: 'gbdshop.local',
   mysql: { database: 'local', user: 'root', password: 'root' },
 });
-
-const fakeClient = {} as any;
 
 interface DepsOverrides extends Partial<PullPushDeps> {
   runner?: { run: PullPushDeps['runCommand']; calls: RecordedCall[] };
@@ -244,28 +262,16 @@ function makeDeps(overrides: DepsOverrides = {}): {
     runCommand: runner.run,
     activeSyncs: new Map(),
     activePreviews: new Map(),
-    loadSiteLinks: () => ({
-      [SITE_ID]: {
-        localSiteId: SITE_ID,
-        kinstaSiteId: 'ksite-1',
-        kinstaSiteName: 'GBD Shop',
-        kinstaSiteSlug: 'gbdbutik',
-      },
-    }),
-    validateEnvironmentInfo: () => true,
+    connectRemote: async () => fakeConnection(),
     getMysqlSocketPath: () => socketPath,
-    preflightRemote: async () => null,
     resolveRsync: () => FAKE_RSYNC,
     findServiceBinary: (_prefixes, bin) => `/fake/bin/${bin}`,
     findWpCliPhar: () => '/fake/wp-cli.phar',
-    getApiKey: () => 'fake-key',
-    getKinstaClient: () => fakeClient,
-    createKinstaBackup: async () => true,
-    clearKinstaCaches: async () => ['page'],
     recordSync,
     notify,
     ensureConfigDir: () => fs.mkdirSync(tempDir, { recursive: true }),
     tempDir,
+    backupsDir,
     sendProgress: (p) => progress.push(p),
     ...overrides,
   };
@@ -276,16 +282,17 @@ function makeDeps(overrides: DepsOverrides = {}): {
 const pullParams = (options: SyncOptions = { includeDatabase: true }): SyncParams => ({
   localSiteId: SITE_ID,
   site: site(),
-  envInfo: envInfo(),
+  environment: environment(),
   options,
 });
 
 const pushParams = (
-  options: SyncOptions = { includeDatabase: true, kinstaBackup: true },
+  options: SyncOptions = { includeDatabase: true },
+  environmentOverrides: Partial<ServerEnvironment> = {},
 ): SyncParams => ({
   localSiteId: SITE_ID,
   site: site(),
-  envInfo: envInfo(),
+  environment: environment(environmentOverrides),
   options,
 });
 
@@ -305,7 +312,7 @@ describe('wp db export hardening (#2)', () => {
 
     const push = makeDeps();
     await executePush(pushParams(), push.deps);
-    const backupExport = push.calls.find((c) => c.step === 'remote-backup-export');
+    const backupExport = push.calls.find((c) => c.step === 'remote-db-export');
     expect(backupExport).toBeDefined();
     const backupCmd = backupExport!.args[backupExport!.args.length - 1];
     expect(backupCmd).toContain('--skip-plugins');
@@ -333,8 +340,13 @@ describe('executePull', () => {
     expect(progress.some((p) => p.stage === 'files' && /42%/.test(p.message))).toBe(true);
     expect(progress.some((p) => p.stage === 'done' && p.progress === 100)).toBe(true);
 
-    expect(recordSync).toHaveBeenCalledWith(SITE_ID, 'pull', 'live', expect.any(Number));
-    expect(notify).toHaveBeenCalledWith('Kinsta Sync', expect.stringContaining('Pull complete'));
+    expect(recordSync).toHaveBeenCalledWith(
+      SITE_ID,
+      'pull',
+      expect.objectContaining({ id: 'staging' }),
+      expect.any(Number),
+    );
+    expect(notify).toHaveBeenCalledWith('SSH Sync', expect.stringContaining('Pull complete'));
 
     // wp-config.php restored to its original content
     const wpConfig = fs.readFileSync(path.join(sitePath, 'app', 'public', 'wp-config.php'), 'utf8');
@@ -343,8 +355,34 @@ describe('executePull', () => {
     expect(deps.activeSyncs.size).toBe(0); // unregistered in finally
   });
 
+  it('removes the remote dump and closes the connection, even when the download fails', async () => {
+    const connection = fakeConnection();
+    const { deps, calls } = makeDeps({
+      connectRemote: async () => connection,
+      runner: makeFakeRunner({ failAt: 'scp' }),
+    });
+    const result = await executePull(pullParams(), deps);
+
+    expect(result.success).toBe(false);
+    const cleanup = calls.find((c) => c.step === 'remote-cleanup');
+    expect(cleanup?.args[cleanup.args.length - 1]).toBe(`rm -f -- '${REMOTE_TEMP}'`);
+    expect(connection.close).toHaveBeenCalledOnce();
+    expect(deps.activeSyncs.size).toBe(0);
+  });
+
+  it('syncs from the resolved WordPress root with the environment excludes', async () => {
+    const { deps, calls } = makeDeps();
+    const params = pullParams({ includeDatabase: false });
+    params.environment.extraExcludes = ['wp-content/litespeed/'];
+    await executePull(params, deps);
+    const rsync = calls.find((c) => c.step === 'rsync')!;
+    expect(rsync.args).toContain('deploy@35.1.2.3:/var/www/example.com/');
+    expect(rsync.args).toContain('--exclude=wp-content/litespeed/');
+    expect(rsync.args).toContain('--exclude=wp-content/uploads/');
+  });
+
   it('downgrades MariaDB 11.4 collations in the downloaded dump before importing (MySQL 8)', async () => {
-    // Kinsta's MariaDB 11.4+ emits utf8mb4_uca1400_* collations Local's MySQL 8
+    // MariaDB 11.4+ emits utf8mb4_uca1400_* collations Local's MySQL 8
     // can't import ("Unknown collation: 'utf8mb4_uca1400_ai_ci'").
     const runner = makeFakeRunner({
       pullDumpSql:
@@ -504,7 +542,7 @@ describe('executePull', () => {
     expect(result.error).toContain('fake failure at mysql-import');
     expect(steps(calls)).toContain('mysql-restore'); // local DB restored
     expect(notify).toHaveBeenCalledWith(
-      'Kinsta Sync',
+      'SSH Sync',
       expect.stringContaining('was restored from backup'),
     );
     expect(deps.activeSyncs.size).toBe(0);
@@ -533,11 +571,16 @@ describe('executePull', () => {
 
   it('aborts and leaves no sync registered when the remote pre-flight fails', async () => {
     const { deps, calls } = makeDeps({
-      preflightRemote: async () => 'Could not reach Kinsta over SSH',
+      connectRemote: async () => {
+        throw new Error('Could not connect to deploy@35.1.2.3 over SSH.');
+      },
     });
     const result = await executePull(pullParams(), deps);
 
-    expect(result).toEqual({ success: false, error: 'Could not reach Kinsta over SSH' });
+    expect(result).toEqual({
+      success: false,
+      error: 'Could not connect to deploy@35.1.2.3 over SSH.',
+    });
     expect(calls).toHaveLength(0); // nothing ran
     expect(deps.activeSyncs.size).toBe(0);
   });
@@ -561,10 +604,10 @@ describe('executePull', () => {
     });
     let preflightCalls = 0;
     const { deps } = makeDeps({
-      preflightRemote: async () => {
+      connectRemote: async () => {
         preflightCalls++;
         await preflightGate;
-        return null;
+        return fakeConnection();
       },
     });
 
@@ -593,7 +636,7 @@ describe('executePull', () => {
     const fsThatFailsBackupUnlink = {
       ...fs,
       unlinkSync: (p: fs.PathLike, ...rest: any[]) => {
-        if (String(p).endsWith('.kinsta-sync-bak')) {
+        if (String(p).endsWith('.ssh-sync-bak')) {
           throw new Error('simulated unlink failure');
         }
         return (fs.unlinkSync as any)(p, ...rest);
@@ -614,36 +657,78 @@ describe('executePull', () => {
 });
 
 describe('executePush', () => {
-  it('happy path: Kinsta backup + files + DB + search-replace + cache clear', async () => {
-    const createKinstaBackup = vi.fn(async () => true);
-    const clearKinstaCaches = vi.fn(async () => ['page', 'edge']);
-    const { deps, calls, progress, notify, recordSync } = makeDeps({
-      createKinstaBackup,
-      clearKinstaCaches,
-    });
-    const result = await executePush(pushParams(), deps);
+  it('happy path: backup to this machine + files + DB + search-replace + cache command', async () => {
+    const { deps, calls, progress, notify, recordSync } = makeDeps();
+    const params = pushParams({ includeDatabase: true }, { cacheCommand: 'wp cache flush' });
+    const result = await executePush(params, deps);
 
     expect(result).toEqual({ success: true, warning: null });
 
     const labels = steps(calls);
-    expect(labels).toContain('remote-backup-export'); // remote DB backup
-    expect(labels).toContain('remote-backup-wc'); // size verified
+    expect(labels.indexOf('remote-db-export')).toBeLessThan(labels.indexOf('rsync')); // backup first
     expect(labels).toContain('rsync');
     expect(labels).toContain('mysqldump'); // local export
-    expect(labels).toContain('scp');
+    expect(labels).toContain('remote-mktemp'); // private upload target
     expect(labels).toContain('remote-db-import');
     expect(labels).toContain('remote-search-replace');
+    expect(labels).toContain('remote-cache');
     expect(labels).not.toContain('remote-db-restore'); // no rollback on success
 
-    expect(createKinstaBackup).toHaveBeenCalledOnce();
-    expect(clearKinstaCaches).toHaveBeenCalledOnce();
-    expect(recordSync).toHaveBeenCalledWith(SITE_ID, 'push', 'live', expect.any(Number));
-    expect(notify).toHaveBeenCalledWith('Kinsta Sync', expect.stringContaining('Push complete'));
+    // The pre-push backup lives on this machine; every remote temp file is removed
+    expect(
+      fs.readdirSync(backupsDir).filter((f) => f.startsWith(`${SITE_ID}-staging-`)),
+    ).toHaveLength(1);
+    const cleanups = calls.filter((c) => c.step === 'remote-cleanup');
+    expect(cleanups).toHaveLength(2); // the backup export and the uploaded dump
+    for (const c of cleanups) expect(c.args[c.args.length - 1]).toContain(REMOTE_TEMP);
+
+    expect(recordSync).toHaveBeenCalledWith(
+      SITE_ID,
+      'push',
+      expect.objectContaining({ id: 'staging' }),
+      expect.any(Number),
+    );
+    expect(notify).toHaveBeenCalledWith('SSH Sync', expect.stringContaining('Push complete'));
     expect(progress.some((p) => p.stage === 'done' && p.progress === 100)).toBe(true);
     expect(deps.activeSyncs.size).toBe(0);
   });
 
-  it('downgrades MySQL 8 collations in the dump before uploading to Kinsta (MariaDB)', async () => {
+  it('files-only push skips the database backup entirely', async () => {
+    const { deps, calls } = makeDeps();
+    const result = await executePush(pushParams({ includeDatabase: false }), deps);
+    expect(result.success).toBe(true);
+    const labels = steps(calls);
+    expect(labels).toContain('rsync');
+    expect(labels).not.toContain('remote-db-export');
+    expect(labels).not.toContain('remote-db-import');
+  });
+
+  it('refuses a production database push without Migration mode, before connecting', async () => {
+    const connectRemote = vi.fn(async () => fakeConnection());
+    const { deps, calls } = makeDeps({ connectRemote });
+    const result = await executePush(
+      pushParams({ includeDatabase: true }, { isProduction: true }),
+      deps,
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Migration mode/);
+    expect(connectRemote).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('allows a production database push in Migration mode with the typed domain', async () => {
+    const { deps } = makeDeps();
+    const result = await executePush(
+      pushParams(
+        { includeDatabase: true, migrationMode: true, confirmDomain: 'example.com' },
+        { isProduction: true },
+      ),
+      deps,
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it('downgrades MySQL 8 collations in the dump before uploading (MariaDB servers)', async () => {
     // Local (MySQL 8) emits utf8mb4_0900_* collations MariaDB can't import.
     const runner = makeFakeRunner({
       pushDumpSql:
@@ -723,34 +808,19 @@ describe('executePush', () => {
     expect(result.error).toContain('fake failure at remote-db-import');
     expect(steps(calls)).toContain('remote-db-restore'); // remote DB restored
     expect(notify).toHaveBeenCalledWith(
-      'Kinsta Sync',
+      'SSH Sync',
       expect.stringContaining('was restored from backup'),
     );
   });
 
-  it('aborts the push (no destructive step) when the Kinsta backup fails', async () => {
-    const createKinstaBackup = vi.fn(async () => {
-      throw new Error('Kinsta API 500');
-    });
-    const { deps, calls } = makeDeps({ createKinstaBackup });
-    const result = await executePush(pushParams(), deps);
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('Kinsta backup failed — push aborted');
-    const labels = steps(calls);
-    expect(labels).not.toContain('rsync'); // never touched files
-    expect(labels).not.toContain('remote-db-import');
-    expect(labels).not.toContain('remote-db-restore');
-  });
-
   it('aborts before any change when the remote backup looks empty/truncated', async () => {
-    const { deps, calls } = makeDeps({ runner: makeFakeRunner({ remoteBackupWc: '0' }) });
+    const { deps, calls } = makeDeps({ runner: makeFakeRunner({ remoteDumpBytes: 10 }) });
     const result = await executePush(pushParams(), deps);
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('Remote database backup looks invalid');
     const labels = steps(calls);
-    expect(labels).toContain('remote-backup-wc');
+    expect(labels).toContain('remote-db-export');
     expect(labels).not.toContain('rsync'); // server untouched
     expect(labels).not.toContain('remote-db-import');
   });
@@ -772,10 +842,10 @@ describe('executePush', () => {
     });
     let preflightCalls = 0;
     const { deps } = makeDeps({
-      preflightRemote: async () => {
+      connectRemote: async () => {
         preflightCalls++;
         await preflightGate;
-        return null;
+        return fakeConnection();
       },
     });
 

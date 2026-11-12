@@ -1,79 +1,51 @@
 import { describe, it, expect } from 'vitest';
 import {
-  sanitizeSshUser,
-  buildEnvInfo,
-  envLabel,
+  environmentTarget,
+  sshCommandFor,
+  remoteDomainOf,
   visibleDiffRows,
   summarizeSelection,
   buildPushFileSelection,
 } from './pushHelpers';
 
-describe('envLabel', () => {
-  it('labels premium as Production and non-premium as Staging', () => {
-    expect(envLabel({ is_premium: true })).toBe('Production');
-    expect(envLabel({ is_premium: false })).toBe('Staging');
+describe('environmentTarget', () => {
+  it('prefers the ssh alias', () => {
+    expect(environmentTarget({ sshAlias: 'wplus-site', sshHost: 'x', sshUser: 'y' })).toBe(
+      'wplus-site',
+    );
+  });
+  it('falls back to user@host, or the bare host', () => {
+    expect(environmentTarget({ sshHost: 'example.com', sshUser: 'deploy' })).toBe(
+      'deploy@example.com',
+    );
+    expect(environmentTarget({ sshHost: 'example.com' })).toBe('example.com');
   });
   it('returns an empty string for a missing env', () => {
-    expect(envLabel(null)).toBe('');
-    expect(envLabel(undefined)).toBe('');
+    expect(environmentTarget(null)).toBe('');
+    expect(environmentTarget(undefined)).toBe('');
   });
 });
 
-describe('sanitizeSshUser', () => {
-  it('lowercases and strips everything non-alphanumeric', () => {
-    expect(sanitizeSshUser('Nuclear Sweden')).toBe('nuclearsweden');
-    expect(sanitizeSshUser('GBD-Shop_2024!')).toBe('gbdshop2024');
-    expect(sanitizeSshUser('  spaces  ')).toBe('spaces');
+describe('sshCommandFor', () => {
+  it('uses the alias as-is', () => {
+    expect(sshCommandFor({ sshAlias: 'wplus-site' })).toBe('ssh wplus-site');
   });
-  it('handles empty/undefined input', () => {
-    expect(sanitizeSshUser('')).toBe('');
-    expect(sanitizeSshUser(undefined as unknown as string)).toBe('');
+  it('adds -p only for a non-default port', () => {
+    expect(sshCommandFor({ sshHost: 'h', sshUser: 'u', sshPort: '22' })).toBe('ssh u@h');
+    expect(sshCommandFor({ sshHost: 'h', sshUser: 'u', sshPort: '2222' })).toBe('ssh -p 2222 u@h');
   });
 });
 
-describe('buildEnvInfo', () => {
-  const env = {
-    id: 'env-1',
-    is_premium: false,
-    ssh_connection: { ssh_ip: { external_ip: '1.2.3.4' }, ssh_port: 36750 },
-    primaryDomain: { name: 'stg-foo.kinsta.cloud' },
-    domains: [{ name: 'other.example.com' }],
-    cdn_cache_id: null,
-  };
-  const link = { kinstaSiteSlug: 'Foo Bar', kinstaSiteName: 'Foo Bar Display' };
-
-  it('returns null when env or link is missing', () => {
-    expect(buildEnvInfo(undefined, link)).toBeNull();
-    expect(buildEnvInfo(env, null)).toBeNull();
+describe('remoteDomainOf', () => {
+  it('returns host + path without the trailing slash', () => {
+    expect(remoteDomainOf('https://wplus.pt')).toBe('wplus.pt');
+    expect(remoteDomainOf('https://wplus.pt/')).toBe('wplus.pt');
+    expect(remoteDomainOf('https://example.com/blog/')).toBe('example.com/blog');
   });
-
-  it('maps a staging environment with a sanitized ssh user', () => {
-    expect(buildEnvInfo(env, link)).toEqual({
-      envId: 'env-1',
-      envType: 'staging',
-      sshHost: '1.2.3.4',
-      sshPort: '36750',
-      sshUser: 'foobar',
-      remoteDomain: 'stg-foo.kinsta.cloud',
-      cdnCacheId: null,
-    });
-  });
-
-  it('marks premium environments as live and prefers the slug for the ssh user', () => {
-    const info = buildEnvInfo({ ...env, is_premium: true }, link)!;
-    expect(info.envType).toBe('live');
-    expect(info.sshUser).toBe('foobar'); // from slug, not display name
-  });
-
-  it('falls back to the site name when no slug, port 22, and first domain', () => {
-    const info = buildEnvInfo(
-      { id: 'e', is_premium: false, domains: [{ name: 'fallback.example.com' }] },
-      { kinstaSiteName: 'My Site' },
-    )!;
-    expect(info.sshPort).toBe('22');
-    expect(info.sshUser).toBe('mysite');
-    expect(info.remoteDomain).toBe('fallback.example.com');
-    expect(info.sshHost).toBe('');
+  it('returns an empty string for an invalid or missing URL', () => {
+    expect(remoteDomainOf('not a url')).toBe('');
+    expect(remoteDomainOf('')).toBe('');
+    expect(remoteDomainOf(undefined)).toBe('');
   });
 });
 

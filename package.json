@@ -1,22 +1,22 @@
 {
-  "name": "local-addon-kinsta",
-  "productName": "Kinsta Sync",
-  "version": "1.1.12",
-  "description": "Sync WordPress sites between Local and Kinsta hosting",
-  "author": "Lucas",
+  "name": "local-addon-ssh-sync",
+  "productName": "SSH Sync",
+  "version": "0.1.0",
+  "description": "Pull and push WordPress sites between Local and any server over SSH",
+  "author": "Fábio Nunes (WPlus)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/landerss0n/local-addon-kinsta.git"
+    "url": "git+https://github.com/fabiomsnunes/local-addon-ssh-sync.git"
   },
   "bugs": {
-    "url": "https://github.com/landerss0n/local-addon-kinsta/issues"
+    "url": "https://github.com/fabiomsnunes/local-addon-ssh-sync/issues"
   },
-  "homepage": "https://github.com/landerss0n/local-addon-kinsta#readme",
+  "homepage": "https://github.com/fabiomsnunes/local-addon-ssh-sync#readme",
   "keywords": [
     "local-addon"
   ],
-  "slug": "local-addon-kinsta",
+  "slug": "local-addon-ssh-sync",
   "bgColor": "#181516",
   "icon": "icon.svg",
   "engines": {
@@ -28,9 +28,6 @@
     "lib",
     "icon.svg",
     "README.md"
-  ],
-  "bundledDependencies": [
-    "axios"
   ],
   "scripts": {
     "build": "npm run build:main && npm run build:renderer",
@@ -56,9 +53,6 @@
     "*.{json,md,yml,yaml}": [
       "prettier --write"
     ]
-  },
-  "dependencies": {
-    "axios": "^1.6.0"
   },
   "devDependencies": {
     "@getflywheel/local": "^9.2.9",

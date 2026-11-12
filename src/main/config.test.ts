@@ -2,133 +2,140 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { SafeStorage } from 'electron';
 import {
   initConfig,
   getTempDir,
-  loadConfig,
-  saveConfig,
-  loadSiteLinks,
-  saveSiteLinks,
+  getBackupsDir,
+  loadProfiles,
+  getProfile,
+  findEnvironment,
+  saveEnvironments,
+  deleteProfile,
   recordSync,
-  getApiKey,
-  saveApiKey,
-  deleteApiKey,
-  migrateConfigFiles,
+  prunePushBackups,
 } from './config';
-
-// A stand-in for Electron's safeStorage: reversible "encryption" so getApiKey
-// round-trips saveApiKey without a real keychain.
-const fakeSafeStorage = (available = true): SafeStorage =>
-  ({
-    isEncryptionAvailable: () => available,
-    encryptString: (s: string) => Buffer.from('enc:' + s, 'utf8'),
-    decryptString: (b: Buffer) => b.toString('utf8').replace(/^enc:/, ''),
-  }) as unknown as SafeStorage;
+import { HISTORY_LIMIT, PUSH_BACKUPS_TO_KEEP } from './constants';
+import { ServerEnvironment } from './types';
 
 let sandbox: string;
 
+const environment = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironment => ({
+  id: 'production',
+  label: 'Production',
+  sshAlias: 'example',
+  auth: 'key',
+  remotePath: '/var/www/example.com',
+  remoteUrl: 'https://example.com',
+  wpCommand: 'wp',
+  extraExcludes: [],
+  isProduction: true,
+  ...overrides,
+});
+
 beforeEach(() => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'kinsta-config-'));
-  // initConfig resolves CONFIG_DIR to <userDataPath>/addons-data/kinsta-sync
-  initConfig(sandbox, fakeSafeStorage());
+  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-config-'));
+  initConfig(sandbox);
 });
 
 afterEach(() => {
   fs.rmSync(sandbox, { recursive: true, force: true });
 });
 
-const link = (over: Partial<any> = {}) => ({
-  localSiteId: 's1',
-  kinstaSiteId: 'k1',
-  kinstaSiteName: 'Nuclear Sweden',
-  kinstaSiteSlug: 'nuclearsweden',
-  ...over,
-});
-
-describe('config + site links', () => {
-  it('getTempDir points inside the resolved config dir', () => {
-    expect(getTempDir()).toBe(path.join(sandbox, 'addons-data', 'kinsta-sync', 'tmp'));
-  });
-
-  it('loadConfig returns {} before anything is saved, then round-trips', () => {
-    expect(loadConfig()).toEqual({});
-    saveConfig({ companyId: 'co-123' });
-    expect(loadConfig()).toEqual({ companyId: 'co-123' });
-  });
-
-  it('loadSiteLinks returns {} before anything is saved, then round-trips', () => {
-    expect(loadSiteLinks()).toEqual({});
-    saveSiteLinks({ s1: link() });
-    expect(loadSiteLinks().s1.kinstaSiteSlug).toBe('nuclearsweden');
+describe('config paths', () => {
+  it('keeps temp dumps and backups inside addons-data/ssh-sync', () => {
+    const dataDir = path.join(sandbox, 'addons-data', 'ssh-sync');
+    expect(getTempDir()).toBe(path.join(dataDir, 'tmp'));
+    expect(getBackupsDir()).toBe(path.join(dataDir, 'backups'));
   });
 });
 
-describe('API key storage', () => {
-  it('round-trips an encrypted API key and deletes it', () => {
-    expect(getApiKey()).toBeNull();
-    expect(saveApiKey('secret-key')).toBe(true);
-    expect(getApiKey()).toBe('secret-key');
-    deleteApiKey();
-    expect(getApiKey()).toBeNull();
+describe('profiles', () => {
+  it('returns {} before anything is saved, then round-trips environments', () => {
+    expect(loadProfiles()).toEqual({});
+    saveEnvironments('site-1', [environment()]);
+    expect(getProfile('site-1')?.environments).toEqual([environment()]);
+    expect(findEnvironment('site-1', 'production')?.label).toBe('Production');
+    expect(findEnvironment('site-1', 'staging')).toBeNull();
+    expect(findEnvironment('other-site', 'production')).toBeNull();
   });
 
-  it('refuses to save when encryption is unavailable', () => {
-    initConfig(sandbox, fakeSafeStorage(false));
-    expect(saveApiKey('secret')).toBe(false);
-    expect(getApiKey()).toBeNull();
+  it('keeps history and timestamps when the environments are edited', () => {
+    saveEnvironments('site-1', [environment()]);
+    recordSync('site-1', 'pull', environment(), 1000);
+    saveEnvironments('site-1', [environment({ label: 'Live' })]);
+    const profile = getProfile('site-1')!;
+    expect(profile.environments[0].label).toBe('Live');
+    expect(profile.lastPullAt).toBeTruthy();
+    expect(profile.history).toHaveLength(1);
+  });
+
+  it('deletes a profile and reports whether one existed', () => {
+    saveEnvironments('site-1', [environment()]);
+    expect(deleteProfile('site-1')).toBe(true);
+    expect(deleteProfile('site-1')).toBe(false);
+    expect(getProfile('site-1')).toBeNull();
+  });
+
+  it('writes the profiles file readable by the owner only', () => {
+    saveEnvironments('site-1', [environment()]);
+    const file = path.join(sandbox, 'addons-data', 'ssh-sync', 'profiles.json');
+    expect(fs.statSync(file).mode & 0o077).toBe(0);
   });
 });
 
 describe('recordSync', () => {
   it('sets the matching timestamp and prepends a history entry', () => {
-    saveSiteLinks({ s1: link() });
-    recordSync('s1', 'pull', 'staging', 1234);
-    const after = loadSiteLinks().s1;
-    expect(after.lastPullAt).toBeTruthy();
-    expect(after.lastPushAt).toBeUndefined();
-    expect(after.history?.[0]).toMatchObject({
-      mode: 'pull',
-      envType: 'staging',
-      durationMs: 1234,
+    saveEnvironments('site-1', [environment()]);
+    recordSync('site-1', 'push', environment(), 2500);
+    const profile = getProfile('site-1')!;
+    expect(profile.lastPushAt).toBeTruthy();
+    expect(profile.lastPullAt).toBeUndefined();
+    expect(profile.history![0]).toMatchObject({
+      mode: 'push',
+      environmentId: 'production',
+      environmentLabel: 'Production',
+      durationMs: 2500,
     });
   });
 
   it('caps history at the limit, most recent first', () => {
-    saveSiteLinks({ s1: link() });
-    for (let i = 0; i < 12; i++) recordSync('s1', i % 2 === 0 ? 'pull' : 'push', 'staging', i);
-    const after = loadSiteLinks().s1;
-    expect(after.history).toHaveLength(10); // HISTORY_LIMIT
-    expect(after.history?.[0].durationMs).toBe(11); // newest (i=11, push)
-    expect(after.lastPushAt).toBeTruthy();
-    expect(after.lastPullAt).toBeTruthy();
+    saveEnvironments('site-1', [environment()]);
+    for (let i = 0; i < HISTORY_LIMIT + 3; i++) {
+      recordSync('site-1', 'pull', environment(), i);
+    }
+    const history = getProfile('site-1')!.history!;
+    expect(history).toHaveLength(HISTORY_LIMIT);
+    expect(history[0].durationMs).toBe(HISTORY_LIMIT + 2);
   });
 
-  it('is a no-op for an unlinked site', () => {
-    saveSiteLinks({});
-    expect(() => recordSync('missing', 'pull', 'staging', 1)).not.toThrow();
-    expect(loadSiteLinks()).toEqual({});
+  it('is a no-op for a site without a profile', () => {
+    recordSync('nope', 'pull', environment(), 1);
+    expect(getProfile('nope')).toBeNull();
   });
 });
 
-describe('migrateConfigFiles', () => {
-  it('copies missing files, never overwrites existing ones, and renames the legacy dir away', () => {
-    const legacy = path.join(sandbox, 'legacy');
-    const target = path.join(sandbox, 'target');
-    fs.mkdirSync(legacy, { recursive: true });
-    fs.mkdirSync(target, { recursive: true });
-    fs.writeFileSync(path.join(legacy, 'config.json'), JSON.stringify({ companyId: 'OLD' }));
-    fs.writeFileSync(path.join(legacy, 'sites.json'), '{}');
-    // target already has config.json — must be preserved
-    fs.writeFileSync(path.join(target, 'config.json'), JSON.stringify({ companyId: 'KEEP' }));
+describe('prunePushBackups', () => {
+  it('keeps only the newest backups of that environment', () => {
+    const dir = path.join(sandbox, 'backups');
+    fs.mkdirSync(dir);
+    const names = [
+      'site-1-production-2026-11-01T10-00-00-000Z.sql',
+      'site-1-production-2026-11-02T10-00-00-000Z.sql',
+      'site-1-production-2026-11-03T10-00-00-000Z.sql',
+      'site-1-production-2026-11-04T10-00-00-000Z.sql',
+      'site-1-staging-2026-11-01T10-00-00-000Z.sql',
+      'site-2-production-2026-11-01T10-00-00-000Z.sql',
+    ];
+    for (const n of names) fs.writeFileSync(path.join(dir, n), 'x');
 
-    migrateConfigFiles(legacy, target);
+    prunePushBackups(dir, 'site-1', 'production');
 
-    expect(JSON.parse(fs.readFileSync(path.join(target, 'config.json'), 'utf8'))).toEqual({
-      companyId: 'KEEP', // not overwritten
-    });
-    expect(fs.existsSync(path.join(target, 'sites.json'))).toBe(true); // copied
-    expect(fs.existsSync(legacy)).toBe(false); // renamed away
-    expect(fs.existsSync(legacy + '.migrated')).toBe(true);
+    const left = fs.readdirSync(dir).sort();
+    expect(left.filter((n) => n.startsWith('site-1-production-'))).toHaveLength(
+      PUSH_BACKUPS_TO_KEEP,
+    );
+    expect(left).not.toContain('site-1-production-2026-11-01T10-00-00-000Z.sql');
+    expect(left).toContain('site-1-staging-2026-11-01T10-00-00-000Z.sql');
+    expect(left).toContain('site-2-production-2026-11-01T10-00-00-000Z.sql');
   });
 });
