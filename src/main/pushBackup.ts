@@ -162,10 +162,12 @@ export function acquireLockCommand(lock: string, owner: string, token: string): 
   return [
     `l=${q}`,
     `if mkdir "$l" 2>/dev/null; then :`,
-    // Take over a dead lock: rename it away (only one taker's mv succeeds),
-    // and if what was renamed turns out to be fresh (another taker got there
-    // first), put it back and report busy
-    `elif [ -n "$(find "$l" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mv "$l" "$l.stale.$$" 2>/dev/null; then if [ -n "$(find "$l.stale.$$" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mkdir "$l" 2>/dev/null; then rm -rf -- "$l.stale.$$"; else mv "$l.stale.$$" "$l" 2>/dev/null; printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
+    // Take over a dead lock: rename it away (only one taker's mv succeeds).
+    // What was renamed is still dead: delete it and take the lock, unless
+    // someone else's mkdir got there first. It turned out fresh (a new holder
+    // got in before the rename): put it back, and if yet another lock took
+    // its place meanwhile, remove the copy mv nested inside that one.
+    `elif [ -n "$(find "$l" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ] && mv "$l" "$l.stale.$$" 2>/dev/null; then if [ -n "$(find "$l.stale.$$" -maxdepth 0 -mmin +${LOCK_STALE_MINUTES} 2>/dev/null)" ]; then rm -rf -- "$l.stale.$$"; mkdir "$l" 2>/dev/null || { printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; }; else mv "$l.stale.$$" "$l" 2>/dev/null; rm -rf -- "$l/\${l##*/}.stale.$$"; printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
     `else printf 'SSHSYNC_LOCK=busy %s\\n' "$(cat "$l/owner" 2>/dev/null)"; exit 0; fi`,
     `printf '%s\\n' ${shellQuote(owner)} > "$l/owner"`,
     `printf '%s\\n' ${shellQuote(token)} > "$l/token"`,

@@ -1135,6 +1135,50 @@ describe("changedSinceCommand (run for real with this machine's sh)", () => {
   });
 });
 
+describe("acquireLockCommand (run for real with this machine's sh)", () => {
+  const sh = (command: string, env: NodeJS.ProcessEnv = process.env) =>
+    promisify(execFile)('sh', ['-c', command], { env });
+  const makeStale = (dir: string) => {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'owner'), 'old mac\n');
+    const old = new Date(Date.now() - 400 * 60 * 1000);
+    fs.utimesSync(dir, old, old);
+  };
+
+  it('takes over a dead lock and leaves no renamed copy behind', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-lock-'));
+    const lock = path.join(home, '.ssh-sync-lock-abc');
+    makeStale(lock);
+    const { stdout } = await sh(acquireLockCommand(lock, 'me', 'tok'));
+    expect(parseLockOutput(stdout)).toEqual({ ok: true });
+    expect(fs.readFileSync(path.join(lock, 'token'), 'utf8')).toBe('tok\n');
+    expect(fs.readdirSync(home)).toEqual(['.ssh-sync-lock-abc']);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reports busy, nesting nothing, when another taker creates the lock first', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-lock-'));
+    const lock = path.join(home, '.ssh-sync-lock-abc');
+    makeStale(lock);
+    // A mkdir that loses every race: another taker creates the folder first
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(bin, 'mkdir'),
+      '#!/bin/sh\n[ -e "$1" ] || { /bin/mkdir "$1" && echo other > "$1/owner"; }\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const { stdout } = await sh(acquireLockCommand(lock, 'me', 'tok'), {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+    });
+    expect(parseLockOutput(stdout)).toEqual({ ok: false, owner: 'other' });
+    expect(fs.readdirSync(lock)).toEqual(['owner']);
+    expect(fs.readdirSync(home).sort()).toEqual(['.ssh-sync-lock-abc', 'bin']);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+});
+
 describe('endProgress', () => {
   it('ends a failed or cancelled sync with a final event, leaves successes alone', () => {
     const events: any[] = [];
