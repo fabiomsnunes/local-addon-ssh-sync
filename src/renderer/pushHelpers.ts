@@ -1,32 +1,8 @@
-// Pure, dependency-free helpers extracted from KinstaPushScreen so the push
-// screen's non-React logic (SSH user sanitization, env mapping, diff filtering,
+// Pure, dependency-free helpers extracted from the push screen so its
+// non-React logic (environment targets, diff filtering,
 // selection math, the rsync fast-path decision) can be unit-tested without a DOM
 // or Electron. Structural (duck-typed) parameter shapes keep the screen's richer
 // objects compatible without sharing the full component types.
-
-export interface EnvLike {
-  id: string;
-  is_premium?: boolean;
-  ssh_connection?: { ssh_ip?: { external_ip?: string }; ssh_port?: string | number };
-  primaryDomain?: { name?: string };
-  domains?: Array<{ name?: string }>;
-  cdn_cache_id?: string | null;
-}
-
-export interface LinkLike {
-  kinstaSiteSlug?: string;
-  kinstaSiteName?: string;
-}
-
-export interface PushEnvInfo {
-  envId: string;
-  envType: 'live' | 'staging';
-  sshHost: string;
-  sshPort: string;
-  sshUser: string;
-  remoteDomain: string;
-  cdnCacheId?: string | null;
-}
 
 export interface DiffRowLike {
   op: string;
@@ -36,37 +12,38 @@ export interface DiffRowLike {
   selected?: boolean;
 }
 
-// Kinsta SSH usernames are the site slug lowercased with everything non-alphanumeric
-// stripped. Kept pure + tested because it feeds a shell-adjacent SSH target.
-export function sanitizeSshUser(name: string): string {
-  return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+export interface EnvironmentLike {
+  sshAlias?: string;
+  sshHost?: string;
+  sshUser?: string;
+  sshPort?: string;
 }
 
-// Map a Kinsta environment + the site link into the EnvironmentInfo the main
-// process expects. Returns null when either input is missing.
-export function buildEnvInfo(
-  env: EnvLike | undefined | null,
-  link: LinkLike | null,
-): PushEnvInfo | null {
-  if (!env || !link) return null;
-  const siteName = link.kinstaSiteSlug || link.kinstaSiteName || '';
-  return {
-    envId: env.id,
-    envType: env.is_premium ? 'live' : 'staging',
-    sshHost: env.ssh_connection?.ssh_ip?.external_ip || '',
-    sshPort: String(env.ssh_connection?.ssh_port || '22'),
-    sshUser: sanitizeSshUser(siteName),
-    remoteDomain: env.primaryDomain?.name || env.domains?.[0]?.name || '',
-    cdnCacheId: env.cdn_cache_id,
-  };
-}
-
-// The user-facing label for an environment. Kinsta's "premium" flag is the
-// production environment; everything else is staging. ("Live" is the stored
-// envType; "Production" is the label shown throughout the UI.)
-export function envLabel(env: { is_premium?: boolean } | null | undefined): string {
+// What the user would type after `ssh`: the alias, or user@host
+export function environmentTarget(env: EnvironmentLike | null | undefined): string {
   if (!env) return '';
-  return env.is_premium ? 'Production' : 'Staging';
+  if (env.sshAlias) return env.sshAlias;
+  return env.sshUser && env.sshHost ? `${env.sshUser}@${env.sshHost}` : env.sshHost || '';
+}
+
+// A copy-pasteable ssh command for the environment
+export function sshCommandFor(env: EnvironmentLike | null | undefined): string {
+  if (!env) return '';
+  if (env.sshAlias) return `ssh ${env.sshAlias}`;
+  const port = env.sshPort && env.sshPort !== '22' ? `-p ${env.sshPort} ` : '';
+  return `ssh ${port}${environmentTarget(env)}`;
+}
+
+// host + path of the site URL (what the user types to confirm a production
+// database push; mirrors remoteDomainFromUrl in the main process)
+export function remoteDomainOf(remoteUrl: string | null | undefined): string {
+  if (!remoteUrl) return '';
+  try {
+    const url = new URL(remoteUrl);
+    return `${url.host}${url.pathname}`.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
 }
 
 // Hide add/update directory rows (implied by their files); keep folder deletions.
@@ -108,4 +85,30 @@ export function buildPushFileSelection(
     files: selected.filter((r) => r.op !== 'delete').map((r) => r.path),
     deletions: selected.filter((r) => r.op === 'delete').map((r) => r.path),
   };
+}
+
+// A file only in Local, older than the last pull from that environment, was
+// most likely deleted on the server since (or is a leftover of the Local
+// install): pushing it would bring it back. Same rule as the main process's
+// isStaleLocalOnly (cliProtocol.ts). Needs the mtime from the preview.
+export function isStaleLocalOnly(
+  row: { op: string; isDir?: boolean; localMtime?: number },
+  lastPullMs: number | null,
+): boolean {
+  return (
+    row.op === 'add' &&
+    !row.isDir &&
+    lastPullMs !== null &&
+    typeof row.localMtime === 'number' &&
+    row.localMtime < lastPullMs
+  );
+}
+
+// The newest pull from one environment, from the profile's history
+export function lastPullFrom(
+  history: { mode: string; environmentId: string; at: string }[] | undefined,
+  environmentId: string,
+): number | null {
+  const pull = (history || []).find((h) => h.mode === 'pull' && h.environmentId === environmentId);
+  return pull ? Date.parse(pull.at) : null;
 }

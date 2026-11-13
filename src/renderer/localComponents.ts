@@ -54,7 +54,7 @@ function resolveLocalComponents(): LocalComponents {
   }
 
   console.warn(
-    '[kinsta-sync] Could not load @getflywheel/local-components from Local; ' +
+    '[ssh-sync] Could not load @getflywheel/local-components from Local; ' +
       'using the bundled copy. Components will render unstyled because their ' +
       "class names won't match Local's stylesheet.",
   );

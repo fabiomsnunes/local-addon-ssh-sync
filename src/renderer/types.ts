@@ -1,33 +1,41 @@
-// Shared renderer-side shapes. Previously duplicated across KinstaPage,
-// KinstaPushScreen, and KinstaPullDrawer.
+// Shared renderer-side shapes. Mirror src/main/types.ts (the main process owns
+// validation; these only describe what arrives over IPC).
 
-// A Kinsta environment as returned by the main process (`kinsta:getEnvironments`).
-export interface Environment {
+export interface ServerEnvironment {
   id: string;
-  name: string;
-  display_name: string;
-  is_premium: boolean;
-  cdn_cache_id?: string;
-  primaryDomain?: { name: string };
-  domains?: Array<{ name: string }>;
-  ssh_connection?: {
-    ssh_ip?: { external_ip: string };
-    ssh_port?: string;
-  };
+  label: string;
+  sshAlias?: string;
+  sshHost?: string;
+  sshUser?: string;
+  sshPort?: string;
+  auth: 'key' | 'password';
+  remotePath: string;
+  remoteUrl: string;
+  wpCommand: string;
+  cacheCommand?: string;
+  extraExcludes: string[];
+  isProduction: boolean;
+  // Set by the main process: a password is saved for this environment
+  hasPassword?: boolean;
 }
 
-// The flattened env descriptor the main process expects for a sync.
-export interface EnvironmentInfo {
-  envId: string;
-  envType: 'staging' | 'live';
-  sshHost: string;
-  sshPort: string;
-  sshUser: string;
-  remoteDomain: string;
-  cdnCacheId?: string;
+export interface SyncHistoryEntry {
+  mode: 'pull' | 'push';
+  environmentId: string;
+  environmentLabel: string;
+  at: string;
+  durationMs: number;
 }
 
-// Sync progress payload streamed over `kinsta:syncProgress`.
+export interface SiteProfile {
+  localSiteId: string;
+  environments: ServerEnvironment[];
+  lastPullAt?: string;
+  lastPushAt?: string;
+  history?: SyncHistoryEntry[];
+}
+
+// Sync progress payload streamed over `sshsync:syncProgress`.
 export interface SyncProgress {
   stage: string;
   progress: number;

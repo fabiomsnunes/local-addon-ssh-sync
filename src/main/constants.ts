@@ -1,10 +1,7 @@
-import * as path from 'path';
-import * as os from 'os';
+export const PRODUCT_NAME = 'SSH Sync';
 
-export const KINSTA_API_BASE = 'https://api.kinsta.com/v2';
-
-// Legacy config location (pre userDataPath migration)
-export const LEGACY_CONFIG_DIR = path.join(os.homedir(), '.kinsta-sync');
+// Folder under Local's addons-data where profiles, secrets and dumps live
+export const DATA_DIR_NAME = 'ssh-sync';
 
 // Files/folders to exclude during sync
 export const EXCLUDE_PATTERNS = [
@@ -48,16 +45,23 @@ export const EXCLUDE_PATTERNS = [
   '.htaccess',
   'php.ini',
   '.user.ini',
-  'wp-content/mu-plugins/kinsta-mu-plugins/',
-  'wp-content/mu-plugins/kinsta-mu-plugins.php',
   // Host-specific persistent-cache drop-ins. object-cache.php wires WordPress to
   // the host's Redis/Memcached, advanced-cache.php to its page-cache engine —
   // both are provisioned per host. Syncing either way would point one host at
   // the other's (unreachable) cache backend and break caching / fatal the site.
   'wp-content/object-cache.php',
   'wp-content/advanced-cache.php',
+  // LiteSpeed Cache's per-site config file (cache paths and server settings),
+  // written by the plugin on each server
+  'wp-content/.litespeed_conf.php',
   // Local-generated helper file in the webroot — never part of the WP site
   'local-xdebuginfo.php',
+  // Our own files in the SSH user's home (temp dumps, push backups, lock,
+  // last-push marker), in case the WordPress root is that home: never synced,
+  // never deleted by a full push
+  '/.ssh-sync-*',
+  // Our own safety mu-plugin for pulled copies (safeClone.ts): never pushed
+  'wp-content/mu-plugins/ssh-sync-local-safety.php',
 ];
 
 export const HISTORY_LIMIT = 10;
@@ -68,10 +72,9 @@ export const HISTORY_LIMIT = 10;
 // useless, so we refuse to proceed with the destructive import.
 export const MIN_DUMP_BYTES = 200;
 
-export const KINSTA_BACKUP_TAG = 'kinsta-sync-pre-push';
-export const MANUAL_BACKUP_LIMIT = 5;
+// Remote database exports kept on this machine per environment, newest first
+export const PUSH_BACKUPS_TO_KEEP = 3;
 
-// Remote pre-push DB dump (home dir, outside ~/public). The automatic rollback
-// restores from this exact path — keep the export, size-check, and restore in
-// lockstep so a typo can't silently break the rollback net.
-export const REMOTE_PUSH_BACKUP = '~/kinsta-sync-pre-push-backup.sql';
+// Remote temp files (database dumps in transit) are created with mktemp in the
+// SSH user's home under this prefix and removed as soon as they are transferred.
+export const REMOTE_TEMP_PREFIX = '.ssh-sync-';

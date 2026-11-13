@@ -9,10 +9,11 @@ import {
   Spinner,
   Title,
 } from './localComponents';
-import KinstaIcon from './KinstaIcon';
-import { buildEnvInfo, envLabel } from './pushHelpers';
+import SyncIcon from './SyncIcon';
+import { environmentTarget, remoteDomainOf } from './pushHelpers';
 import { STATUS, tint } from './colors';
-import { Environment, SyncProgress } from './types';
+import SiteUrlConfirm, { SiteUrlMismatch } from './SiteUrlConfirm';
+import { ServerEnvironment, SiteProfile, SyncProgress } from './types';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -20,20 +21,20 @@ interface Props {
   isOpen: boolean;
   onClose: () => void;
   site: any;
-  siteLink: {
-    kinstaSiteId: string;
-    kinstaSiteName: string;
-    kinstaSiteSlug?: string;
-  };
+  profile: SiteProfile;
+  initialEnvironmentId: string;
 }
 
-// Pull-only drawer. Push moved to the full-screen KinstaPushScreen (Magic
-// Sync-style preview); this drawer owns the simpler "download from Kinsta" flow.
-const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) => {
-  const [environments, setEnvironments] = useState<Environment[]>([]);
-  const [selectedEnvId, setSelectedEnvId] = useState<string>('');
+// Pull-only drawer. Push lives in the full-screen PushScreen (preview with
+// per-file selection); this drawer owns the simpler "download from server" flow.
+const PullDrawer: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEnvironmentId }) => {
+  const environments: ServerEnvironment[] = profile.environments;
+  const [selectedEnvId, setSelectedEnvId] = useState<string>(initialEnvironmentId);
   const [includeDatabase, setIncludeDatabase] = useState(true);
   const [includeUploads, setIncludeUploads] = useState(false);
+  const [makeSafe, setMakeSafe] = useState(true);
+  const [siteUrlMismatch, setSiteUrlMismatch] = useState<SiteUrlMismatch | null>(null);
+  const [safeCloneNote, setSafeCloneNote] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
@@ -42,12 +43,12 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isOpen && siteLink) {
-      loadEnvironments();
+    if (isOpen) {
+      setSelectedEnvId(initialEnvironmentId);
       loadLastSynced();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- load env/last-synced only when the drawer opens / site link changes
-  }, [isOpen, siteLink]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reload only when the drawer opens / the preselected environment changes
+  }, [isOpen, initialEnvironmentId]);
 
   useEffect(() => {
     const progressHandler = (
@@ -65,56 +66,53 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
       }
     };
 
-    ipcRenderer.on('kinsta:syncProgress', progressHandler);
+    ipcRenderer.on('sshsync:syncProgress', progressHandler);
     return () => {
-      ipcRenderer.removeListener('kinsta:syncProgress', progressHandler);
+      ipcRenderer.removeListener('sshsync:syncProgress', progressHandler);
     };
   }, [site.id]);
 
-  const loadEnvironments = async () => {
-    const result = await ipcRenderer.invoke('kinsta:getEnvironments', siteLink.kinstaSiteId);
-    if (result.success) {
-      setEnvironments(result.environments);
-      if (result.environments.length > 0) {
-        setSelectedEnvId(result.environments[0].id);
-      }
-    }
-  };
-
-  // The stored link carries the lastPullAt timestamp
+  // The stored profile carries the lastPullAt timestamp
   const loadLastSynced = async () => {
-    const link = await ipcRenderer.invoke('kinsta:getSiteLink', site.id);
-    setLastSyncedAt(link?.lastPullAt || null);
+    const stored: SiteProfile | null = await ipcRenderer.invoke('sshsync:getProfile', site.id);
+    setLastSyncedAt(stored?.lastPullAt || null);
   };
 
   const handleCancel = async () => {
     setIsCancelling(true);
-    await ipcRenderer.invoke('kinsta:cancelSync', site.id);
+    await ipcRenderer.invoke('sshsync:cancelSync', site.id);
   };
 
-  const executeSync = async () => {
+  // `acceptSiteUrl` re-runs the pull after the user confirmed the site URL
+  // WordPress reports in that folder (see SiteUrlConfirm)
+  const executeSync = async (acceptSiteUrl?: string) => {
     const env = environments.find((e) => e.id === selectedEnvId);
-    const envInfo = buildEnvInfo(env, siteLink);
-    if (!envInfo) {
+    if (!env) {
       setError('Please select an environment');
       return;
     }
 
     setIsSyncing(true);
     setError(null);
+    setSiteUrlMismatch(null);
     setIsComplete(false);
     setSyncProgress({ stage: 'starting', progress: 0, message: 'Starting pull...' });
 
-    const result = await ipcRenderer.invoke('kinsta:pull', site.id, site, envInfo, {
+    setSafeCloneNote(null);
+    const result = await ipcRenderer.invoke('sshsync:pull', site.id, site, env.id, {
       includeUploads,
       includeDatabase,
+      makeSafe,
+      ...(acceptSiteUrl ? { acceptSiteUrl } : {}),
     });
 
     if (result.success) {
+      setSafeCloneNote(result.note || null);
       loadLastSynced();
     } else {
       // Cancelled syncs return to the form without an error banner
       setError(result.cancelled ? null : result.error);
+      setSiteUrlMismatch(result.siteUrlMismatch || null);
       setIsSyncing(false);
       setIsCancelling(false);
       setSyncProgress(null);
@@ -124,6 +122,7 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   const handleClose = () => {
     if (!isSyncing) {
       setError(null);
+      setSiteUrlMismatch(null);
       setIsComplete(false);
       setIsCancelling(false);
       setSyncProgress(null);
@@ -132,18 +131,24 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   };
 
   const selectedEnv = environments.find((e) => e.id === selectedEnvId);
-  const isLive = selectedEnv?.is_premium;
 
   // Build radio options
   const envOptions: { [key: string]: any } = {};
   environments.forEach((env) => {
-    const label = envLabel(env);
-    const domain = env.primaryDomain?.name || env.domains?.[0]?.name || env.display_name;
     envOptions[env.id] = {
       label: (
         <div style={{ textAlign: 'left' }}>
-          <div style={{ fontWeight: 600 }}>{label}</div>
-          <div style={{ fontSize: '12px', opacity: 0.7 }}>{domain}</div>
+          <div style={{ fontWeight: 600 }}>
+            {env.label}
+            {env.isProduction && (
+              <span style={{ marginLeft: '8px', fontSize: '11px', color: STATUS.danger }}>
+                PRODUCTION
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: '12px', opacity: 0.7 }}>
+            {remoteDomainOf(env.remoteUrl)} · {environmentTarget(env)}
+          </div>
         </div>
       ),
     };
@@ -207,12 +212,12 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
         {/* Header */}
         <div style={headerStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <KinstaIcon size={28} />
+            <SyncIcon size={28} />
             <div>
               <Title size="s" style={{ margin: 0 }}>
-                Pull from Kinsta
+                Pull from server
               </Title>
-              <span style={{ fontSize: '13px', opacity: 0.7 }}>{siteLink.kinstaSiteName}</span>
+              <span style={{ fontSize: '13px', opacity: 0.7 }}>{site.name || site.domain}</span>
             </div>
           </div>
           <button
@@ -302,6 +307,16 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                     checked={includeUploads}
                     onChange={(checked: boolean) => setIncludeUploads(checked)}
                   />
+                  <div style={{ height: '12px' }} />
+                  <Checkbox
+                    label="Make the local copy safe (recommended)"
+                    checked={makeSafe}
+                    onChange={(checked: boolean) => setMakeSafe(checked)}
+                  />
+                  <div style={{ fontSize: '12px', opacity: 0.6, margin: '6px 0 0 28px' }}>
+                    Turns off backup, mail and remote-management plugins and blocks outgoing
+                    requests and email, so this copy cannot reach the live site&apos;s services.
+                  </div>
                 </div>
               </div>
 
@@ -327,7 +342,7 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                     <path d="M12 16v-4M12 8h.01" />
                   </svg>
                   <div style={{ fontSize: '13px', opacity: 0.9 }}>
-                    Remote files will be downloaded from <strong>{envLabel(selectedEnv)}</strong>.
+                    Remote files will be downloaded from <strong>{selectedEnv?.label}</strong>.
                     {includeDatabase && ' Your local database will be replaced.'}
                   </div>
                 </div>
@@ -363,6 +378,14 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
                 >
                   {error}
                 </div>
+              )}
+
+              {siteUrlMismatch && (
+                <SiteUrlConfirm
+                  mismatch={siteUrlMismatch}
+                  busy={isSyncing}
+                  onContinue={(acceptSiteUrl) => executeSync(acceptSiteUrl)}
+                />
               )}
             </>
           )}
@@ -453,6 +476,19 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
               <span style={{ opacity: 0.7, marginBottom: '24px', display: 'block' }}>
                 Your site has been synced successfully.
               </span>
+              {safeCloneNote && (
+                <span
+                  style={{
+                    opacity: 0.7,
+                    fontSize: '12px',
+                    marginBottom: '24px',
+                    display: 'block',
+                    maxWidth: '360px',
+                  }}
+                >
+                  {safeCloneNote}
+                </span>
+              )}
               <TextButton onClick={handleClose}>Close</TextButton>
             </div>
           )}
@@ -462,11 +498,11 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
         {!isSyncing && !isComplete && (
           <div style={footerStyle}>
             <PrimaryButton
-              onClick={executeSync}
+              onClick={() => executeSync()}
               disabled={!selectedEnvId || environments.length === 0}
               style={{ width: '100%' }}
             >
-              Pull from {isLive ? 'Production' : 'Staging'}
+              Pull from {selectedEnv?.label || 'server'}
             </PrimaryButton>
           </div>
         )}
@@ -475,4 +511,4 @@ const KinstaPullDrawer: React.FC<Props> = ({ isOpen, onClose, site, siteLink }) 
   );
 };
 
-export default KinstaPullDrawer;
+export default PullDrawer;

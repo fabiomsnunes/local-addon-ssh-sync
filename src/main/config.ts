@@ -2,188 +2,194 @@ import * as path from 'path';
 import * as fs from 'fs';
 import type { SafeStorage } from 'electron';
 
-import { LEGACY_CONFIG_DIR, HISTORY_LIMIT } from './constants';
-import { KinstaConfig, SiteLink } from './types';
-
-// Set from context via initConfig() in the exported entry point
-let safeStorage: SafeStorage | null = null;
+import { DATA_DIR_NAME, HISTORY_LIMIT, PUSH_BACKUPS_TO_KEEP } from './constants';
+import { ServerEnvironment, SiteProfile } from './types';
+import type { NeutralizeRecord } from './safeClone';
 
 // Config paths — resolved once userDataPath is known
-let CONFIG_DIR = LEGACY_CONFIG_DIR;
-let CONFIG_FILE = '';
-let KEY_FILE = '';
-let SITES_FILE = '';
+let CONFIG_DIR = '';
+let PROFILES_FILE = '';
 let TEMP_DIR = '';
+let BACKUPS_DIR = '';
+let SECRETS_FILE = '';
 
-// userDataPath captured by initConfig(), used by resolveConfigPaths()
-let userDataPath = '';
+// Electron's safeStorage (macOS Keychain / OS credential store), set at startup
+let safeStorage: SafeStorage | null = null;
 
-export function resolveConfigPaths(): void {
-  // Store under Local's own user data dir (idiomatic per the Context API)
-  CONFIG_DIR = userDataPath
-    ? path.join(userDataPath, 'addons-data', 'kinsta-sync')
-    : LEGACY_CONFIG_DIR;
-  CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-  KEY_FILE = path.join(CONFIG_DIR, '.api-key.enc');
-  SITES_FILE = path.join(CONFIG_DIR, 'sites.json');
-  TEMP_DIR = path.join(CONFIG_DIR, 'tmp');
-}
-
-// Initialize config state from the Context API: capture userDataPath and the
-// safeStorage instance, then resolve the config paths.
-export function initConfig(newUserDataPath: string, newSafeStorage: SafeStorage): void {
-  userDataPath = newUserDataPath;
+// Initialize from the Context API: store everything under Local's own user
+// data dir (addons-data/ssh-sync).
+export function initConfig(userDataPath: string, newSafeStorage: SafeStorage | null = null): void {
   safeStorage = newSafeStorage;
-  resolveConfigPaths();
+  CONFIG_DIR = path.join(userDataPath, 'addons-data', DATA_DIR_NAME);
+  PROFILES_FILE = path.join(CONFIG_DIR, 'profiles.json');
+  TEMP_DIR = path.join(CONFIG_DIR, 'tmp');
+  BACKUPS_DIR = path.join(CONFIG_DIR, 'backups');
+  SECRETS_FILE = path.join(CONFIG_DIR, 'secrets.json');
 }
 
-// Accessor for the temp dir (defaultPullPushDeps needs it)
 export function getTempDir(): string {
   return TEMP_DIR;
 }
 
-// One-time migration from ~/.kinsta-sync to userDataPath.
-// IMPORTANT: the legacy dir is renamed away afterwards — if it stays, every
-// startup would re-copy "missing" files and resurrect deleted credentials
-// (e.g. the API key after a disconnect).
-export function migrateLegacyConfig(): void {
-  if (CONFIG_DIR === LEGACY_CONFIG_DIR) return;
-  if (!fs.existsSync(LEGACY_CONFIG_DIR)) return;
-  ensureConfigDir();
-  migrateConfigFiles(LEGACY_CONFIG_DIR, CONFIG_DIR);
+export function getConfigDir(): string {
+  return CONFIG_DIR;
 }
 
-// Copy any config files missing from targetDir, then rename the legacy dir away
-// so migration runs exactly once. Exported (and parameterized) so it can be
-// unit-tested with temp dirs instead of the real ~/.kinsta-sync.
-export function migrateConfigFiles(legacyDir: string, targetDir: string): void {
-  for (const file of ['config.json', '.api-key.enc', 'sites.json']) {
-    const from = path.join(legacyDir, file);
-    const to = path.join(targetDir, file);
-    if (fs.existsSync(from) && !fs.existsSync(to)) {
-      fs.copyFileSync(from, to);
-      console.log(`[Kinsta] Migrated ${file} to ${targetDir}`);
-    }
-  }
-  // Keep the old dir as a backup, but make sure migration never runs again
-  try {
-    fs.renameSync(legacyDir, `${legacyDir}.migrated`);
-    console.log(`[Kinsta] Legacy config dir renamed to ${legacyDir}.migrated`);
-  } catch (e) {
-    console.error('[Kinsta] Could not rename legacy config dir:', e);
-  }
+export function getBackupsDir(): string {
+  return BACKUPS_DIR;
 }
 
-// Config helpers
 export function ensureConfigDir(): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.mkdirSync(TEMP_DIR, { recursive: true });
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(TEMP_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true, mode: 0o700 });
 }
 
-export function loadConfig(): KinstaConfig {
+export function loadProfiles(): Record<string, SiteProfile> {
   ensureConfigDir();
-  if (fs.existsSync(CONFIG_FILE)) {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  if (fs.existsSync(PROFILES_FILE)) {
+    return JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8'));
   }
   return {};
 }
 
-export function saveConfig(config: KinstaConfig): void {
+export function saveProfiles(profiles: Record<string, SiteProfile>): void {
   ensureConfigDir();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  fs.writeFileSync(PROFILES_FILE, JSON.stringify(profiles, null, 2), { mode: 0o600 });
 }
 
-// Secure API key storage using Electron's safeStorage
-export function getApiKey(): string | null {
-  if (!fs.existsSync(KEY_FILE)) {
-    return null;
-  }
-  try {
-    const encryptedData = fs.readFileSync(KEY_FILE);
-    if (safeStorage && safeStorage.isEncryptionAvailable()) {
-      return safeStorage.decryptString(encryptedData);
-    }
-    // Security: Don't read unencrypted keys
-    console.error('Cannot read API key: encryption not available');
-    return null;
-  } catch {
-    return null;
-  }
+export function getProfile(localSiteId: string): SiteProfile | null {
+  return loadProfiles()[localSiteId] || null;
 }
 
-export function saveApiKey(apiKey: string): boolean {
-  ensureConfigDir();
-  try {
-    if (safeStorage && safeStorage.isEncryptionAvailable()) {
-      const encrypted = safeStorage.encryptString(apiKey);
-      fs.writeFileSync(KEY_FILE, encrypted);
-      // Set restrictive permissions
-      fs.chmodSync(KEY_FILE, 0o600);
-      return true;
-    } else {
-      // Security: Refuse to save if encryption is not available
-      console.error('Cannot save API key: encryption not available');
-      return false;
-    }
-  } catch (e) {
-    console.error('Failed to save API key:', e);
-    return false;
-  }
+export function findEnvironment(
+  localSiteId: string,
+  environmentId: string,
+): ServerEnvironment | null {
+  const profile = getProfile(localSiteId);
+  return profile?.environments.find((e) => e.id === environmentId) || null;
 }
 
-export function deleteApiKey(): void {
-  if (fs.existsSync(KEY_FILE)) {
-    fs.unlinkSync(KEY_FILE);
-  }
+export function saveEnvironments(localSiteId: string, environments: ServerEnvironment[]): void {
+  const profiles = loadProfiles();
+  const profile = profiles[localSiteId] || { localSiteId, environments: [] };
+  profiles[localSiteId] = { ...profile, environments };
+  saveProfiles(profiles);
 }
 
-export function loadSiteLinks(): Record<string, SiteLink> {
-  ensureConfigDir();
-  if (fs.existsSync(SITES_FILE)) {
-    return JSON.parse(fs.readFileSync(SITES_FILE, 'utf8'));
-  }
-  return {};
-}
-
-export function saveSiteLinks(links: Record<string, SiteLink>): void {
-  ensureConfigDir();
-  fs.writeFileSync(SITES_FILE, JSON.stringify(links, null, 2));
+export function deleteProfile(localSiteId: string): boolean {
+  const profiles = loadProfiles();
+  if (!profiles[localSiteId]) return false;
+  delete profiles[localSiteId];
+  saveProfiles(profiles);
+  return true;
 }
 
 export function recordSync(
   localSiteId: string,
   mode: 'pull' | 'push',
-  envType: string,
+  environment: ServerEnvironment,
   durationMs: number,
 ): void {
-  const links = loadSiteLinks();
-  const link = links[localSiteId];
-  if (!link) return;
+  const profiles = loadProfiles();
+  const profile = profiles[localSiteId];
+  if (!profile) return;
   const at = new Date().toISOString();
   if (mode === 'pull') {
-    link.lastPullAt = at;
+    profile.lastPullAt = at;
   } else {
-    link.lastPushAt = at;
+    profile.lastPushAt = at;
   }
-  link.history = [{ mode, envType, at, durationMs }, ...(link.history || [])].slice(
-    0,
-    HISTORY_LIMIT,
-  );
-  saveSiteLinks(links);
+  profile.history = [
+    {
+      mode,
+      environmentId: environment.id,
+      environmentLabel: environment.label,
+      at,
+      durationMs,
+    },
+    ...(profile.history || []),
+  ].slice(0, HISTORY_LIMIT);
+  saveProfiles(profiles);
 }
 
-// Security: Clean up old temp files on startup
+// Keep the backups of the newest pushes to one environment, delete the rest.
+// Each push leaves <prefix><stamp>.sql, <prefix><stamp>-files/ and
+// <prefix><stamp>.json; the stamp right after the prefix also keeps
+// environment `a` from matching the backups of environment `a-b`.
+export function prunePushBackups(
+  backupsDir: string,
+  localSiteId: string,
+  environmentId: string,
+  dfs: Pick<typeof fs, 'readdirSync' | 'rmSync'> = fs,
+): void {
+  const prefix = `${localSiteId}-${environmentId}-`;
+  const artifact = /^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)(\.sql|\.json|-files)$/;
+  const byStamp = new Map<string, string[]>();
+  for (const name of dfs.readdirSync(backupsDir) as string[]) {
+    if (!name.startsWith(prefix)) continue;
+    const match = name.slice(prefix.length).match(artifact);
+    if (!match) continue;
+    byStamp.set(match[1], [...(byStamp.get(match[1]) || []), name]);
+  }
+  // Only finished pushes (with a manifest) count and get pruned: what a
+  // failed push left behind is there because its rollback failed
+  const stamps = [...byStamp.keys()]
+    .filter((stamp) => byStamp.get(stamp)!.some((name) => name.endsWith('.json')))
+    .sort()
+    .reverse();
+  for (const stamp of stamps.slice(PUSH_BACKUPS_TO_KEEP)) {
+    for (const name of byStamp.get(stamp)!) {
+      try {
+        dfs.rmSync(path.join(backupsDir, name), { recursive: true, force: true });
+      } catch {
+        // A backup we could not delete is harmless; the next push retries
+      }
+    }
+  }
+}
+
+// The newest push to an environment that can still be undone
+export function latestPushManifest(
+  backupsDir: string,
+  localSiteId: string,
+  environmentId: string,
+): { base: string; manifest: any } | null {
+  const prefix = `${localSiteId}-${environmentId}-`;
+  let names: string[];
+  try {
+    names = fs.readdirSync(backupsDir);
+  } catch {
+    return null;
+  }
+  const latest = names
+    .filter(
+      (n) =>
+        n.startsWith(prefix) && /^\d{4}-\d{2}-\d{2}T[\d-]+Z\.json$/.test(n.slice(prefix.length)),
+    )
+    .sort()
+    .pop();
+  if (!latest) return null;
+  try {
+    return {
+      base: path.join(backupsDir, latest.replace(/\.json$/, '')),
+      manifest: JSON.parse(fs.readFileSync(path.join(backupsDir, latest), 'utf8')),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Leftover dumps from an interrupted session hold full database contents:
+// remove them on startup. (Pre-push backups live in BACKUPS_DIR and stay.)
 export function cleanupTempFiles(): void {
   if (!fs.existsSync(TEMP_DIR)) return;
 
   try {
-    const files = fs.readdirSync(TEMP_DIR);
-    for (const file of files) {
-      if (file.endsWith('.sql')) {
-        const filePath = path.join(TEMP_DIR, file);
+    for (const file of fs.readdirSync(TEMP_DIR)) {
+      if (file.endsWith('.sql') || file.endsWith('.txt')) {
         try {
-          fs.unlinkSync(filePath);
-          console.log(`[Kinsta] Cleaned up temp file: ${file}`);
+          fs.unlinkSync(path.join(TEMP_DIR, file));
         } catch {
           // Ignore cleanup errors
         }
@@ -191,5 +197,93 @@ export function cleanupTempFiles(): void {
     }
   } catch {
     // Ignore errors
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSH passwords: encrypted with safeStorage, keyed by environment id, never
+// returned to the renderer and never stored in profiles.json.
+// ---------------------------------------------------------------------------
+
+function loadSecrets(): Record<string, string> {
+  if (!SECRETS_FILE || !fs.existsSync(SECRETS_FILE)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(SECRETS_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function saveSecrets(secrets: Record<string, string>): void {
+  ensureConfigDir();
+  fs.writeFileSync(SECRETS_FILE, JSON.stringify(secrets, null, 2), { mode: 0o600 });
+}
+
+// On Linux without a keyring Electron falls back to `basic_text`, a hardcoded
+// key: as good as plain text, so passwords are refused there.
+export function canStorePasswords(): boolean {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) return false;
+  const backend = (
+    safeStorage as SafeStorage & { getSelectedStorageBackend?: () => string }
+  ).getSelectedStorageBackend?.();
+  return backend !== 'basic_text';
+}
+
+// Refuses (returns false) when the OS cannot encrypt: a password is never
+// written in plain text.
+export function savePassword(environmentId: string, password: string): boolean {
+  if (!canStorePasswords()) return false;
+  const secrets = loadSecrets();
+  secrets[environmentId] = safeStorage!.encryptString(password).toString('base64');
+  saveSecrets(secrets);
+  return true;
+}
+
+export function getPassword(environmentId: string): string | null {
+  const encrypted = loadSecrets()[environmentId];
+  if (!encrypted || !canStorePasswords()) return null;
+  try {
+    return safeStorage!.decryptString(Buffer.from(encrypted, 'base64'));
+  } catch {
+    return null;
+  }
+}
+
+export function hasPassword(environmentId: string): boolean {
+  return Boolean(loadSecrets()[environmentId]);
+}
+
+// Drop the passwords of every environment not in `keepIds`
+export function prunePasswords(keepIds: Set<string>): void {
+  const secrets = loadSecrets();
+  const kept = Object.fromEntries(Object.entries(secrets).filter(([id]) => keepIds.has(id)));
+  if (Object.keys(kept).length !== Object.keys(secrets).length) saveSecrets(kept);
+}
+
+// What the safe-copy step changed in a Local site's database, so a database
+// push can put it back on the server (see safeClone.ts). No secrets inside.
+function neutralizeRecordFile(localSiteId: string): string {
+  return path.join(CONFIG_DIR, 'neutralized', `${localSiteId.replace(/[^A-Za-z0-9_-]/g, '')}.json`);
+}
+
+export function saveNeutralizeRecord(localSiteId: string, record: NeutralizeRecord | null): void {
+  const file = neutralizeRecordFile(localSiteId);
+  if (!record) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // none saved
+    }
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, JSON.stringify(record, null, 2), { mode: 0o600 });
+}
+
+export function loadNeutralizeRecord(localSiteId: string): NeutralizeRecord | null {
+  try {
+    return JSON.parse(fs.readFileSync(neutralizeRecordFile(localSiteId), 'utf8'));
+  } catch {
+    return null;
   }
 }

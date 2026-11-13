@@ -2,38 +2,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
 
-import { EnvironmentInfo, RsyncInfo, PushDiffRow, SiteInfo } from './types';
+import { RsyncInfo, PushDiffRow, SiteInfo } from './types';
 import { expandPath } from './validators';
 
-// The per-sync local webroot + SSH target shared by every rsync invocation
-// (pull, push, and the dry-run preview).
-export function rsyncSshContext(
-  site: SiteInfo,
-  envInfo: EnvironmentInfo,
-): { localPublicPath: string; sshCommandForRsync: string; remoteHost: string } {
-  return {
-    localPublicPath: path.join(expandPath(site.path), 'app', 'public'),
-    sshCommandForRsync: `ssh -p ${envInfo.sshPort} -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -o ServerAliveCountMax=120`,
-    remoteHost: `${envInfo.sshUser}@${envInfo.sshHost}`,
-  };
-}
-
-export function sshArgs(envInfo: EnvironmentInfo, remoteCmd: string): string[] {
-  return [
-    '-p',
-    envInfo.sshPort,
-    '-o',
-    'StrictHostKeyChecking=accept-new',
-    // Keep the connection alive on long-running steps (big rsync, slow
-    // mysqldump/import) so an idle NAT/firewall can't drop the channel
-    // mid-sync: probe every 60s, give up only after 120 missed probes.
-    '-o',
-    'ServerAliveInterval=60',
-    '-o',
-    'ServerAliveCountMax=120',
-    `${envInfo.sshUser}@${envInfo.sshHost}`,
-    remoteCmd,
-  ];
+// The Local site's WordPress root (the local side of every rsync)
+export function localPublicPath(site: SiteInfo): string {
+  return path.join(expandPath(site.path), 'app', 'public');
 }
 
 // Human-readable warning for an rsync partial transfer (exit 23/24), or null
@@ -44,7 +18,7 @@ export function describePartialTransfer(result: { code: number; stderr: string }
   if (result.code === 0) return null;
   const failed = (result.stderr.match(/failed:|cannot /g) || []).length;
   console.warn(
-    '[Kinsta] rsync partial transfer (code',
+    '[SSH Sync] rsync partial transfer (code',
     result.code,
     '):',
     result.stderr.slice(-2000),
@@ -259,7 +233,8 @@ export function buildPushRsyncArgs(opts: {
   excludeArgs: string[];
   sshCommand: string;
   localPublicPath: string;
-  remoteHost: string;
+  // `target:/abs/wordpress/root/`
+  remoteRoot: string;
   mode?: 'newer' | 'all';
   filesFromPath?: string;
 }): string[] {
@@ -271,6 +246,6 @@ export function buildPushRsyncArgs(opts: {
   }
   if (opts.mode === 'newer') args.push('--update');
   args.push(...rsyncProgressArgs(opts.rsync), ...opts.excludeArgs);
-  args.push('-e', opts.sshCommand, `${opts.localPublicPath}/`, `${opts.remoteHost}:~/public/`);
+  args.push('-e', opts.sshCommand, `${opts.localPublicPath}/`, opts.remoteRoot);
   return args;
 }

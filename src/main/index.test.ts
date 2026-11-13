@@ -1,21 +1,28 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import {
   isValidHostname,
   isValidPort,
   isValidUsername,
   isValidDomain,
-  validateEnvironmentInfo,
+  isValidRemotePath,
+  isValidRemoteCommand,
+  remoteDomainFromUrl,
+  validateEnvironment,
   expandPath,
   describePartialTransfer,
-  sshArgs,
   rsyncProgressArgs,
   makeRsyncProgressParser,
   getDbCredentials,
   searchReplacePairs,
   isLikelyValidSqlDump,
-  isTransientApiError,
   EXCLUDE_PATTERNS,
-  EnvironmentInfo,
+  ServerEnvironment,
+  RemoteConnection,
   RsyncInfo,
   parseItemizeLine,
   parseItemizeOutput,
@@ -25,25 +32,77 @@ import {
   parseTablePrefix,
   setTablePrefix,
   normalizeTablePrefix,
-  rsyncSshContext,
   downgradeMySQL8Collations,
   downgradeMariaDBCollations,
+  shellQuote,
+  remoteCdPath,
+  sshTarget,
+  baseSshOptions,
+  masterSshArgs,
+  askpassEnvironment,
+  askpassHelperPath,
+  serveAskpass,
+  removeControlDir,
+  sweepStaleControlDirs,
+  openRemoteConnection,
+  sshArgs,
+  scpArgs,
+  rsyncRemoteShell,
+  rsyncRemoteRoot,
+  remoteWp,
+  REMOTE_MKTEMP,
+  parseRemoteTempPath,
+  remoteProbeCommand,
+  parseRemoteProbe,
+  parseSshConfigHosts,
+  normalizeEnvironments,
+  productionDatabaseGuard,
+  pullSourceDomains,
+  pushTargetDomain,
+  endProgress,
+  siteUrlMismatch,
+  parseAddedFromOutFormat,
+  moveListedToBackupCommand,
+  outermostPaths,
+  isSafeListedPath,
+  releaseLockCommand,
+  changedSinceCommand,
+  changedSinceLines,
+  acquireLockCommand,
+  parseLockOutput,
+  lockDir,
+  ensureLocalCopyConfig,
+  restoreNeutralizedScript,
+  parseNeutralizeOutput,
 } from './index';
 
-const env = (overrides: Partial<EnvironmentInfo> = {}): EnvironmentInfo => ({
-  envId: 'env-1',
-  envType: 'live',
+const env = (overrides: Partial<ServerEnvironment> = {}): ServerEnvironment => ({
+  id: 'production',
+  label: 'Production',
   sshHost: '35.1.2.3',
   sshPort: '12345',
-  sshUser: 'gbdbutik',
-  remoteDomain: 'gbdbutik.se',
+  sshUser: 'deploy',
+  auth: 'key',
+  remotePath: '/var/www/example.com',
+  remoteUrl: 'https://example.com',
+  wpCommand: 'wp',
+  extraExcludes: [],
+  isProduction: true,
+  ...overrides,
+});
+
+const connection = (overrides: Partial<RemoteConnection> = {}): RemoteConnection => ({
+  target: 'deploy@35.1.2.3',
+  sshOptions: baseSshOptions(env(), '/tmp/ssh-sync-x/cm-1'),
+  remoteRoot: '/var/www/example.com',
+  close: async () => {},
   ...overrides,
 });
 
 describe('injection guards (validators)', () => {
   it('accepts normal hosts', () => {
     expect(isValidHostname('35.1.2.3')).toBe(true);
-    expect(isValidHostname('ssh.kinsta.cloud')).toBe(true);
+    expect(isValidHostname('sv02.example.net')).toBe(true);
   });
 
   it('rejects shell metacharacters in hostnames', () => {
@@ -69,53 +128,255 @@ describe('injection guards (validators)', () => {
   });
 
   it('rejects dangerous usernames and domains', () => {
-    expect(isValidUsername('gbdbutik')).toBe(true);
+    expect(isValidUsername('deploy')).toBe(true);
     expect(isValidUsername('user name')).toBe(false);
     expect(isValidUsername('user;id')).toBe(false);
-    expect(isValidDomain('gbdbutik.se')).toBe(true);
+    expect(isValidUsername('-J')).toBe(false);
+    expect(isValidUsername('first.last')).toBe(true);
+    expect(isValidDomain('example.com')).toBe(true);
     expect(isValidDomain("dom'ain.se")).toBe(false);
   });
 
-  it('validateEnvironmentInfo requires every field to pass', () => {
-    expect(validateEnvironmentInfo(env())).toBe(true);
-    expect(validateEnvironmentInfo(env({ sshHost: 'host;evil' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ sshPort: '99999' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ sshUser: 'a b' }))).toBe(false);
-    expect(validateEnvironmentInfo(env({ remoteDomain: '$(x).se' }))).toBe(false);
+  it('accepts absolute and ~-relative WordPress folders only', () => {
+    for (const ok of ['/var/www/example.com', '~/public_html', '~', '/home/u/webapps/app']) {
+      expect(isValidRemotePath(ok), ok).toBe(true);
+    }
+    for (const bad of [
+      'public_html',
+      '/var/www/../etc',
+      '/var/www/$(id)',
+      "/var/www/a'b",
+      '/var/www/a b',
+      '~root/x',
+      '',
+    ]) {
+      expect(isValidRemotePath(bad), bad).toBe(false);
+    }
+  });
+
+  it('accepts plain WP-CLI invocations and rejects shell syntax', () => {
+    for (const ok of ['wp', 'php8.2 /usr/local/bin/wp', 'php -d memory_limit=512M ~/wp-cli.phar']) {
+      expect(isValidRemoteCommand(ok), ok).toBe(true);
+    }
+    for (const bad of ['wp; rm -rf /', 'wp && id', 'wp | sh', '$(id)', 'wp `id`', 'wp  x', '']) {
+      expect(isValidRemoteCommand(bad), bad).toBe(false);
+    }
+  });
+
+  it('derives the search-replace domain from the site URL', () => {
+    expect(remoteDomainFromUrl('https://example.com')).toBe('example.com');
+    expect(remoteDomainFromUrl('https://example.com/')).toBe('example.com');
+    expect(remoteDomainFromUrl('https://example.com/blog/')).toBe('example.com/blog');
+    expect(remoteDomainFromUrl('http://example.com:8080')).toBe('example.com:8080');
+    expect(remoteDomainFromUrl('example.com')).toBeNull();
+    expect(remoteDomainFromUrl('ftp://example.com')).toBeNull();
+    expect(remoteDomainFromUrl('https://example.com/?x=1')).toBeNull();
+  });
+
+  it('validateEnvironment reports the first problem', () => {
+    expect(validateEnvironment(env())).toBeNull();
+    expect(validateEnvironment(env({ sshHost: undefined, sshAlias: 'example' }))).toBeNull();
+    expect(validateEnvironment(env({ sshHost: 'host;evil' }))).toMatch(/host/i);
+    expect(validateEnvironment(env({ sshPort: '99999' }))).toMatch(/port/i);
+    expect(validateEnvironment(env({ sshUser: 'a b' }))).toMatch(/user/i);
+    expect(validateEnvironment(env({ sshAlias: '-oProxyCommand=x' }))).toMatch(/alias/i);
+    expect(validateEnvironment(env({ remotePath: 'relative' }))).toMatch(/folder/i);
+    expect(validateEnvironment(env({ remoteUrl: 'nope' }))).toMatch(/URL/);
+    expect(validateEnvironment(env({ wpCommand: 'wp;id' }))).toMatch(/WP-CLI/);
+    expect(validateEnvironment(env({ cacheCommand: 'wp cache flush && id' }))).toMatch(/cache/);
+    expect(validateEnvironment(env({ extraExcludes: ['ok/', 'x;y'] }))).toMatch(/exclude/);
+    expect(validateEnvironment(env({ label: ' ' }))).toMatch(/name/);
   });
 });
 
-describe('sshArgs', () => {
-  it('builds args as an array (no shell string)', () => {
-    expect(sshArgs(env(), 'wp db export /tmp/x.sql')).toEqual([
-      '-p',
-      '12345',
-      '-o',
-      'StrictHostKeyChecking=accept-new',
-      '-o',
-      'ServerAliveInterval=60',
-      '-o',
-      'ServerAliveCountMax=120',
-      'gbdbutik@35.1.2.3',
-      'wp db export /tmp/x.sql',
+describe('normalizeEnvironments', () => {
+  it('drops unknown fields, fills defaults and assigns an id', () => {
+    const result = normalizeEnvironments([
+      {
+        label: 'Staging',
+        sshAlias: 'staging-host',
+        sshHost: 'ignored.example',
+        remotePath: '/var/www/staging/',
+        remoteUrl: 'https://staging.example.com/',
+        extraExcludes: [' wp-content/litespeed/ ', ''],
+        ...({ evil: true } as object),
+      } as Partial<ServerEnvironment>,
     ]);
+    expect('environments' in result).toBe(true);
+    const [e] = (result as { environments: ServerEnvironment[] }).environments;
+    expect(e.id).toMatch(/^[a-f0-9]{12}$/);
+    expect(e.sshHost).toBeUndefined();
+    expect(e.remotePath).toBe('/var/www/staging');
+    expect(e.remoteUrl).toBe('https://staging.example.com');
+    expect(e.wpCommand).toBe('wp');
+    expect(e.auth).toBe('key');
+    expect(e.isProduction).toBe(false);
+    expect(e.extraExcludes).toEqual(['wp-content/litespeed/']);
+    expect(e).not.toHaveProperty('evil');
+  });
+
+  it('rejects the save when one environment is invalid', () => {
+    const result = normalizeEnvironments([env(), env({ label: 'Bad', remotePath: 'x' })]);
+    expect(result).toEqual({ error: expect.stringContaining('Bad') });
+  });
+});
+
+describe('productionDatabaseGuard', () => {
+  it('lets files-only pushes and non-production databases through', () => {
+    expect(productionDatabaseGuard(env(), { includeDatabase: false })).toBeNull();
+    expect(
+      productionDatabaseGuard(env({ isProduction: false }), { includeDatabase: true }),
+    ).toBeNull();
+  });
+
+  it('needs Migration mode AND the typed domain for a production database', () => {
+    expect(productionDatabaseGuard(env(), { includeDatabase: true })).toMatch(/Migration mode/);
+    expect(productionDatabaseGuard(env(), { includeDatabase: true, migrationMode: true })).toMatch(
+      /example\.com/,
+    );
+    expect(
+      productionDatabaseGuard(env(), {
+        includeDatabase: true,
+        migrationMode: true,
+        confirmDomain: 'other.com',
+      }),
+    ).not.toBeNull();
+    expect(
+      productionDatabaseGuard(env(), {
+        includeDatabase: true,
+        migrationMode: true,
+        confirmDomain: 'example.com',
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('ssh helpers', () => {
+  it('quotes anything for a POSIX shell', () => {
+    expect(shellQuote("it's")).toBe(`'it'\\''s'`);
+    expect(shellQuote('/var/www/x')).toBe(`'/var/www/x'`);
+  });
+
+  it('keeps a leading ~ expandable when quoting a path for cd', () => {
+    expect(remoteCdPath('~')).toBe('~');
+    expect(remoteCdPath('~/public_html')).toBe(`~/'public_html'`);
+    expect(remoteCdPath('/var/www/x')).toBe(`'/var/www/x'`);
+  });
+
+  it('targets the alias when there is one, user@host otherwise', () => {
+    expect(sshTarget(env())).toBe('deploy@35.1.2.3');
+    expect(sshTarget(env({ sshAlias: 'example' }))).toBe('example');
+  });
+
+  it('passes the port as -o Port (shared by ssh, scp and rsync), never with an alias', () => {
+    expect(baseSshOptions(env())).toContain('Port=12345');
+    expect(baseSshOptions(env({ sshAlias: 'example' })).join(' ')).not.toContain('Port=');
   });
 
   it('keeps the SSH connection alive on long syncs (keepalive)', () => {
-    // A long mysqldump/import or a big rsync can idle the channel long enough
-    // for a NAT/firewall to drop it. ServerAlive* makes ssh probe the peer.
-    const args = sshArgs(env(), 'wp db export /tmp/x.sql');
-    expect(args).toContain('ServerAliveInterval=60');
-    expect(args).toContain('ServerAliveCountMax=120');
+    const options = baseSshOptions(env());
+    expect(options).toContain('ServerAliveInterval=60');
+    expect(options).toContain('ServerAliveCountMax=120');
   });
-});
 
-describe('rsyncSshContext', () => {
-  it('applies the same SSH keepalive to the rsync transport', () => {
-    const { sshCommandForRsync } = rsyncSshContext({ path: '/tmp/site' } as any, env());
-    expect(sshCommandForRsync).toContain('-o ServerAliveInterval=60');
-    expect(sshCommandForRsync).toContain('-o ServerAliveCountMax=120');
-    expect(sshCommandForRsync).toContain('-p 12345');
+  it('reuses the multiplexed master without ever becoming one', () => {
+    const options = baseSshOptions(env(), '/tmp/cm-1');
+    expect(options).toContain('ControlPath=/tmp/cm-1');
+    expect(options).toContain('ControlMaster=no');
+    // A client never authenticates on its own (no prompt if the master died)
+    expect(options).toContain('BatchMode=yes');
+  });
+
+  it('keeps the master in the foreground even when ssh_config sets ControlPersist', () => {
+    const args = masterSshArgs(env({ sshAlias: 'example' }), '/tmp/cm-1');
+    expect(args).toContain('ControlPersist=no');
+    expect(args).toContain('ControlMaster=yes');
+    expect(args).toContain('ControlPath=/tmp/cm-1');
+    expect(args).toContain('BatchMode=yes');
+    expect(args.slice(-2)).toEqual(['-N', 'example']);
+  });
+
+  it('builds ssh and scp args as arrays (no local shell string)', () => {
+    const c = connection();
+    expect(sshArgs(c, 'pwd').slice(-2)).toEqual(['deploy@35.1.2.3', 'pwd']);
+    expect(scpArgs(c, 'a', 'b').slice(-2)).toEqual(['a', 'b']);
+    expect(sshArgs(c, 'pwd')).toContain('StrictHostKeyChecking=accept-new');
+  });
+
+  it('gives rsync the same ssh options and the resolved WordPress root', () => {
+    const c = connection();
+    expect(rsyncRemoteShell(c)).toBe(['ssh', ...c.sshOptions].join(' '));
+    expect(rsyncRemoteShell(c)).toContain('-o ServerAliveInterval=60');
+    expect(rsyncRemoteRoot(c)).toBe('deploy@35.1.2.3:/var/www/example.com/');
+  });
+
+  it('runs WP-CLI from the quoted WordPress root with the configured command', () => {
+    expect(
+      remoteWp(connection(), env({ wpCommand: 'php8.2 ~/wp' }), 'config get table_prefix'),
+    ).toBe(`cd '/var/www/example.com' && php8.2 ~/wp config get table_prefix`);
+  });
+
+  it('creates remote temp files privately in home, never in /tmp', () => {
+    expect(REMOTE_MKTEMP).toBe('mktemp "$HOME/.ssh-sync-XXXXXXXX"');
+  });
+
+  it('accepts only a mktemp path it created', () => {
+    expect(parseRemoteTempPath('/home/u/.ssh-sync-Ab12Cd34\n')).toBe('/home/u/.ssh-sync-Ab12Cd34');
+    expect(parseRemoteTempPath('banner\n/home/u/.ssh-sync-Ab12Cd34\n')).toBe(
+      '/home/u/.ssh-sync-Ab12Cd34',
+    );
+    expect(parseRemoteTempPath('/home/u+x@y/.ssh-sync-Ab12Cd34')).toBe(
+      '/home/u+x@y/.ssh-sync-Ab12Cd34',
+    );
+    expect(parseRemoteTempPath('/etc/passwd')).toBeNull();
+    expect(parseRemoteTempPath('/home/u/.ssh-sync-x; rm -rf /')).toBeNull();
+    expect(parseRemoteTempPath('')).toBeNull();
+  });
+
+  it('probes the folder, rsync and WP-CLI and reports the resolved root', () => {
+    const command = remoteProbeCommand(env({ remotePath: '~/public_html' }));
+    expect(command).toContain(`cd ~/'public_html'`);
+    expect(command).toContain('core is-installed');
+    expect(command).toContain(`-name '.ssh-sync-????????' -mmin +120 -delete`);
+    expect(
+      parseRemoteProbe(
+        'SSHSYNC_PROBE_ROOT=/home/u/public_html\nSSHSYNC_PROBE_URL=https://example.com/wp\nSSHSYNC_PROBE_HOMEURL=https://example.com\nSSHSYNC_PROBE_HOME=/home/u\nSSHSYNC_PROBE=ok\n',
+      ),
+    ).toEqual({
+      ok: true,
+      remoteRoot: '/home/u/public_html',
+      siteUrl: 'https://example.com/wp',
+      homeUrl: 'https://example.com',
+      remoteHome: '/home/u',
+    });
+    // through WordPress, so WP_SITEURL/WP_HOME in wp-config count
+    expect(command).toContain('site_url()');
+    expect(command).toContain('home_url()');
+    expect(parseRemoteProbe('SSHSYNC_PROBE=path\n')).toEqual({ ok: false, reason: 'path' });
+    expect(parseRemoteProbe('SSHSYNC_PROBE_ROOT=/x\nSSHSYNC_PROBE=wp\n')).toEqual({
+      ok: false,
+      reason: 'wp',
+    });
+    expect(parseRemoteProbe('Welcome!\n')).toEqual({ ok: false, reason: 'unexpected' });
+    expect(
+      parseRemoteProbe('SSHSYNC_PROBE_ROOT=/a b\nSSHSYNC_PROBE_HOME=/h\nSSHSYNC_PROBE=ok\n'),
+    ).toEqual({
+      ok: false,
+      reason: 'unexpected',
+    });
+  });
+
+  it('lists connectable hosts from ssh_config, skipping patterns', () => {
+    const config = [
+      'Host *',
+      '  ServerAliveInterval 30',
+      'Host example.com example',
+      '  HostName 1.2.3.4',
+      'host staging-box',
+      'Host !bad *.internal',
+      'Match host x',
+    ].join('\n');
+    expect(parseSshConfigHosts(config)).toEqual(['example', 'example.com', 'staging-box']);
   });
 });
 
@@ -420,7 +681,7 @@ describe('buildPushRsyncArgs', () => {
     excludeArgs: ['--exclude=.git'],
     sshCommand: 'ssh -p 22',
     localPublicPath: '/x/app/public',
-    remoteHost: 'u@h',
+    remoteRoot: 'u@h:/var/www/x/',
   };
 
   it('full push keeps --delete', () => {
@@ -442,7 +703,7 @@ describe('buildPushRsyncArgs', () => {
 
   it('always ends with -e ssh, source, destination', () => {
     const args = buildPushRsyncArgs({ ...base, mode: 'all' });
-    expect(args.slice(-4)).toEqual(['-e', 'ssh -p 22', '/x/app/public/', 'u@h:~/public/']);
+    expect(args.slice(-4)).toEqual(['-e', 'ssh -p 22', '/x/app/public/', 'u@h:/var/www/x/']);
   });
 });
 
@@ -460,30 +721,9 @@ describe('isLikelyValidSqlDump', () => {
   });
 });
 
-describe('isTransientApiError', () => {
-  it('treats network errors (no response) as transient', () => {
-    expect(isTransientApiError({ code: 'ECONNABORTED' })).toBe(true);
-    expect(isTransientApiError(new Error('socket hang up'))).toBe(true);
-  });
-  it('treats 5xx and 429 as transient', () => {
-    expect(isTransientApiError({ response: { status: 500 } })).toBe(true);
-    expect(isTransientApiError({ response: { status: 503 } })).toBe(true);
-    expect(isTransientApiError({ response: { status: 429 } })).toBe(true);
-  });
-  it('does NOT retry 4xx (auth, not-found, bad request)', () => {
-    expect(isTransientApiError({ response: { status: 401 } })).toBe(false);
-    expect(isTransientApiError({ response: { status: 404 } })).toBe(false);
-    expect(isTransientApiError({ response: { status: 400 } })).toBe(false);
-  });
-  it('handles null/undefined safely', () => {
-    expect(isTransientApiError(null)).toBe(false);
-    expect(isTransientApiError(undefined)).toBe(false);
-  });
-});
-
 describe('downgradeMySQL8Collations', () => {
   // Local ships MySQL 8.x, whose default utf8mb4 collation is utf8mb4_0900_*.
-  // Kinsta runs MariaDB, which doesn't know those collations → `wp db import`
+  // MariaDB servers don't know those collations → `wp db import`
   // fails with "Unknown collation". Rewrite them to a widely-supported one.
   it('rewrites the MySQL 8 default collation in CREATE TABLE (COLLATE=)', () => {
     const sql =
@@ -520,7 +760,7 @@ describe('downgradeMySQL8Collations', () => {
 });
 
 describe('downgradeMariaDBCollations', () => {
-  // The mirror image of the push case: Kinsta's MariaDB 11.4+ defaults utf8mb4
+  // The mirror image of the push case: MariaDB 11.4+ defaults utf8mb4
   // to utf8mb4_uca1400_*, which Local's MySQL 8 doesn't know → the pull import
   // fails with "Unknown collation: 'utf8mb4_uca1400_ai_ci'".
   it('rewrites the MariaDB 11.4 default collation in CREATE TABLE (COLLATE=)', () => {
@@ -567,13 +807,15 @@ describe('EXCLUDE_PATTERNS', () => {
       '.htaccess',
       '*.sql',
       'node_modules/',
-      'wp-content/mu-plugins/kinsta-mu-plugins/',
       'local-xdebuginfo.php',
+      // Our safety mu-plugin for pulled copies must never reach a server
+      'wp-content/mu-plugins/ssh-sync-local-safety.php',
       // Host-specific persistent-cache drop-ins: object-cache.php points at the
       // host's Redis/Memcached, advanced-cache.php at its page cache. Syncing
       // either way would point one host at the other's cache backend.
       'wp-content/object-cache.php',
       'wp-content/advanced-cache.php',
+      'wp-content/.litespeed_conf.php',
     ]) {
       expect(EXCLUDE_PATTERNS).toContain(required);
     }
@@ -658,5 +900,318 @@ describe('EXCLUDE_PATTERNS', () => {
     // page-cache exclude must be anchored to wp-content/cache.
     expect(EXCLUDE_PATTERNS).not.toContain('cache/');
     expect(EXCLUDE_PATTERNS).toContain('wp-content/cache/');
+  });
+});
+
+describe('password authentication', () => {
+  afterAll(() => removeControlDir());
+
+  it('tries the password once, never keys, and never batch mode', () => {
+    const args = masterSshArgs(env({ auth: 'password' }), '/tmp/cm-1');
+    expect(args).toContain('PubkeyAuthentication=no');
+    expect(args).toContain('NumberOfPasswordPrompts=1');
+    expect(args).not.toContain('BatchMode=yes');
+  });
+
+  it('points ssh at the askpass helper without putting the password in the environment', () => {
+    const environment = askpassEnvironment('/tmp/x/askpass.sh', '/tmp/x/ap-1');
+    expect(environment.SSH_ASKPASS).toBe('/tmp/x/askpass.sh');
+    expect(environment.SSH_ASKPASS_REQUIRE).toBe('force');
+    expect(environment.SSHSYNC_ASKPASS_SOCKET).toBe('/tmp/x/ap-1');
+    expect(Object.values(environment)).not.toContain('s3cret');
+  });
+
+  it('the helper prints the password served on the socket, once per answer', async () => {
+    const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-test-')), 'ap');
+    const server = serveAskpass(socketPath, "pa ss'word", 1);
+    const helper = askpassHelperPath();
+    const { stdout } = await promisify(execFile)(helper, [], {
+      env: askpassEnvironment(helper, socketPath),
+    });
+    expect(stdout).toBe("pa ss'word\n");
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(path.dirname(socketPath), { recursive: true, force: true });
+  });
+
+  it('refuses to connect a password environment with no password', async () => {
+    await expect(
+      openRemoteConnection(env({ auth: 'password' }), async () => ({ code: 0, stderr: '' }), null),
+    ).rejects.toThrow(/No password saved/);
+  });
+});
+
+describe('ensureLocalCopyConfig', () => {
+  const settings = "require_once ABSPATH . 'wp-settings.php';\n";
+
+  it('adds the safety constant and WP_ENVIRONMENT_TYPE before wp-settings.php', () => {
+    const out = ensureLocalCopyConfig(`<?php\n${settings}`);
+    expect(out).toContain("define( 'SSH_SYNC_LOCAL_COPY', true );");
+    expect(out).toContain("define( 'WP_ENVIRONMENT_TYPE', 'local' );");
+    expect(out.indexOf('SSH_SYNC_LOCAL_COPY')).toBeLessThan(out.indexOf('wp-settings'));
+  });
+
+  it('switches a literal WP_ENVIRONMENT_TYPE to local and is idempotent', () => {
+    const once = ensureLocalCopyConfig(
+      `<?php\ndefine( 'WP_ENVIRONMENT_TYPE', 'production' );\n/* That's all, stop editing! */\n${settings}`,
+    );
+    expect(once).not.toContain("'production'");
+    expect(ensureLocalCopyConfig(once)).toBe(once);
+    expect(once.match(/SSH_SYNC_LOCAL_COPY/g)).toHaveLength(1);
+  });
+
+  it('leaves a non-literal WP_ENVIRONMENT_TYPE alone instead of redefining it', () => {
+    const out = ensureLocalCopyConfig(
+      `<?php\ndefine( 'WP_ENVIRONMENT_TYPE', getenv( 'ENV' ) );\n${settings}`,
+    );
+    expect(out.match(/WP_ENVIRONMENT_TYPE/g)).toHaveLength(1);
+    expect(out).toContain("define( 'SSH_SYNC_LOCAL_COPY', true );");
+  });
+});
+
+describe('restoreNeutralizedScript', () => {
+  it('embeds the record as base64 and only touches options tables it recognizes', () => {
+    const script = restoreNeutralizedScript({
+      options: { options: { deactivated: ["evil'/x.php"], stripeTestmode: 'no' } },
+      sitewideDeactivated: {},
+    });
+    expect(script).not.toContain("evil'");
+    expect(script).toContain('base64_decode');
+    expect(script).toContain("preg_match( '/^([0-9]+_)?options$/', $suffix )");
+    expect(script).toContain('wp_cache_flush()');
+  });
+});
+
+describe('parseNeutralizeOutput', () => {
+  it('reads the JSON summary and rejects anything else', () => {
+    expect(
+      parseNeutralizeOutput(
+        '{"deactivated":["a/a.php"],"stripe":false,"record":{"options":{"options":{"deactivated":["a/a.php"],"stripeTestmode":null}},"sitewideDeactivated":[]}}',
+      ),
+    ).toEqual({
+      deactivated: ['a/a.php'],
+      stripe: false,
+      record: {
+        options: { options: { deactivated: ['a/a.php'], stripeTestmode: null } },
+        sitewideDeactivated: {},
+      },
+    });
+    expect(parseNeutralizeOutput('Warning: x')).toBeNull();
+  });
+});
+
+describe('control dir cleanup', () => {
+  it('sweeps only our own stale dirs', () => {
+    const tmp = os.tmpdir();
+    const stale = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    const fresh = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    const other = fs.mkdtempSync(path.join(tmp, 'not-ours-'));
+    const foreign = fs.mkdtempSync(path.join(tmp, 'ssh-sync-'));
+    fs.writeFileSync(path.join(foreign, 'someone-elses.txt'), 'x');
+    fs.writeFileSync(path.join(stale, 'askpass.sh'), '#!/bin/sh');
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(stale, old, old);
+    fs.utimesSync(other, old, old);
+    fs.utimesSync(foreign, old, old);
+    sweepStaleControlDirs();
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    expect(fs.existsSync(other)).toBe(true);
+    expect(fs.existsSync(foreign)).toBe(true); // same prefix, not our content
+    fs.rmSync(foreign, { recursive: true });
+    fs.rmSync(fresh, { recursive: true });
+    fs.rmSync(other, { recursive: true });
+  });
+});
+
+describe('siteUrlMismatch', () => {
+  it('accepts the configured site whatever the scheme, www or trailing slash', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com')).toBeNull();
+    expect(siteUrlMismatch(env(), 'http://example.com/')).toBeNull();
+    expect(siteUrlMismatch(env(), 'https://www.example.com')).toBeNull();
+    expect(
+      siteUrlMismatch(env({ remoteUrl: 'https://www.example.com' }), 'https://example.com'),
+    ).toBeNull();
+  });
+
+  it('accepts WordPress in a subfolder through the home URL', () => {
+    expect(siteUrlMismatch(env(), 'https://example.com/wp', 'https://example.com')).toBeNull();
+  });
+
+  it('reports a folder that holds another site, or no readable URL', () => {
+    expect(siteUrlMismatch(env(), 'https://other.com')).toMatch(
+      /says it is https:\/\/other\.com, not https:\/\/example\.com/,
+    );
+    expect(siteUrlMismatch(env(), '')).toMatch(/Could not read the site URL/);
+  });
+});
+
+describe('push backups and lock', () => {
+  it('reads new files and folders from rsync out-format lines', () => {
+    expect(
+      parseAddedFromOutFormat(
+        [
+          'SSHSYNC|<f+++++++++|a/new.php',
+          'SSHSYNC|cd+++++++++|a/dir/',
+          'SSHSYNC|<f.st......|a/changed.php',
+          'SSHSYNC|.d..t......|./',
+          '   1,234  42%  progress\rSSHSYNC|<f+++++++++|after-progress.php',
+          'SSHSYNC|cL+++++++++|a/link',
+          'SSHSYNC|cL.......|a/old-link',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      files: ['a/new.php', 'after-progress.php'],
+      dirs: ['a/dir'],
+      links: ['a/link'],
+      updated: ['a/changed.php'],
+      deleted: [],
+    });
+    expect(parseAddedFromOutFormat('SSHSYNC|*deleting|old dir/ x.php\n')).toMatchObject({
+      deleted: ['old dir/ x.php'],
+    });
+  });
+
+  it('moves deletions into the backup folder, never nested, never through quoting', () => {
+    expect(outermostPaths(['foo/a.php', 'foo', 'bar/b.php', 'foobar/c.php'])).toEqual([
+      'foo',
+      'bar/b.php',
+      'foobar/c.php',
+    ]);
+    const command = moveListedToBackupCommand('/home/u/.ssh-sync-files-x');
+    expect(command).toContain('while IFS= read -r p');
+    expect(command).toContain(`mv -- "$p" "$b/$p"`);
+    expect(command).not.toContain('rm ');
+    expect(isSafeListedPath('caf\u00e9 (1) & $x.jpg')).toBe(true);
+    for (const bad of ['/etc/passwd', '../x', 'a/../b', 'a\nb', '', 'a//b', './a']) {
+      expect(isSafeListedPath(bad), bad).toBe(false);
+    }
+  });
+
+  it('locks per server folder with an atomic mkdir and reports the holder', () => {
+    const lock = lockDir('/home/u', '/var/www/a');
+    expect(lock).toMatch(/^\/home\/u\/\.ssh-sync-lock-[0-9a-f]{12}$/);
+    expect(lockDir('/home/u', '/var/www/b')).not.toBe(lock);
+    const acquire = acquireLockCommand(lock, "me's mac", 'tok123');
+    expect(acquire).toContain(`l='${lock}'`);
+    expect(acquire).toContain('if mkdir "$l"');
+    // A dead lock is taken over by an atomic rename, never by rm then mkdir
+    expect(acquire).toContain('mv "$l" "$l.stale.$$"');
+    expect(acquire).toContain(`'tok123' > "$l/token"`);
+    expect(releaseLockCommand(lock, 'tok123')).toContain(`= 'tok123' ] && rm -rf`);
+    expect(parseLockOutput('SSHSYNC_LOCK=ok\n')).toEqual({ ok: true });
+    expect(parseLockOutput('SSHSYNC_LOCK=busy mac (site) since x\n')).toEqual({
+      ok: false,
+      owner: 'mac (site) since x',
+    });
+  });
+});
+
+describe("changedSinceCommand (run for real with this machine's sh)", () => {
+  it('reports files whose size or mtime changed and deletions that came back, keeping spaces', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-changed-'));
+    const same = ' lead and trail .txt ';
+    fs.writeFileSync(path.join(dir, same), 'abc');
+    fs.writeFileSync(path.join(dir, 'edited.php'), 'abcdef');
+    fs.writeFileSync(path.join(dir, 'café (1).txt'), 'x');
+    const stat = (f: string) => {
+      const st = fs.statSync(path.join(dir, f));
+      return [st.size, Math.floor(st.mtimeMs / 1000)] as [number, number];
+    };
+    const lines = changedSinceLines(
+      { [same]: stat(same), 'edited.php': [3, stat('edited.php')[1]] },
+      ['café (1).txt', 'still-gone.txt'],
+    );
+    const input = path.join(dir, 'list');
+    fs.writeFileSync(input, `${lines.join('\n')}\n`);
+    const { stdout } = await promisify(execFile)('sh', [
+      '-c',
+      `cd "$1" && { ${changedSinceCommand()}; } < "$2"`,
+      'sh',
+      dir,
+      input,
+    ]);
+    expect(stdout.trim().split('\n').sort()).toEqual([
+      'SSHSYNC_CHANGED|café (1).txt',
+      'SSHSYNC_CHANGED|edited.php',
+    ]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("acquireLockCommand (run for real with this machine's sh)", () => {
+  const sh = (command: string, env: NodeJS.ProcessEnv = process.env) =>
+    promisify(execFile)('sh', ['-c', command], { env });
+  const makeStale = (dir: string) => {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'owner'), 'old mac\n');
+    const old = new Date(Date.now() - 400 * 60 * 1000);
+    fs.utimesSync(dir, old, old);
+  };
+
+  it('takes over a dead lock and leaves no renamed copy behind', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-lock-'));
+    const lock = path.join(home, '.ssh-sync-lock-abc');
+    makeStale(lock);
+    const { stdout } = await sh(acquireLockCommand(lock, 'me', 'tok'));
+    expect(parseLockOutput(stdout)).toEqual({ ok: true });
+    expect(fs.readFileSync(path.join(lock, 'token'), 'utf8')).toBe('tok\n');
+    expect(fs.readdirSync(home)).toEqual(['.ssh-sync-lock-abc']);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reports busy, nesting nothing, when another taker creates the lock first', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-sync-lock-'));
+    const lock = path.join(home, '.ssh-sync-lock-abc');
+    makeStale(lock);
+    // A mkdir that loses every race: another taker creates the folder first
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(bin, 'mkdir'),
+      '#!/bin/sh\n[ -e "$1" ] || { /bin/mkdir "$1" && echo other > "$1/owner"; }\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const { stdout } = await sh(acquireLockCommand(lock, 'me', 'tok'), {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+    });
+    expect(parseLockOutput(stdout)).toEqual({ ok: false, owner: 'other' });
+    expect(fs.readdirSync(lock)).toEqual(['owner']);
+    expect(fs.readdirSync(home).sort()).toEqual(['.ssh-sync-lock-abc', 'bin']);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe('endProgress', () => {
+  it('ends a failed or cancelled sync with a final event, leaves successes alone', () => {
+    const events: any[] = [];
+    const send = (p: any) => events.push(p);
+    endProgress({ success: true }, send);
+    endProgress({ success: false, error: 'Could not connect' }, send);
+    endProgress({ success: false, cancelled: true }, send);
+    expect(events).toEqual([
+      { stage: 'error', progress: 0, message: 'Could not connect' },
+      { stage: 'cancelled', progress: 0, message: 'Sync cancelled' },
+    ]);
+  });
+});
+
+describe('search-replace domains', () => {
+  it('pull replaces the domain WordPress reports, www. form first, then the configured one', () => {
+    expect(pullSourceDomains(env(), 'https://www.example.com')).toEqual([
+      'www.example.com',
+      'example.com',
+    ]);
+    expect(pullSourceDomains(env(), 'https://example.com')).toEqual(['example.com']);
+    // an accepted other site: its domain is what the pulled data holds
+    expect(pullSourceDomains(env(), 'https://prod.com')).toEqual(['example.com', 'prod.com']);
+  });
+
+  it("push writes the server's own www. form, or the configured domain for another site", () => {
+    expect(pushTargetDomain(env(), 'https://www.example.com')).toBe('www.example.com');
+    expect(
+      pushTargetDomain(env({ remoteUrl: 'https://www.example.com' }), 'https://example.com'),
+    ).toBe('example.com');
+    expect(pushTargetDomain(env(), 'https://prod.com')).toBe('example.com');
   });
 });

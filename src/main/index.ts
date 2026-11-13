@@ -2,13 +2,13 @@
 import type { AddonMainContext } from '@getflywheel/local/main';
 import * as path from 'path';
 import * as fs from 'fs';
+import { randomBytes } from 'crypto';
 import { spawn } from 'child_process';
 import type { IpcMainInvokeEvent } from 'electron';
 
 import { EXCLUDE_PATTERNS } from './constants';
 import {
-  SiteLink,
-  EnvironmentInfo,
+  ServerEnvironment,
   SyncProgress,
   SyncOptions,
   SiteInfo,
@@ -16,46 +16,77 @@ import {
   ActiveSync,
   RunOptions,
   PullPushDeps,
+  RemoteConnection,
+  PushDiffRow,
 } from './types';
-import { validateEnvironmentInfo } from './validators';
-import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, rsyncSshContext } from './rsync';
-import { getKinstaClient, createKinstaBackup, clearKinstaCaches } from './kinstaApi';
-import { executePull, executePush } from './sync';
+import { validateEnvironment } from './validators';
+import { resolveRsync, parseItemizeOutput, parseVerboseDryRun, localPublicPath } from './rsync';
+import {
+  openRemoteConnection,
+  closeAllConnections,
+  removeControlDir,
+  sweepStaleControlDirs,
+  listSshConfigHosts,
+  rsyncRemoteShell,
+  rsyncRemoteRoot,
+} from './ssh';
+import { executePull, executePush, executeUndoPush } from './sync';
+import {
+  CliRequest,
+  CliMessage,
+  CLI_SOCKET_NAME,
+  readLocalSite,
+  startCliServer,
+  isStaleLocalOnly,
+  lastPullFrom,
+  cliPullOptions,
+  cliPushOptions,
+  cliLauncherScript,
+} from './cliProtocol';
 import { initLocalPaths, getMysqlSocketPath, findServiceBinary, findWpCliPhar } from './localPaths';
 import {
   initConfig,
   getTempDir,
-  migrateLegacyConfig,
+  getBackupsDir,
+  getConfigDir,
   ensureConfigDir,
-  loadConfig,
-  saveConfig,
-  getApiKey,
-  saveApiKey,
-  deleteApiKey,
-  loadSiteLinks,
-  saveSiteLinks,
+  getProfile,
+  loadProfiles,
+  findEnvironment,
+  canStorePasswords,
+  savePassword,
+  getPassword,
+  hasPassword,
+  prunePasswords,
+  saveEnvironments,
+  deleteProfile,
   recordSync,
   cleanupTempFiles,
+  saveNeutralizeRecord,
+  loadNeutralizeRecord,
+  latestPushManifest,
 } from './config';
 
 // Re-export the public API from the extracted modules so existing imports
-// `from './index'` (the test suite, the renderer IPC types) keep resolving.
+// `from './index'` (the test suite) keep resolving.
 export * from './types';
 export * from './validators';
 export * from './rsync';
-export * from './kinstaApi';
+export * from './ssh';
 export * from './sync';
+export * from './safeClone';
+export * from './pushBackup';
+export * from './cliProtocol';
 export * from './localPaths';
 export * from './config';
 export {
-  KINSTA_API_BASE,
-  LEGACY_CONFIG_DIR,
+  PRODUCT_NAME,
+  DATA_DIR_NAME,
   EXCLUDE_PATTERNS,
   HISTORY_LIMIT,
   MIN_DUMP_BYTES,
-  KINSTA_BACKUP_TAG,
-  MANUAL_BACKUP_LIMIT,
-  REMOTE_PUSH_BACKUP,
+  PUSH_BACKUPS_TO_KEEP,
+  REMOTE_TEMP_PREFIX,
 } from './constants';
 
 // Set from context in the exported entry point
@@ -152,29 +183,6 @@ function runCommand(
   });
 }
 
-// Fail-fast pre-flight: confirm SSH + remote WP-CLI + the public dir are reachable
-// BEFORE any destructive step. Without it a bad key / unreachable host only surfaces
-// mid-sync as a cryptic rsync/ssh failure (after backups have already run). Returns
-// null on success or a user-facing error message. ConnectTimeout bounds a dead host.
-async function preflightRemote(envInfo: EnvironmentInfo): Promise<string | null> {
-  const probe: ActiveSync = { cancelled: false, child: null };
-  try {
-    await runCommand(probe, 'ssh', [
-      '-p',
-      envInfo.sshPort,
-      '-o',
-      'StrictHostKeyChecking=accept-new',
-      '-o',
-      'ConnectTimeout=15',
-      `${envInfo.sshUser}@${envInfo.sshHost}`,
-      'cd ~/public && wp --version',
-    ]);
-    return null;
-  } catch (e: any) {
-    return `Could not reach Kinsta over SSH (or WP-CLI failed on the server). Check that your SSH key is added in MyKinsta and the environment has SSH access enabled. Details: ${e.message}`;
-  }
-}
-
 function notify(title: string, message: string): void {
   try {
     notifier?.notify({ title, message });
@@ -203,16 +211,53 @@ function watchRendererBundle(electron: AddonMainContext['electron']): void {
           for (const win of electron.BrowserWindow.getAllWindows()) {
             win.webContents.reloadIgnoringCache();
           }
-          console.log('[Kinsta] Renderer bundle changed — reloaded Local windows');
+          console.log('[SSH Sync] Renderer bundle changed — reloaded Local windows');
         } catch (e) {
-          console.error('[Kinsta] Renderer reload failed:', e);
+          console.error('[SSH Sync] Renderer reload failed:', e);
         }
       }, 400);
     });
   } catch (e) {
-    console.error('[Kinsta] Could not watch renderer bundle:', e);
+    console.error('[SSH Sync] Could not watch renderer bundle:', e);
   }
 }
+
+// `password` overrides the saved one (Test connection on an edited form)
+async function connectRemote(
+  environment: ServerEnvironment,
+  password: string | null = null,
+): Promise<RemoteConnection> {
+  const effectivePassword =
+    environment.auth === 'password' ? password || getPassword(environment.id) : null;
+  return openRemoteConnection(environment, runCommand, effectivePassword);
+}
+
+// Passwords live only as long as a password environment that uses them
+function pruneOrphanPasswords(): void {
+  const keep = new Set<string>();
+  for (const profile of Object.values(loadProfiles())) {
+    for (const environment of profile.environments) {
+      if (environment.auth === 'password') keep.add(environment.id);
+    }
+  }
+  prunePasswords(keep);
+}
+
+// What the renderer may know about a profile: whether a password is saved,
+// never the password itself.
+function profileForRenderer(localSiteId: string) {
+  const profile = getProfile(localSiteId);
+  if (!profile) return null;
+  return {
+    ...profile,
+    environments: profile.environments.map((environment) => ({
+      ...environment,
+      hasPassword: environment.auth === 'password' && hasPassword(environment.id),
+    })),
+  };
+}
+
+type EnvironmentInput = Partial<ServerEnvironment> & { password?: string };
 
 // Wire the orchestration seams to the real implementations. Called per IPC
 // invocation with a `sendProgress` bound to the requesting renderer.
@@ -222,23 +267,356 @@ function defaultPullPushDeps(sendProgress: (progress: SyncProgress) => void): Pu
     runCommand,
     activeSyncs,
     activePreviews,
-    loadSiteLinks,
-    validateEnvironmentInfo,
+    connectRemote,
     getMysqlSocketPath,
-    preflightRemote,
     resolveRsync,
     findServiceBinary,
     findWpCliPhar,
-    getApiKey,
-    getKinstaClient,
-    createKinstaBackup,
-    clearKinstaCaches,
     recordSync,
     notify,
+    saveNeutralizeRecord,
+    loadNeutralizeRecord,
+    latestPushManifest: (siteId: string, environmentId: string) =>
+      latestPushManifest(getBackupsDir(), siteId, environmentId),
     ensureConfigDir,
     tempDir: getTempDir(),
+    backupsDir: getBackupsDir(),
     sendProgress,
   };
+}
+
+// Every sync ends with a final progress event, whatever path it returned by
+// (a refusal before the work starts sends none of its own): listeners such as
+// the status badge clear their state on `done`, `error` or `cancelled`.
+export function endProgress<T extends { success: boolean; cancelled?: boolean; error?: string }>(
+  result: T,
+  sendProgress: (progress: SyncProgress) => void,
+): T {
+  if (!result.success) {
+    sendProgress(
+      result.cancelled
+        ? { stage: 'cancelled', progress: 0, message: 'Sync cancelled' }
+        : { stage: 'error', progress: 0, message: result.error || 'Sync failed' },
+    );
+  }
+  return result;
+}
+
+// Environments arrive from the renderer: keep only known fields, give new ones
+// an id, and reject the whole save on the first invalid entry.
+export function normalizeEnvironments(
+  input: Partial<ServerEnvironment>[],
+): { environments: ServerEnvironment[] } | { error: string } {
+  const environments: ServerEnvironment[] = [];
+  for (const raw of input) {
+    const environment: ServerEnvironment = {
+      id: raw.id && /^[a-z0-9-]+$/.test(raw.id) ? raw.id : randomBytes(6).toString('hex'),
+      label: String(raw.label || '').trim(),
+      sshAlias: raw.sshAlias ? String(raw.sshAlias).trim() : undefined,
+      sshHost: raw.sshAlias ? undefined : String(raw.sshHost || '').trim(),
+      sshUser: raw.sshAlias ? undefined : String(raw.sshUser || '').trim(),
+      sshPort: raw.sshAlias ? undefined : String(raw.sshPort || '22').trim(),
+      auth: raw.auth === 'password' ? 'password' : 'key',
+      remotePath: String(raw.remotePath || '')
+        .trim()
+        .replace(/(.)\/+$/, '$1'),
+      remoteUrl: String(raw.remoteUrl || '')
+        .trim()
+        .replace(/\/+$/, ''),
+      wpCommand: String(raw.wpCommand || 'wp').trim(),
+      cacheCommand: raw.cacheCommand ? String(raw.cacheCommand).trim() : undefined,
+      extraExcludes: Array.isArray(raw.extraExcludes)
+        ? raw.extraExcludes.map((p) => String(p).trim()).filter(Boolean)
+        : [],
+      isProduction: Boolean(raw.isProduction),
+    };
+    const error = validateEnvironment(environment);
+    if (error) return { error: `${environment.label || 'Environment'}: ${error}` };
+    environments.push(environment);
+  }
+  return { environments };
+}
+
+interface PreviewOptions {
+  mode?: 'newer' | 'all';
+  includeUploads?: boolean;
+}
+
+// rsync dry-run diff of what a push would change on the server. Read-only.
+async function previewPush(
+  localSiteId: string,
+  site: SiteInfo,
+  environment: ServerEnvironment,
+  options: PreviewOptions = {},
+): Promise<
+  | { success: true; rows: PushDiffRow[]; degraded: boolean; mode: 'newer' | 'all' }
+  | { success: false; error: string; mode: 'newer' | 'all' }
+> {
+  const mode = options.mode || 'newer';
+  if (activeSyncs.has(localSiteId)) {
+    return { success: false, error: 'A sync is already running for this site', mode };
+  }
+
+  const excludeArgs = [...EXCLUDE_PATTERNS, ...environment.extraExcludes].map(
+    (p) => `--exclude=${p}`,
+  );
+  if (!options.includeUploads) {
+    excludeArgs.push('--exclude=wp-content/uploads/');
+  }
+
+  // One preview at a time per site: kill the previous dry-run if the renderer
+  // re-fires (mode/env/uploads toggles) so orphaned SSH sessions don't pile up
+  // against the server's connection limit.
+  activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
+  const preview: ActiveSync = { cancelled: false, child: null };
+  activePreviews.set(localSiteId, preview);
+
+  let connection: RemoteConnection | null = null;
+  try {
+    connection = await connectRemote(environment);
+    const rsync = resolveRsync();
+    const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
+
+    // %M carries the local file's mtime so we never stat thousands of files
+    // in the main process (which would block Local's entire UI)
+    const args = ['-az', '--delete', '-n'];
+    if (mode === 'newer') args.push('--update');
+    // -8: names exactly as on disk, so the selected rows match the files a
+    // selective push sends (escaped \#ooo names would match nothing)
+    args.push(...(degraded ? ['-v'] : ['-8', '--itemize-changes', '--out-format=%i|%l|%M|%n']));
+    args.push(
+      ...excludeArgs,
+      '-e',
+      rsyncRemoteShell(connection),
+      `${localPublicPath(site)}/`,
+      rsyncRemoteRoot(connection),
+    );
+
+    const chunks: string[] = [];
+    await runCommand(preview, rsync.bin, args, {
+      okCodes: [23, 24],
+      onStdout: (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+    const stdout = chunks.join('');
+
+    const rows = degraded ? parseVerboseDryRun(stdout) : parseItemizeOutput(stdout);
+    return { success: true, rows, degraded, mode };
+  } catch (error: any) {
+    return { success: false, error: error.message, mode };
+  } finally {
+    await connection?.close();
+    if (activePreviews.get(localSiteId) === preview) activePreviews.delete(localSiteId);
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// One `ssh-sync` request: the same engine and guards as the UI. Connection
+// details always come from the stored profile.
+async function handleCliRequest(
+  userDataPath: string,
+  request: CliRequest,
+  send: (message: CliMessage) => void,
+  onDisconnect: (callback: () => void) => void,
+): Promise<void> {
+  const fail = (message: string) => send({ type: 'result', success: false, message });
+  const site = readLocalSite(userDataPath, request.site);
+  if (!site) return fail(`No Local site called "${request.site}".`);
+  const environments = getProfile(site.id)?.environments || [];
+
+  if (request.command === 'envs') {
+    if (!environments.length) return fail(`${site.name} has no server environments yet.`);
+    for (const e of environments) {
+      const target = e.sshAlias || `${e.sshUser}@${e.sshHost}:${e.sshPort || '22'}`;
+      send({
+        type: 'output',
+        text: `${e.label}${e.isProduction ? ' (production)' : ''}  ${target}  ${e.remoteUrl}  [${e.id}]`,
+      });
+    }
+    return send({ type: 'result', success: true });
+  }
+
+  const wanted = request.environment.toLowerCase();
+  const environment = environments.find(
+    (e) => e.id === request.environment || e.label.toLowerCase() === wanted,
+  );
+  if (!environment) return fail(`${site.name} has no environment "${request.environment}".`);
+  const progress = (p: SyncProgress) =>
+    send({ type: 'progress', progress: p.progress, message: p.message });
+
+  // Cancel the sync this request started (never one the UI started) when the
+  // client goes away. executePull/executePush register their ActiveSync
+  // before their first await, so it is in the map right after the call.
+  const runCancellable = async <T>(start: () => Promise<T>): Promise<T> => {
+    const before = activeSyncs.get(site.id);
+    const pending = start();
+    const started = activeSyncs.get(site.id);
+    if (started && started !== before) {
+      onDisconnect(() => {
+        started.cancelled = true;
+        started.child?.kill('SIGTERM');
+      });
+    }
+    return pending;
+  };
+
+  if (request.command === 'test') {
+    try {
+      const connection = await connectRemote(environment);
+      await connection.close();
+      return send({
+        type: 'result',
+        success: true,
+        message: `Connected · WordPress at ${connection.remoteRoot}`,
+      });
+    } catch (e: any) {
+      return fail(e.message);
+    }
+  }
+
+  if (request.command === 'pull') {
+    const result = await runCancellable(() =>
+      executePull(
+        {
+          localSiteId: site.id,
+          site,
+          environment,
+          options: cliPullOptions(request),
+        },
+        defaultPullPushDeps(progress),
+      ),
+    );
+    if (!result.success) return fail(result.error || 'Pull failed.');
+    if (result.note) send({ type: 'output', text: result.note });
+    return send({
+      type: 'result',
+      success: true,
+      message: result.warning ? `Pull complete. ${result.warning}` : 'Pull complete.',
+    });
+  }
+
+  if (request.command === 'undo') {
+    const latest = latestPushManifest(getBackupsDir(), site.id, environment.id);
+    if (!latest) return fail(`No push to ${environment.label} to undo.`);
+    const manifest = latest.manifest as {
+      stamp: string;
+      hasDatabaseBackup: boolean;
+      added: string[] | null;
+    };
+    const what = `the push of ${manifest.stamp.replace(/T(\d\d)-(\d\d).*/, ' $1:$2 UTC')}: files${manifest.hasDatabaseBackup ? ' and database' : ''}`;
+    if (!request.yes) {
+      return send({
+        type: 'result',
+        success: true,
+        message: `Would undo ${what}. Add --yes to undo.`,
+      });
+    }
+    if (manifest.hasDatabaseBackup && environment.isProduction) {
+      return fail(
+        `Undoing a database push to ${environment.label} (production) is only possible in the app.`,
+      );
+    }
+    if (environment.isProduction && !request.production) {
+      return fail(`${environment.label} is production: add --production to undo there.`);
+    }
+    const result = await runCancellable(() =>
+      executeUndoPush(
+        { localSiteId: site.id, site, environment, acceptSiteUrl: request.acceptSiteUrl },
+        defaultPullPushDeps(progress),
+      ),
+    );
+    if (!result.success) {
+      for (const file of (result.conflicts || []).slice(0, 20)) {
+        send({ type: 'output', text: `  changed since the push: ${file}` });
+      }
+      return fail(result.error || 'Undo failed.');
+    }
+    return send({
+      type: 'result',
+      success: true,
+      message: [`Undid ${what}.`, result.note, result.warning].filter(Boolean).join(' '),
+    });
+  }
+
+  if (request.yes && environment.isProduction && !request.production) {
+    return fail(`${environment.label} is production: add --production to push files to it.`);
+  }
+
+  // push: always from a fresh preview, so only what it lists can change
+  progress({ stage: 'preview', progress: 1, message: `Comparing with ${environment.label}...` });
+  const preview = await previewPush(site.id, site, environment, {
+    mode: request.mode,
+    includeUploads: request.includeUploads,
+  });
+  if (!preview.success) return fail(preview.error);
+  const lastPull = lastPullFrom(getProfile(site.id)?.history, environment.id);
+  const rows = preview.rows.filter((r) => !(r.isDir && r.op !== 'delete'));
+  const stale = request.includeStale ? [] : rows.filter((r) => isStaleLocalOnly(r, lastPull));
+  for (const r of stale) {
+    send({
+      type: 'output',
+      text: `  ${r.path}  (only in Local, older than the last pull: skipped, add --include-stale)`,
+    });
+  }
+  const files = rows.filter((r) => r.op !== 'delete' && !stale.includes(r));
+  const deletions = rows.filter((r) => r.op === 'delete');
+  for (const r of files) {
+    send({
+      type: 'output',
+      text: `${r.op === 'add' ? '+' : '~'} ${r.path}  ${formatBytes(r.sizeBytes)}`,
+    });
+  }
+  for (const r of deletions) {
+    send({
+      type: 'output',
+      text: `- ${r.path}${request.deletions ? '' : '  (kept: add --delete)'}`,
+    });
+  }
+  const summary = `${files.length} to upload, ${deletions.length} only on the server${request.includeDatabase ? ', database' : ''}`;
+  if (!request.yes) {
+    return send({
+      type: 'result',
+      success: true,
+      message: `Dry run: ${summary}. Add --yes to push.`,
+    });
+  }
+  if (!files.length && !(request.deletions && deletions.length) && !request.includeDatabase) {
+    return send({ type: 'result', success: true, message: 'Nothing to push.' });
+  }
+  const result = await runCancellable(() =>
+    executePush(
+      {
+        localSiteId: site.id,
+        site,
+        environment,
+        options: cliPushOptions(
+          request,
+          files.map((r) => r.path),
+          deletions.map((r) => r.path),
+        ),
+      },
+      defaultPullPushDeps(progress),
+    ),
+  );
+  if (!result.success) return fail(result.error || 'Push failed.');
+  if (result.note) send({ type: 'output', text: result.note });
+  return send({
+    type: 'result',
+    success: true,
+    message: result.warning
+      ? `Push complete (${summary}). ${result.warning}`
+      : `Push complete (${summary}).`,
+  });
+}
+
+function cliLauncherPath(userDataPath: string): string {
+  return path.join(userDataPath, 'bin', 'ssh-sync');
 }
 
 // ---------------------------------------------------------------------------
@@ -254,223 +632,161 @@ export default function (context: AddonMainContext): void {
   const userDataPath = String(context.environment.userDataPath || '');
   const appPath = String(context.environment.appPath || '');
   initLocalPaths(userDataPath, appPath);
-  // initConfig sets safeStorage then resolves the config paths (preserving the
-  // original order: paths/safeStorage set before resolveConfigPaths/migrate).
   initConfig(userDataPath, electron.safeStorage);
-  migrateLegacyConfig();
 
   // Security: Clean up any leftover temp files from previous sessions
   cleanupTempFiles();
+  sweepStaleControlDirs();
+
+  // The `ssh-sync` command's endpoint
+  ensureConfigDir();
+  const cliSocketPath = path.join(getConfigDir(), CLI_SOCKET_NAME);
+  const cliServer = startCliServer(cliSocketPath, (request, send, onDisconnect) =>
+    handleCliRequest(userDataPath, request, send, onDisconnect),
+  );
+
+  // Quitting Local mid-sync must not leave ssh masters running
+  try {
+    electron.app.on('before-quit', () => {
+      cliServer.close();
+      void closeAllConnections().finally(removeControlDir);
+    });
+  } catch (e) {
+    console.error('[SSH Sync] Could not register the quit handler:', e);
+  }
 
   // Hot-reload Local's renderer when the compiled renderer bundle changes
   watchRendererBundle(electron);
 
-  // Clean up stale links when a site is deleted in Local
+  // Remove the profile when its site is deleted in Local
   try {
     hooks.addAction('siteDeleted', (siteId: string) => {
-      const links = loadSiteLinks();
-      if (links[siteId]) {
-        delete links[siteId];
-        saveSiteLinks(links);
-        console.log(`[Kinsta] Removed link for deleted site ${siteId}`);
+      if (deleteProfile(siteId)) {
+        pruneOrphanPasswords();
+        console.log(`[SSH Sync] Removed profile for deleted site ${siteId}`);
       }
     });
   } catch (e) {
-    console.error('[Kinsta] Could not register siteDeleted action:', e);
+    console.error('[SSH Sync] Could not register siteDeleted action:', e);
   }
 
-  // Test API connection
-  ipcMain.handle(
-    'kinsta:testConnection',
-    async (_event: IpcMainInvokeEvent, apiKey: string, companyId: string) => {
-      try {
-        const client = getKinstaClient(apiKey);
-        const response = await client.get(`/sites?company=${companyId}`);
+  ipcMain.handle('sshsync:getProfile', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+    return profileForRenderer(localSiteId);
+  });
 
-        if (response.data.company) {
-          // Save credentials securely
-          const saved = saveApiKey(apiKey);
-          if (!saved) {
-            return {
-              success: false,
-              error: 'Could not save API key securely. Encryption not available.',
-            };
-          }
-          // Note: the /sites response's `company` object only contains `sites` —
-          // the Kinsta API has no endpoint that exposes the company name.
-          saveConfig({ companyId });
-          return { success: true, company: response.data.company };
+  ipcMain.handle('sshsync:canStorePasswords', async () => canStorePasswords());
+
+  ipcMain.handle('sshsync:listSshHosts', async () => listSshConfigHosts());
+
+  ipcMain.handle('sshsync:cliStatus', async () => {
+    const launcher = cliLauncherPath(userDataPath);
+    return { installed: fs.existsSync(launcher), path: launcher };
+  });
+
+  // Writes the `ssh-sync` launcher next to Local's own `localwp`
+  ipcMain.handle('sshsync:installCli', async () => {
+    const launcher = cliLauncherPath(userDataPath);
+    try {
+      fs.mkdirSync(path.dirname(launcher), { recursive: true });
+      fs.writeFileSync(
+        launcher,
+        cliLauncherScript(process.execPath, path.join(__dirname, 'cli.js'), cliSocketPath),
+        { mode: 0o755 },
+      );
+      return { success: true, path: launcher };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle(
+    'sshsync:saveEnvironments',
+    async (_event: IpcMainInvokeEvent, localSiteId: string, input: EnvironmentInput[]) => {
+      const inputs = Array.isArray(input) ? input : [];
+      const result = normalizeEnvironments(inputs);
+      if ('error' in result) return { success: false, error: result.error };
+      // normalizeEnvironments keeps the order, so inputs[i] is environments[i].
+      // Check every environment before saving any password.
+      const typedPasswords = result.environments.map((environment, i) =>
+        environment.auth === 'password' && typeof inputs[i].password === 'string'
+          ? inputs[i].password!
+          : '',
+      );
+      for (let i = 0; i < result.environments.length; i++) {
+        const environment = result.environments[i];
+        if (environment.auth !== 'password' || typedPasswords[i]) continue;
+        if (!hasPassword(environment.id)) {
+          return { success: false, error: `${environment.label}: enter the SSH password.` };
         }
-        return { success: false, error: 'Invalid response from Kinsta API' };
-      } catch (error: any) {
-        return { success: false, error: error.message || 'Connection failed' };
       }
+      if (typedPasswords.some(Boolean) && !canStorePasswords()) {
+        return {
+          success: false,
+          error: 'This computer cannot store the password encrypted, so it was not saved.',
+        };
+      }
+      result.environments.forEach((environment, i) => {
+        if (typedPasswords[i]) savePassword(environment.id, typedPasswords[i]);
+      });
+      saveEnvironments(localSiteId, result.environments);
+      pruneOrphanPasswords();
+      return { success: true, profile: profileForRenderer(localSiteId) };
     },
   );
 
-  // Get stored config (returns masked apiKey if exists)
-  ipcMain.handle('kinsta:getConfig', async () => {
-    const config = loadConfig();
-    const hasApiKey = getApiKey() !== null;
-    return { ...config, apiKey: hasApiKey ? '••••••••' : undefined };
-  });
-
-  // Get Kinsta sites
-  ipcMain.handle('kinsta:getSites', async () => {
-    const config = loadConfig();
-    const apiKey = getApiKey();
-    if (!apiKey || !config.companyId) {
-      return { success: false, error: 'Not connected to Kinsta' };
-    }
-
-    try {
-      const client = getKinstaClient(apiKey);
-      const response = await client.get(`/sites?company=${config.companyId}`);
-      return { success: true, sites: response.data.company?.sites || [] };
-    } catch (error: any) {
-      return { success: false, error: error.message };
-    }
-  });
-
-  // Get environments for a site
-  ipcMain.handle('kinsta:getEnvironments', async (_event: IpcMainInvokeEvent, siteId: string) => {
-    const apiKey = getApiKey();
-    if (!apiKey) {
-      return { success: false, error: 'Not connected' };
-    }
-
-    try {
-      const client = getKinstaClient(apiKey);
-      const response = await client.get(`/sites/${siteId}/environments`);
-      return { success: true, environments: response.data.site?.environments || [] };
-    } catch (error: any) {
-      return { success: false, error: error.message };
-    }
-  });
-
-  // Link Local site to Kinsta (only stores site info, not environment)
   ipcMain.handle(
-    'kinsta:linkSite',
-    async (_event: IpcMainInvokeEvent, localSiteId: string, kinstaSite: any) => {
-      const links = loadSiteLinks();
-
-      const link: SiteLink = {
-        localSiteId,
-        kinstaSiteId: kinstaSite.id,
-        kinstaSiteName: kinstaSite.display_name || kinstaSite.name,
-        kinstaSiteSlug: kinstaSite.name, // The actual site name used for SSH
-      };
-
-      links[localSiteId] = link;
-      saveSiteLinks(links);
-
-      return { success: true, link };
+    'sshsync:deleteProfile',
+    async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+      deleteProfile(localSiteId);
+      pruneOrphanPasswords();
+      return { success: true };
     },
   );
 
-  // Get link for a Local site
-  ipcMain.handle('kinsta:getSiteLink', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
-    const links = loadSiteLinks();
-    return links[localSiteId] || null;
-  });
-
-  // Unlink site
-  ipcMain.handle('kinsta:unlinkSite', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
-    const links = loadSiteLinks();
-    delete links[localSiteId];
-    saveSiteLinks(links);
-    return { success: true };
-  });
-
-  // Clear all Kinsta caches for an environment (also used standalone from the page)
+  // Connect and probe an environment as typed in the form (not yet saved)
   ipcMain.handle(
-    'kinsta:clearCache',
-    async (_event: IpcMainInvokeEvent, envId: string, cdnCacheId?: string) => {
-      const apiKey = getApiKey();
-      if (!apiKey) {
-        return { success: false, error: 'Not connected' };
-      }
+    'sshsync:testConnection',
+    async (_event: IpcMainInvokeEvent, input: EnvironmentInput) => {
+      const result = normalizeEnvironments([input]);
+      if ('error' in result) return { success: false, error: result.error };
       try {
-        const client = getKinstaClient(apiKey);
-        const cleared = await clearKinstaCaches(client, envId, cdnCacheId);
-        return { success: true, cleared };
-      } catch (error: any) {
-        return { success: false, error: error.response?.data?.message || error.message };
+        const connection = await connectRemote(
+          result.environments[0],
+          typeof input.password === 'string' ? input.password : null,
+        );
+        await connection.close();
+        return {
+          success: true,
+          remoteRoot: connection.remoteRoot,
+          warning: connection.siteUrlMismatch,
+        };
+      } catch (e: any) {
+        return { success: false, error: e.message };
       }
     },
   );
 
-  // Push preview: rsync dry-run diff of what a push would change on Kinsta.
+  // Push preview: rsync dry-run diff of what a push would change on the server.
   // Read-only — no files are touched on either side.
   ipcMain.handle(
-    'kinsta:pushPreview',
+    'sshsync:pushPreview',
     async (
       _event: IpcMainInvokeEvent,
       localSiteId: string,
       site: SiteInfo,
-      envInfo: EnvironmentInfo,
-      options: { mode?: 'newer' | 'all'; includeUploads?: boolean } = {},
+      environmentId: string,
+      options: PreviewOptions = {},
     ) => {
-      const mode = options.mode || 'newer';
-      if (activeSyncs.has(localSiteId)) {
-        return { success: false, error: 'A sync is already running for this site', mode };
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) {
+        return { success: false, error: 'Unknown environment.', mode: options.mode || 'newer' };
       }
-      if (!validateEnvironmentInfo(envInfo)) {
-        return { success: false, error: 'Invalid environment configuration.', mode };
-      }
-
-      const { localPublicPath, sshCommandForRsync, remoteHost } = rsyncSshContext(site, envInfo);
-
-      const excludeArgs = EXCLUDE_PATTERNS.map((p) => `--exclude=${p}`);
-      if (!options.includeUploads) {
-        excludeArgs.push('--exclude=wp-content/uploads/');
-      }
-
-      const rsync = resolveRsync();
-      const degraded = !(rsync.supportsItemizeChanges && rsync.supportsOutFormat);
-
-      // %M carries the local file's mtime so we never stat thousands of files
-      // in the main process (which would block Local's entire UI)
-      const args = ['-az', '--delete', '-n'];
-      if (mode === 'newer') args.push('--update');
-      args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
-      args.push(
-        ...excludeArgs,
-        '-e',
-        sshCommandForRsync,
-        `${localPublicPath}/`,
-        `${remoteHost}:~/public/`,
-      );
-
-      // One preview at a time per site: kill the previous dry-run if the
-      // renderer re-fires (mode/env/uploads toggles) so orphaned SSH sessions
-      // don't pile up against Kinsta's connection limit.
-      activePreviews.get(localSiteId)?.child?.kill('SIGTERM');
-      const preview: ActiveSync = { cancelled: false, child: null };
-      activePreviews.set(localSiteId, preview);
-
-      try {
-        const chunks: string[] = [];
-        await runCommand(preview, rsync.bin, args, {
-          okCodes: [23, 24],
-          onStdout: (chunk) => {
-            chunks.push(chunk);
-          },
-        });
-        const stdout = chunks.join('');
-
-        const rows = degraded ? parseVerboseDryRun(stdout) : parseItemizeOutput(stdout);
-        return { success: true, rows, degraded, mode };
-      } catch (error: any) {
-        return { success: false, error: error.message, mode };
-      } finally {
-        if (activePreviews.get(localSiteId) === preview) activePreviews.delete(localSiteId);
-      }
+      return previewPush(localSiteId, site, environment, options);
     },
   );
 
   // Cancel a running sync for a site
-  ipcMain.handle('kinsta:cancelSync', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+  ipcMain.handle('sshsync:cancelSync', async (_event: IpcMainInvokeEvent, localSiteId: string) => {
     const sync = activeSyncs.get(localSiteId);
     if (sync) {
       sync.cancelled = true;
@@ -479,60 +795,79 @@ export default function (context: AddonMainContext): void {
     return { success: true };
   });
 
-  // Pull from Kinsta
-  ipcMain.handle(
-    'kinsta:pull',
+  // The renderer names the environment; its connection details always come
+  // from the stored profile, never from the renderer.
+  const syncHandler =
+    (mode: 'pull' | 'push') =>
     async (
       event: IpcMainInvokeEvent,
       localSiteId: string,
       site: SiteInfo,
-      envInfo: EnvironmentInfo,
+      environmentId: string,
       options: SyncOptions,
     ) => {
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) return { success: false, error: 'Unknown environment.' };
       // siteId + mode let listeners (status badge, drawer) filter events
       const sendProgress = (progress: SyncProgress) => {
-        event.sender.send('kinsta:syncProgress', {
-          ...progress,
-          siteId: localSiteId,
-          mode: 'pull',
-        });
+        event.sender.send('sshsync:syncProgress', { ...progress, siteId: localSiteId, mode });
       };
-      return executePull(
-        { localSiteId, site, envInfo, options },
-        defaultPullPushDeps(sendProgress),
+      const execute = mode === 'pull' ? executePull : executePush;
+      return endProgress(
+        await execute(
+          { localSiteId, site, environment, options: options || {} },
+          defaultPullPushDeps(sendProgress),
+        ),
+        sendProgress,
       );
+    };
+
+  // The newest push to each environment that can still be undone
+  ipcMain.handle(
+    'sshsync:undoablePushes',
+    async (_event: IpcMainInvokeEvent, localSiteId: string) => {
+      const environments = getProfile(localSiteId)?.environments || [];
+      const result: Record<string, { stamp: string; database: boolean }> = {};
+      for (const environment of environments) {
+        const latest = latestPushManifest(getBackupsDir(), localSiteId, environment.id);
+        if (latest) {
+          const m = latest.manifest as { stamp: string; hasDatabaseBackup: boolean };
+          result[environment.id] = { stamp: m.stamp, database: Boolean(m.hasDatabaseBackup) };
+        }
+      }
+      return result;
     },
   );
 
-  // Push to Kinsta
   ipcMain.handle(
-    'kinsta:push',
+    'sshsync:undoLastPush',
     async (
       event: IpcMainInvokeEvent,
       localSiteId: string,
       site: SiteInfo,
-      envInfo: EnvironmentInfo,
-      options: SyncOptions,
+      environmentId: string,
+      confirmDomain?: string,
+      acceptSiteUrl?: string,
     ) => {
-      // siteId + mode let listeners (status badge, drawer) filter events
+      const environment = findEnvironment(localSiteId, environmentId);
+      if (!environment) return { success: false, error: 'Unknown environment.' };
       const sendProgress = (progress: SyncProgress) => {
-        event.sender.send('kinsta:syncProgress', {
+        event.sender.send('sshsync:syncProgress', {
           ...progress,
           siteId: localSiteId,
           mode: 'push',
         });
       };
-      return executePush(
-        { localSiteId, site, envInfo, options },
-        defaultPullPushDeps(sendProgress),
+      return endProgress(
+        await executeUndoPush(
+          { localSiteId, site, environment, confirmDomain, acceptSiteUrl },
+          defaultPullPushDeps(sendProgress),
+        ),
+        sendProgress,
       );
     },
   );
 
-  // Disconnect from Kinsta
-  ipcMain.handle('kinsta:disconnect', async () => {
-    deleteApiKey();
-    saveConfig({});
-    return { success: true };
-  });
+  ipcMain.handle('sshsync:pull', syncHandler('pull'));
+  ipcMain.handle('sshsync:push', syncHandler('push'));
 }

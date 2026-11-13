@@ -8,7 +8,7 @@ import { builtinModules } from 'module';
  *
  * The renderer bundle is loaded by Local via a plain Node `require()` of
  * `lib/renderer/index.js` from inside the installed add-on directory
- * (`.../Local/addons/local-addon-kinsta/`), OUTSIDE Local's own app.asar.
+ * (`.../Local/addons/local-addon-ssh-sync/`), OUTSIDE Local's own app.asar.
  * So every bare `require("<pkg>")` left in the bundle (a webpack `external`)
  * MUST be resolvable from that directory on a CLEAN install — i.e. it must be
  * either:

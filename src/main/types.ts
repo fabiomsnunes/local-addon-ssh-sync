@@ -2,37 +2,48 @@
 import type * as Local from '@getflywheel/local';
 import type * as fs from 'fs';
 import type { ChildProcess } from 'child_process';
-import type { AxiosInstance } from 'axios';
+import type { NeutralizeRecord } from './safeClone';
 
-export interface KinstaConfig {
-  companyId?: string;
+export type SshAuthMethod = 'key' | 'password';
+
+// One server a Local site syncs with (e.g. Production, Staging). The connection
+// is either an alias from ~/.ssh/config (which then owns host, user, port and
+// key) or an explicit host/user/port.
+export interface ServerEnvironment {
+  id: string;
+  label: string;
+  sshAlias?: string;
+  sshHost?: string;
+  sshUser?: string;
+  sshPort?: string;
+  auth: SshAuthMethod;
+  // WordPress root on the server: absolute, or relative to the SSH user's home (~/...)
+  remotePath: string;
+  // The site's URL on the server, e.g. https://example.com
+  remoteUrl: string;
+  // How WP-CLI is invoked on the server, e.g. `wp` or `php8.2 ~/wp-cli.phar`
+  wpCommand: string;
+  // Optional command run in the WordPress root after a push, e.g. `wp cache flush`
+  cacheCommand?: string;
+  // Extra rsync exclude patterns for this server, on top of EXCLUDE_PATTERNS
+  extraExcludes: string[];
+  isProduction: boolean;
 }
 
 export interface SyncHistoryEntry {
   mode: 'pull' | 'push';
-  envType: string; // 'live' | 'staging'
+  environmentId: string;
+  environmentLabel: string;
   at: string; // ISO timestamp
   durationMs: number;
 }
 
-export interface SiteLink {
+export interface SiteProfile {
   localSiteId: string;
-  kinstaSiteId: string;
-  kinstaSiteName: string; // Display name for UI
-  kinstaSiteSlug: string; // Actual site name for SSH username
+  environments: ServerEnvironment[];
   lastPullAt?: string; // ISO timestamp of last successful pull
   lastPushAt?: string; // ISO timestamp of last successful push
   history?: SyncHistoryEntry[]; // Most recent first, capped
-}
-
-export interface EnvironmentInfo {
-  envId: string;
-  envType: 'staging' | 'live';
-  sshHost: string;
-  sshPort: string;
-  sshUser: string;
-  remoteDomain: string;
-  cdnCacheId?: string; // needed for CDN cache clearing (from env.cdn_cache_id)
 }
 
 export interface SyncProgress {
@@ -44,8 +55,6 @@ export interface SyncProgress {
 export interface SyncOptions {
   includeUploads?: boolean;
   includeDatabase?: boolean;
-  // Push only: create a native Kinsta backup (files + DB) before pushing
-  kinstaBackup?: boolean;
   // Push only (from the preview screen): sync mode + selective file lists.
   // When `files` is present the rsync runs with --files-from and WITHOUT
   // --delete; `deletions` are executed separately so unchecked deletions
@@ -53,6 +62,16 @@ export interface SyncOptions {
   mode?: 'newer' | 'all';
   files?: string[];
   deletions?: string[];
+  // Push only: replacing a Production database requires Migration mode plus
+  // the remote domain typed back by the user.
+  migrationMode?: boolean;
+  confirmDomain?: string;
+  // The site URL the server reported, typed back by the user to go ahead
+  // despite a site URL mismatch
+  acceptSiteUrl?: string;
+  // Pull only, on unless false: neutralize the copy before WordPress loads
+  // (see safeClone.ts)
+  makeSafe?: boolean;
 }
 
 // The subset of Local.SiteJSON we actually use (full object arrives over IPC)
@@ -90,6 +109,27 @@ export interface RunOptions {
   okCodes?: number[];
 }
 
+// An open, verified connection to one environment. Every ssh/scp/rsync call of
+// a sync reuses its multiplexed master, so the server sees one authenticated
+// session per sync.
+export interface RemoteConnection {
+  // `alias` or `user@host`
+  target: string;
+  // ssh options shared by ssh, scp and rsync's remote shell (port, keepalives,
+  // ControlPath). Values never contain whitespace.
+  sshOptions: string[];
+  // The WordPress root resolved to an absolute path on the server
+  remoteRoot: string;
+  // The SSH user's home (absolute), for our temp files, backups and lock
+  remoteHome: string;
+  // The site WordPress reports there (home URL, else siteurl)
+  siteUrl: string;
+  // Why that is not the environment's site, or null when it is. Syncs refuse
+  // unless the user typed the reported URL back (SyncOptions.acceptSiteUrl).
+  siteUrlMismatch: string | null;
+  close: () => Promise<void>;
+}
+
 // macOS no longer ships GNU rsync: newer versions bundle openrsync, older ones
 // rsync 2.6.9 — neither supports --info=progress2 (GNU >= 3.1). Version sniffing
 // is unreliable across implementations, so we capability-probe each flag:
@@ -106,7 +146,7 @@ export interface RsyncInfo {
 }
 
 export interface PushDiffRow {
-  path: string; // relative to ~/public
+  path: string; // relative to the remote WordPress root
   op: 'add' | 'update' | 'delete';
   isDir: boolean;
   sizeBytes: number; // rsync %l; 0 for deletes/dirs/unknown
@@ -116,7 +156,7 @@ export interface PushDiffRow {
 export interface SyncParams {
   localSiteId: string;
   site: SiteInfo;
-  envInfo: EnvironmentInfo;
+  environment: ServerEnvironment;
   options: SyncOptions;
 }
 
@@ -125,12 +165,18 @@ export interface SyncResult {
   cancelled?: boolean;
   error?: string;
   warning?: string | null;
+  // What the sync did besides the transfer, for the user (e.g. the safe-clone summary)
+  note?: string | null;
+  // Set when the server folder reports another site (see RemoteConnection)
+  siteUrlMismatch?: { actual: string; expected: string };
+  // Undo only: files changed on the server since the push
+  conflicts?: string[];
 }
 
 // Every environment-touching dependency executePull/executePush rely on. The
 // `defaultPullPushDeps` factory wires these to the real implementations; tests
-// pass fakes (a command runner that matches on cmd/args, an in-memory site-link
-// store, fake binary paths, a sandboxed fs, …).
+// pass fakes (a command runner that matches on cmd/args, a fake connection,
+// fake binary paths, a sandboxed fs, …).
 export interface PullPushDeps {
   fs: Pick<
     typeof fs,
@@ -141,6 +187,8 @@ export interface PullPushDeps {
     | 'copyFileSync'
     | 'unlinkSync'
     | 'readdirSync'
+    | 'mkdirSync'
+    | 'rmSync'
   >;
   runCommand: (
     sync: ActiveSync,
@@ -150,34 +198,31 @@ export interface PullPushDeps {
   ) => Promise<{ code: number; stderr: string }>;
   activeSyncs: Map<string, ActiveSync>;
   activePreviews: Map<string, ActiveSync>;
-  loadSiteLinks: () => Record<string, SiteLink>;
-  validateEnvironmentInfo: (env: EnvironmentInfo) => boolean;
+  // Opens the multiplexed connection and verifies the WordPress root and WP-CLI.
+  // Rejects with a user-facing message when the server is unreachable.
+  connectRemote: (environment: ServerEnvironment) => Promise<RemoteConnection>;
   getMysqlSocketPath: (localSiteId: string) => string;
-  preflightRemote: (envInfo: EnvironmentInfo) => Promise<string | null>;
   resolveRsync: () => RsyncInfo;
   findServiceBinary: (prefixes: string[], binName: string) => string | null;
   findWpCliPhar: () => string | null;
-  getApiKey: () => string | null;
-  getKinstaClient: (apiKey: string) => AxiosInstance;
-  createKinstaBackup: (
-    client: AxiosInstance,
-    envId: string,
-    sync: ActiveSync,
-    onMessage: (msg: string) => void,
-  ) => Promise<boolean>;
-  clearKinstaCaches: (
-    client: AxiosInstance,
-    envId: string,
-    cdnCacheId?: string,
-  ) => Promise<string[]>;
   recordSync: (
     localSiteId: string,
     mode: 'pull' | 'push',
-    envType: string,
+    environment: ServerEnvironment,
     durationMs: number,
   ) => void;
   notify: (title: string, message: string) => void;
+  // What the safe-copy step changed in the local database (null clears it)
+  saveNeutralizeRecord: (localSiteId: string, record: NeutralizeRecord | null) => void;
+  loadNeutralizeRecord: (localSiteId: string) => NeutralizeRecord | null;
+  // The newest undoable push to an environment (manifest + backup base path)
+  latestPushManifest: (
+    localSiteId: string,
+    environmentId: string,
+  ) => { base: string; manifest: unknown } | null;
   ensureConfigDir: () => void;
   tempDir: string;
+  // Remote databases exported before a push land here (the rollback source)
+  backupsDir: string;
   sendProgress: (progress: SyncProgress) => void;
 }
