@@ -1627,16 +1627,22 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         );
       }
     }
+    // The server database was replaced before the failure: the push landed
+    // and nothing below rolls it back, so its manifest and backups stay as
+    // the way to undo it
+    const pushLanded = remoteDatabaseFinished;
     // A push that did not finish is not undoable: its changes are rolled
     // back here, so the newest finished push stays the one to undo
-    try {
-      dfs.unlinkSync(`${backupBase}.json`);
-    } catch {
-      // not written yet
+    if (!pushLanded) {
+      try {
+        dfs.unlinkSync(`${backupBase}.json`);
+      } catch {
+        // not written yet
+      }
     }
     // Files changed but the push did not finish: put them back, so the
     // server keeps code that matches its (restored) database
-    if (filesChanged && !remoteDatabaseFinished) {
+    if (filesChanged && !pushLanded) {
       try {
         sendProgress({ stage: 'files', progress: 0, message: 'Restoring server files...' });
         await restorePushedFiles(deps, freshSync(), connection, {
@@ -1659,7 +1665,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
     }
     // Rolled back: this push's backups have served their purpose. Kept when
     // a rollback failed, as the user's way back.
-    if (!rollbackFailed) {
+    if (!rollbackFailed && !pushLanded) {
       for (const artifact of [`${backupBase}.sql`, `${backupBase}-files`]) {
         try {
           dfs.rmSync(artifact, { recursive: true, force: true });
@@ -1670,9 +1676,12 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       sendProgress({ stage: 'cancelled', progress: 0, message: 'Sync cancelled' });
       return { success: false, cancelled: true, error: 'Sync cancelled' };
     }
-    sendProgress({ stage: 'error', progress: 0, message: error.message });
+    const failure = pushLanded
+      ? `The push reached ${environment.label}, then failed: ${error.message} It can still be undone.`
+      : error.message;
+    sendProgress({ stage: 'error', progress: 0, message: failure });
     deps.notify(PRODUCT_NAME, `Push failed for ${site.name || site.domain}`);
-    return { success: false, error: error.message };
+    return { success: false, error: failure };
   } finally {
     deps.activeSyncs.delete(localSiteId);
     if (lockHeartbeat) clearInterval(lockHeartbeat);

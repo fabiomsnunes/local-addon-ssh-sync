@@ -1051,6 +1051,29 @@ describe('executePush', () => {
     expect(notify).toHaveBeenCalledWith('SSH Sync', expect.stringContaining('were put back'));
   });
 
+  it('keeps a landed database push undoable when a later step fails', async () => {
+    const runner = makeFakeRunner({
+      remoteFilesBackupExists: true,
+      pushOutFormat: 'SSHSYNC|<f+++++++++|wp-content/new.php\n',
+    });
+    const { deps, recordSync } = makeDeps({ runner });
+    recordSync.mockImplementation(() => {
+      throw new Error('profiles.json is corrupt.');
+    });
+    const result = await executePush(pushParams(), deps);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(
+      /reached Staging, then failed: profiles.json is corrupt. It can still be undone/,
+    );
+    const labels = steps(runner.calls);
+    expect(labels).not.toContain('remote-db-restore');
+    expect(labels).not.toContain('remote-remove-added');
+    const latest = latestPushManifest(backupsDir, SITE_ID, 'staging')!;
+    expect(latest.manifest.hasDatabaseBackup).toBe(true);
+    expect(fs.existsSync(`${latest.base}.sql`)).toBe(true);
+    expect(fs.existsSync(`${latest.base}-files`)).toBe(true);
+  });
+
   it('undo restores the files and the database of the last push, once', async () => {
     const first = makeFakeRunner({
       remoteFilesBackupExists: true,
