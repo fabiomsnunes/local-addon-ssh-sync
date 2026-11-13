@@ -24,6 +24,7 @@ import {
   summarizeSelection,
   buildPushFileSelection,
   isStaleLocalOnly,
+  selectedByDefault,
   lastPullFrom,
 } from './pushHelpers';
 import { STATUS, tint } from './colors';
@@ -226,7 +227,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
         setRows(
           visible.map((r: DiffRow) => {
             const stale = isStaleLocalOnly(r, lastPull);
-            return { ...r, stale, selected: !stale };
+            return { ...r, stale, selected: selectedByDefault(r, stale) };
           }),
         );
       } else {

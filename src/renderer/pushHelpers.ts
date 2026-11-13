@@ -112,3 +112,10 @@ export function lastPullFrom(
   const pull = (history || []).find((h) => h.mode === 'pull' && h.environmentId === environmentId);
   return pull ? Date.parse(pull.at) : null;
 }
+
+// What the preview ticks for you: files to add or update, never deletions
+// (deleting on a server only happens when you tick it, as with --delete on
+// the command line) and never stale local-only files
+export function selectedByDefault(row: { op: string }, stale: boolean): boolean {
+  return !stale && row.op !== 'delete';
+}
