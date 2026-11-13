@@ -1,7 +1,7 @@
 {
   "name": "local-addon-ssh-sync",
   "productName": "SSH Sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pull and push WordPress sites between Local and any server over SSH",
   "author": "Fábio Nunes (WPlus)",
   "license": "MIT",
