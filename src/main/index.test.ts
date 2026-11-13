@@ -733,6 +733,14 @@ describe('downgradeMySQL8Collations', () => {
     );
   });
 
+  it('rewrites the uca1400 collations of utf8mb3 tables too (Wordfence)', () => {
+    const sql =
+      'CREATE TABLE `wp_wfls_settings` (...) DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_uca1400_ai_ci; `v` text COLLATE utf8mb3_uca1400_as_cs';
+    expect(downgradeMariaDBCollations(sql)).toBe(
+      'CREATE TABLE `wp_wfls_settings` (...) DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_unicode_520_ci; `v` text COLLATE utf8mb3_unicode_520_ci',
+    );
+  });
+
   it('rewrites the column-level form (COLLATE <name>)', () => {
     const sql = '`name` varchar(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL';
     expect(downgradeMySQL8Collations(sql)).toBe(

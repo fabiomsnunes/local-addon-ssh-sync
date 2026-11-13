@@ -155,15 +155,18 @@ export function downgradeMySQL8Collations(sql: string): string {
   return sql.replace(/utf8mb4_0900_\w+/g, 'utf8mb4_unicode_520_ci');
 }
 
-// The mirror image for pull: MariaDB 11.4+ defaults utf8mb4 to the
-// `utf8mb4_uca1400_*` family (ai_ci, as_cs, nopad_…), which Local's MySQL 8
-// doesn't know → the pull import fails with "Unknown collation:
-// 'utf8mb4_uca1400_ai_ci'". Rewrite the family to utf8mb4_unicode_520_ci (same
-// target as above, understood by both engines) before piping the downloaded
-// dump into Local's MySQL. Covers both the `COLLATE=<name>` and `COLLATE <name>`
-// forms; no-op for dumps from older MariaDB.
+// The mirror image for pull: MariaDB 11.4+ defaults to the `uca1400` family
+// (ai_ci, as_cs, nopad_…) for every Unicode charset, utf8mb3 tables included
+// (Wordfence creates its login tables as utf8mb3). Local's MySQL 8 doesn't know
+// them → the pull import fails with "Unknown collation: 'utf8mb4_uca1400_ai_ci'".
+// Rewrite each to the same charset's unicode_520_ci, understood by both
+// engines, before piping the downloaded dump into Local's MySQL. Covers both
+// the `COLLATE=<name>` and `COLLATE <name>` forms; no-op for older MariaDB.
 export function downgradeMariaDBCollations(sql: string): string {
-  return sql.replace(/utf8mb4_uca1400_\w+/g, 'utf8mb4_unicode_520_ci');
+  return sql.replace(
+    /\b(utf8mb4|utf8mb3|utf8|ucs2|utf16|utf32)_uca1400_\w+/g,
+    (_, charset: string) => `${charset === 'utf8' ? 'utf8mb3' : charset}_unicode_520_ci`,
+  );
 }
 
 // `wp config get table_prefix` returns the bare value plus a trailing newline.
