@@ -76,6 +76,7 @@ export * from './ssh';
 export * from './sync';
 export * from './safeClone';
 export * from './pushBackup';
+export * from './cliProtocol';
 export * from './localPaths';
 export * from './config';
 export {
@@ -380,7 +381,9 @@ async function previewPush(
     // in the main process (which would block Local's entire UI)
     const args = ['-az', '--delete', '-n'];
     if (mode === 'newer') args.push('--update');
-    args.push(...(degraded ? ['-v'] : ['--itemize-changes', '--out-format=%i|%l|%M|%n']));
+    // -8: names exactly as on disk, so the selected rows match the files a
+    // selective push sends (escaped \#ooo names would match nothing)
+    args.push(...(degraded ? ['-v'] : ['-8', '--itemize-changes', '--out-format=%i|%l|%M|%n']));
     args.push(
       ...excludeArgs,
       '-e',
@@ -537,7 +540,7 @@ async function handleCliRequest(
     return send({
       type: 'result',
       success: true,
-      message: [`Undid ${what}.`, result.warning].filter(Boolean).join(' '),
+      message: [`Undid ${what}.`, result.note, result.warning].filter(Boolean).join(' '),
     });
   }
 
@@ -602,6 +605,7 @@ async function handleCliRequest(
     ),
   );
   if (!result.success) return fail(result.error || 'Push failed.');
+  if (result.note) send({ type: 'output', text: result.note });
   return send({
     type: 'result',
     success: true,

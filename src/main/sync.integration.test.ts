@@ -1072,6 +1072,10 @@ describe('executePush', () => {
     expect(labels).toContain('remote-unlock');
     // The manifest is gone: the same push cannot be undone twice
     expect(latestPushManifest(backupsDir, SITE_ID, 'staging')).toBeNull();
+    // and its backups with it: nothing of an undone push stays on this machine
+    expect(fs.readdirSync(backupsDir).filter((f) => f.startsWith(`${SITE_ID}-staging-`))).toEqual(
+      [],
+    );
   });
 
   it('undo refuses when a newer push was made, from any computer', async () => {

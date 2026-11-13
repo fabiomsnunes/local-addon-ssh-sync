@@ -136,6 +136,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [isComplete, setIsComplete] = useState(false);
   const [completionWarning, setCompletionWarning] = useState<string | null>(null);
+  const [completionNote, setCompletionNote] = useState<string | null>(null);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [brewCopied, setBrewCopied] = useState(false);
 
@@ -287,6 +288,7 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
 
     if (result.success) {
       setCompletionWarning(result.warning || null);
+      setCompletionNote(result.note || null);
       // Defensive: the 'done' progress event normally flips these; don't hang on
       // the spinner if it's ever dropped/reordered (idempotent with the event).
       setIsComplete(true);
@@ -620,6 +622,18 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
                         }}
                       >
                         {completionWarning}
+                      </p>
+                    )}
+                    {completionNote && (
+                      <p
+                        style={{
+                          fontSize: '13px',
+                          opacity: 0.8,
+                          textAlign: 'center',
+                          maxWidth: '460px',
+                        }}
+                      >
+                        {completionNote}
                       </p>
                     )}
                     <PrimaryButton onClick={onClose}>Done</PrimaryButton>

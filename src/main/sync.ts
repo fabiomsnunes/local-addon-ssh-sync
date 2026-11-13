@@ -1550,23 +1550,24 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         markerWarning = `This push could not be recorded on ${environment.label}, so an undo of an older push from another computer cannot see it.`;
       }
     }
-    deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
-    sendProgress({
-      stage: 'done',
-      progress: 100,
-      message: pushWarning() ? `Push complete — ${pushWarning()}` : 'Push complete!',
-    });
-    deps.notify(
-      PRODUCT_NAME,
-      pushWarning()
-        ? `Push complete for ${site.name || site.domain} — ${pushWarning()}`
-        : `Push complete for ${site.name || site.domain}`,
-    );
     const restoredNote = restoredOnServer.length
       ? `Re-enabled on ${environment.label} what the safe local copy had turned off: ${restoredOnServer
           .map((p) => (p === 'stripe-testmode' ? 'Stripe live mode' : p.split('/')[0]))
           .join(', ')}.`
       : null;
+    deps.recordSync(localSiteId, 'push', environment, Date.now() - startedAt);
+    const completion = [pushWarning(), restoredNote].filter(Boolean).join(' ');
+    sendProgress({
+      stage: 'done',
+      progress: 100,
+      message: completion ? `Push complete — ${completion}` : 'Push complete!',
+    });
+    deps.notify(
+      PRODUCT_NAME,
+      completion
+        ? `Push complete for ${site.name || site.domain} — ${completion}`
+        : `Push complete for ${site.name || site.domain}`,
+    );
     // Only now: a failed push must never push a good one's backups out
     prunePushBackups(deps.backupsDir, localSiteId, environment.id, dfs);
     return { success: true, warning: pushWarning(), note: restoredNote };
@@ -1826,8 +1827,14 @@ export async function executeUndoPush(
         // non-fatal, as after a push
       }
     }
-    // Undone once: the backups stay until pruned, the manifest goes
+    // Undone once: the push's manifest and backups go (pruning only counts
+    // pushes with a manifest, so they would otherwise stay forever)
     deps.fs.unlinkSync(`${latest.base}.json`);
+    for (const artifact of [sqlBackup, `${latest.base}-files`]) {
+      try {
+        deps.fs.rmSync(artifact, { recursive: true, force: true });
+      } catch {}
+    }
     // The push before this one is the newest again. With none recorded, an
     // "undone" placeholder keeps any older push on any computer from being
     // undone over what is on the server now.
