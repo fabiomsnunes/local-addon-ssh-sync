@@ -1283,6 +1283,23 @@ describe('executePush', () => {
     expect(write.args[write.args.length - 1]).toContain(`'${previous}'`);
   });
 
+  it('undo still works when the push could not write its marker and nobody pushed since', async () => {
+    const previous = '2026-11-01T10-00-00-000Z other-mac (site) since x';
+    const push = makeDeps({
+      runner: makeFakeRunner({ marker: `${previous}\n`, failAt: 'remote-write-marker' }),
+    });
+    const pushed = await executePush(
+      pushParams({ includeDatabase: false, deletions: ['old.php'] }),
+      push.deps,
+    );
+    expect(pushed.warning).toMatch(/could not be recorded/);
+    const result = await executeUndoPush(
+      { localSiteId: SITE_ID, site: site(), environment: environment() },
+      makeDeps({ runner: makeFakeRunner({ marker: `${previous}\n` }) }).deps,
+    );
+    expect(result.success).toBe(true);
+  });
+
   it('undo of a first push leaves an "undone" marker that blocks older undos', async () => {
     const push = makeDeps({ runner: makeFakeRunner() });
     await executePush(pushParams({ includeDatabase: false, deletions: ['old.php'] }), push.deps);

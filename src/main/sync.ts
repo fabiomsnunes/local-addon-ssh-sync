@@ -1786,8 +1786,13 @@ export async function executeUndoPush(
         onStdout: (c) => (markerOutput += c),
       },
     );
-    const [newestStamp, ...newestOwner] = markerOutput.trim().split(' ');
-    if (newestStamp && newestStamp !== manifest.stamp) {
+    const markerLine = markerOutput.trim().split('\n')[0];
+    const [newestStamp, ...newestOwner] = markerLine.split(' ');
+    // The marker still as this push found it: the push could not write its
+    // own (a dropped connection), and nobody has pushed since
+    const markerUnchanged =
+      Boolean(manifest.previousMarker) && markerLine === manifest.previousMarker;
+    if (newestStamp && newestStamp !== manifest.stamp && !markerUnchanged) {
       return {
         success: false,
         error: `A newer push to ${environment.label} was made${newestOwner.length ? ` by ${newestOwner.join(' ')}` : ''}: undoing this one would overwrite it.`,
