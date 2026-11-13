@@ -8,6 +8,7 @@ import {
   buildPushFileSelection,
   isStaleLocalOnly,
   lastPullFrom,
+  selectedByDefault,
 } from './pushHelpers';
 
 describe('environmentTarget', () => {
@@ -136,5 +137,14 @@ describe('isStaleLocalOnly', () => {
       { op: 'add', path: 'old.php', selected: false },
     ];
     expect(buildPushFileSelection(rows, 'all')).toEqual({ files: ['a.php'], deletions: [] });
+  });
+});
+
+describe('selectedByDefault', () => {
+  it('ticks additions and updates, never deletions or stale local-only files', () => {
+    expect(selectedByDefault({ op: 'add' }, false)).toBe(true);
+    expect(selectedByDefault({ op: 'update' }, false)).toBe(true);
+    expect(selectedByDefault({ op: 'delete' }, false)).toBe(false);
+    expect(selectedByDefault({ op: 'add' }, true)).toBe(false);
   });
 });

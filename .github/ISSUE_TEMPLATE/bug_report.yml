@@ -1,0 +1,33 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove host names, paths and anything private. Security issues go to the [private report](https://github.com/fabiomsnunes/local-addon-ssh-sync/security/advisories/new), never here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Include the exact message SSH Sync showed.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: SSH Sync 0.1.0, Local 10.0.1, macOS 26.1
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server
+      description: Host or server type, and how you log in.
+      placeholder: Ubuntu VPS with an SSH key / cPanel host with a password
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Lines starting with `[SSH Sync]` from Local's log (Help → Reveal Local's Log).
+      render: text
