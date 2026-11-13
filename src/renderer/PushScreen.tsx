@@ -871,7 +871,8 @@ const PushScreen: React.FC<Props> = ({ isOpen, onClose, site, profile, initialEn
           </p>
           {isLive && (
             <p style={{ color: STATUS.danger, fontSize: '13px', marginBottom: '24px' }}>
-              This will overwrite your production site. This action cannot be undone.
+              This will overwrite your production site. Undo puts back the files and database from
+              right before this push, as long as nothing changed on the server since.
             </p>
           )}
           <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
