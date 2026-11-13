@@ -105,7 +105,7 @@ Our approach (native More-menu items + drawers) is the officially documented pat
 
 ## Official design rules (build.localwp.com)
 
-- **Modals**: only for yes/no/simple selection. Complex flows → drawer or full-width overlay. We follow this: `FlyModal` only for push-to-production confirmation; drawers for link/sync flows.
+- **Modals**: only for yes/no/simple selection. Complex flows → drawer or full-width overlay. We follow this: drawers for environments and pull; the push preview is the full-width overlay, built on `FlyModal` stretched to fill the window (see the FlyModal fullscreen gotchas below), with its production confirmation inside it. No other `FlyModal`.
 - **Drawer overlays** are the documented pattern for "actions integrating external services triggered from a site-specific action" (e.g. Flywheel push/pull) — exactly our use case.
 - Every overlay/modal MUST have an explicit exit/cancel.
 - Placement: expanding site functionality → Site overview / Utilities tab; standalone concept → new tab under "More" (must include add-on name in title bar).
@@ -159,9 +159,9 @@ osascript -e 'quit app "Local"' && sleep 3 && open -a "Local"
 ### Local Components Used
 
 - `PrimaryButton`, `TextButton` — action buttons
-- `FlyModal` — confirmation dialogs only (push to production)
+- `FlyModal`: only as the base of the full-screen push preview (`PushScreen`), never as a small dialog
 - `RadioBlock` — environment selection in the pull drawer
-- `FlySelect` — environment and mode selection inside the push screen's FlyModal
+- `FlySelect`: environment and mode selection inside the push screen (the environments drawer uses a native `select`: FlySelect's menu lands off screen inside a transformed drawer)
 - `Checkbox` — sync options
 - `ProgressBar`, `Spinner`, `Title`, `VirtualTable`
 
