@@ -41,11 +41,15 @@ export function remoteFilesBackupDir(remoteHome: string, stamp: string): string 
 }
 
 // rsync `--out-format=SSHSYNC|%i|%n` lines: `<f+++++++++` is a new file,
-// `cd+++++++++` a new folder (both relative to the WordPress root).
+// `cd+++++++++` a new folder, `cL+++++++++` a new symlink (all relative to
+// the WordPress root).
 export interface PushedChanges {
   // New files and folders on the server (undo removes them)
   files: string[];
   dirs: string[];
+  // New symlinks (removed by undo like files, but never size-checked: the
+  // server's stat and this machine's do not agree on a link's mtime)
+  links: string[];
   // Existing files the push overwrote (undo restores them from the backup)
   updated: string[];
   // Files rsync --delete removed (fast path; ticked deletions are listed by us)
@@ -53,7 +57,7 @@ export interface PushedChanges {
 }
 
 export function parseAddedFromOutFormat(stdout: string): PushedChanges {
-  const changes: PushedChanges = { files: [], dirs: [], updated: [], deleted: [] };
+  const changes: PushedChanges = { files: [], dirs: [], links: [], updated: [], deleted: [] };
   // Progress output ends its lines with \r, so a marker can follow progress
   // text on the same "line": find every marker wherever it starts. Names are
   // kept exactly (no trimming); only a folder's trailing slash goes.
@@ -72,6 +76,9 @@ export function parseAddedFromOutFormat(stdout: string): PushedChanges {
       if (isNew) changes.dirs.push(name);
     } else if (flags[1] === 'f') {
       (isNew ? changes.files : changes.updated).push(name);
+    } else if (flags[1] === 'L' && isNew) {
+      // A replaced symlink comes back from the backup like any replaced file
+      changes.links.push(name);
     }
   }
   return changes;

@@ -1055,11 +1055,14 @@ describe('push backups and lock', () => {
           'SSHSYNC|<f.st......|a/changed.php',
           'SSHSYNC|.d..t......|./',
           '   1,234  42%  progress\rSSHSYNC|<f+++++++++|after-progress.php',
+          'SSHSYNC|cL+++++++++|a/link',
+          'SSHSYNC|cL.......|a/old-link',
         ].join('\n'),
       ),
     ).toEqual({
       files: ['a/new.php', 'after-progress.php'],
       dirs: ['a/dir'],
+      links: ['a/link'],
       updated: ['a/changed.php'],
       deleted: [],
     });

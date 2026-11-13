@@ -1002,7 +1002,7 @@ describe('executePush', () => {
     const runner = makeFakeRunner({
       remoteFilesBackupExists: true,
       pushOutFormat:
-        'SSHSYNC|<f+++++++++|wp-content/new.php\nSSHSYNC|cd+++++++++|wp-content/newdir/\nSSHSYNC|<f.st......|wp-content/changed.php\n',
+        'SSHSYNC|<f+++++++++|wp-content/new.php\nSSHSYNC|cd+++++++++|wp-content/newdir/\nSSHSYNC|<f.st......|wp-content/changed.php\nSSHSYNC|cL+++++++++|wp-content/link\n',
     });
     const { deps } = makeDeps({ runner });
     const result = await executePush(
@@ -1022,7 +1022,7 @@ describe('executePush', () => {
     const latest = latestPushManifest(backupsDir, SITE_ID, 'staging')!;
     expect(latest.manifest).toMatchObject({
       environmentId: 'staging',
-      added: ['wp-content/new.php'],
+      added: ['wp-content/new.php', 'wp-content/link'],
       addedDirs: ['wp-content/newdir'],
       hasFilesBackup: true,
       hasDatabaseBackup: false,

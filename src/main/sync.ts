@@ -1262,7 +1262,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       }
       // No rsync run (database-only or deletions-only push): nothing unknown
       changes = !ranRsync
-        ? { files: [], dirs: [], updated: [], deleted: [] }
+        ? { files: [], dirs: [], links: [], updated: [], deleted: [] }
         : knowsAdded
           ? parseAddedFromOutFormat(rsyncOutput)
           : null;
@@ -1316,7 +1316,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
       pushManifest = {
         environmentId: environment.id,
         stamp,
-        added: changes ? changes.files : null,
+        added: changes ? [...changes.files, ...changes.links] : null,
         addedDirs: changes ? changes.dirs : null,
         pushed,
         deleted: [...(changes ? changes.deleted : []), ...outermostPaths(options.deletions || [])],
@@ -1648,7 +1648,7 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
         await restorePushedFiles(deps, freshSync(), connection, {
           localFilesBackup,
           remoteFilesBackup,
-          added: changes,
+          added: changes && { files: [...changes.files, ...changes.links], dirs: changes.dirs },
         });
         deps.notify(
           PRODUCT_NAME,
