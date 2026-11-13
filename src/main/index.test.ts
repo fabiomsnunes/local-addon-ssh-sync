@@ -57,6 +57,8 @@ import {
   parseSshConfigHosts,
   normalizeEnvironments,
   productionDatabaseGuard,
+  pullSourceDomains,
+  pushTargetDomain,
   endProgress,
   siteUrlMismatch,
   parseAddedFromOutFormat,
@@ -1144,5 +1146,25 @@ describe('endProgress', () => {
       { stage: 'error', progress: 0, message: 'Could not connect' },
       { stage: 'cancelled', progress: 0, message: 'Sync cancelled' },
     ]);
+  });
+});
+
+describe('search-replace domains', () => {
+  it('pull replaces the domain WordPress reports, www. form first, then the configured one', () => {
+    expect(pullSourceDomains(env(), 'https://www.example.com')).toEqual([
+      'www.example.com',
+      'example.com',
+    ]);
+    expect(pullSourceDomains(env(), 'https://example.com')).toEqual(['example.com']);
+    // an accepted other site: its domain is what the pulled data holds
+    expect(pullSourceDomains(env(), 'https://prod.com')).toEqual(['example.com', 'prod.com']);
+  });
+
+  it("push writes the server's own www. form, or the configured domain for another site", () => {
+    expect(pushTargetDomain(env(), 'https://www.example.com')).toBe('www.example.com');
+    expect(
+      pushTargetDomain(env({ remoteUrl: 'https://www.example.com' }), 'https://example.com'),
+    ).toBe('example.com');
+    expect(pushTargetDomain(env(), 'https://prod.com')).toBe('example.com');
   });
 });

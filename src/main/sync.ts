@@ -90,6 +90,31 @@ import {
 
 type Run = PullPushDeps['runCommand'];
 
+// The domains a pull replaces in the server's database: the one WordPress
+// reports there (what the data actually holds, e.g. www.example.com, or an
+// accepted other site) and the environment's, longest first so a www. form is
+// replaced before the bare domain inside it.
+export function pullSourceDomains(
+  environment: ServerEnvironment,
+  reportedSiteUrl: string,
+): string[] {
+  const domains = [remoteDomainFromUrl(reportedSiteUrl), remoteDomainFromUrl(environment.remoteUrl)]
+    .filter((d): d is string => Boolean(d))
+    .map((d) => d.toLowerCase());
+  return [...new Set(domains)].sort((a, b) => b.length - a.length);
+}
+
+// The domain a push writes into the server's database: the environment's,
+// but in the exact form WordPress uses there when they only differ by www.
+// (an accepted other site, e.g. a staging that still says production, gets
+// the environment's URL, which is what the user configured it to be).
+export function pushTargetDomain(environment: ServerEnvironment, reportedSiteUrl: string): string {
+  const configured = remoteDomainFromUrl(environment.remoteUrl)!;
+  const reported = remoteDomainFromUrl(reportedSiteUrl);
+  const bare = (d: string) => d.toLowerCase().replace(/^www\./, '');
+  return reported && bare(reported) === bare(configured) ? reported : configured;
+}
+
 // A server folder whose WordPress reports another site is refused unless the
 // user typed that site's URL back (e.g. a staging just cloned from production
 // still says production).
@@ -520,7 +545,6 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
   if (environmentError) {
     return { success: false, error: environmentError };
   }
-  const remoteDomain = remoteDomainFromUrl(environment.remoteUrl)!;
 
   // Pre-flight: database sync needs the local site running (MySQL socket)
   const socketPath = deps.getMysqlSocketPath(localSiteId);
@@ -726,7 +750,9 @@ export async function executePull(params: SyncParams, deps: PullPushDeps): Promi
         const wpEnv = { ...process.env, PATH: `${mysqlBinDir}:${process.env.PATH || ''}` };
         // MultiSite.No is the empty string, so truthiness is the correct check
         const networkArgs = site.multiSite ? ['--network'] : [];
-        const pairs = searchReplacePairs(remoteDomain, localDomain);
+        const pairs = pullSourceDomains(environment, connection.siteUrl).flatMap((from) =>
+          searchReplacePairs(from, localDomain),
+        );
 
         for (let i = 0; i < pairs.length; i++) {
           const [from, to] = pairs[i];
@@ -1025,7 +1051,6 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
   if (environmentError) {
     return { success: false, error: environmentError };
   }
-  const remoteDomain = remoteDomainFromUrl(environment.remoteUrl)!;
 
   const guardError = productionDatabaseGuard(environment, options);
   if (guardError) {
@@ -1365,7 +1390,10 @@ export async function executePush(params: SyncParams, deps: PullPushDeps): Promi
 
       // MultiSite.No is the empty string, so truthiness is the correct check
       const networkFlag = site.multiSite ? ' --network' : '';
-      const pairs = searchReplacePairs(site.domain, remoteDomain);
+      const pairs = searchReplacePairs(
+        site.domain,
+        pushTargetDomain(environment, connection.siteUrl),
+      );
 
       for (let i = 0; i < pairs.length; i++) {
         const [from, to] = pairs[i];
