@@ -25,7 +25,7 @@
   <a href="#faq">FAQ</a>
 </p>
 
-![Push preview: every file that would change, ticked or unticked one by one](docs/screenshots/04-push-preview.png)
+https://github.com/user-attachments/assets/ea0b8deb-49ef-43ab-aa7e-160ea08cd673
 
 ## Why
 
@@ -35,12 +35,10 @@ SSH Sync brings that one-click flow to **any host**. No API keys, no account, no
 
 ## Use cases
 
-- **Pull a live site to work on it locally.** Files and database in one click, URLs rewritten, ready to open.
-- **Ship a theme or plugin change.** Push only the files you touched to staging, check them, then to production.
-- **Refresh staging from production.** Pull from production, push to staging, and the clone stays harmless on the way.
-- **Debug a client site safely.** The local copy can't send emails, run backups or charge cards, so you can poke at it freely.
-- **Move a site to a new server.** Pull from the old host, push everything (database included) to the new one in Migration mode.
-- **Script it.** `ssh-sync pull my-site production` from the terminal, a Makefile or your editor.
+- **Work on a live site locally.** Pull files and database in one click, URLs rewritten, ready to open.
+- **Ship your changes.** Push only the files you touched to staging, check them, then to production.
+- **Debug a client site safely.** The local copy can't send emails, run backups or charge cards.
+- **Move a site to a new server.** Pull from the old host, push everything to the new one in Migration mode.
 
 ## Features
 
@@ -49,8 +47,6 @@ SSH Sync brings that one-click flow to **any host**. No API keys, no account, no
 Production, staging, a test server: add as many as you need per site. Each has its own SSH connection, WordPress folder, URL, WP-CLI command and cache command. Pick a host from your `~/.ssh/config` or type it in; log in with your SSH key or a password kept in the macOS Keychain.
 
 ![The SSH Sync page of a site in Local, with a production and a staging environment](docs/screenshots/01-environments.png)
-
-![Editing an environment: host, user, port, authentication, WordPress folder and site URL](docs/screenshots/03-environment.png)
 
 ### Pull with a safe local copy
 
@@ -63,6 +59,8 @@ A pulled site runs the live site's plugins, and the first page you open fires wp
 ### Push exactly what you mean to
 
 Before anything moves, the preview lists every file that would be added, updated or deleted on the server. Push _only newer_ files or _all modified_ ones, untick what you don't want, and nothing is ever deleted on the server unless you tick it.
+
+![Push preview: every file that would change, ticked or unticked one by one](docs/screenshots/04-push-preview.png)
 
 ### Production has guard rails
 
@@ -118,13 +116,18 @@ The same engine and the same guards, from the terminal. See [Command line](#comm
 3. **Test connection**, then **Save**.
 4. **Pull** to bring the site into Local. **Push** to send your changes back.
 
-## What a sync does
+## Under the hood
+
+<details>
+<summary><strong>What a pull and a push do, step by step</strong></summary>
 
 **Pull** (server → Local): connect once and check the WordPress folder → install the local safety net → rsync files → back up the local database → export the server database to a private temp file, download it and delete it → import → search-replace → adopt the server's table prefix → make the copy safe.
 
 **Push** (Local → server): the preview shows exactly what would change. Then: confirmation for production → lock the server folder → (with the database) export the server database as the rollback backup → rsync only the files you selected, keeping what they replace → delete only the deletions you ticked → (with the database) import, search-replace, and re-enable what the safe copy turned off → run the environment's cache command → keep everything needed to undo it.
 
 **Never synced, either way:** `wp-config.php` and every copy of it, `.htaccess`, `.user.ini`, `php.ini`, object and page cache drop-ins, `wp-content/cache/`, `.git`, `node_modules`, SQL dumps, backup copies of any file (`*.bak`, `*.orig`, `*~`) and the safety mu-plugin. Add your own per environment (e.g. `wp-content/litespeed/`).
+
+</details>
 
 <details>
 <summary><strong>What exactly the safe local copy changes</strong></summary>
@@ -159,12 +162,9 @@ ssh-sync undo my-site staging --yes          # undo the last push
 
 ## Security
 
-- **No shell strings on your Mac.** Every command (`ssh`, `rsync`, `mysql`, `php`) runs with argument arrays. Every value that reaches the server's shell is validated against a strict character set and quoted.
-- **SSH keys** stay where they are: your agent and `~/.ssh/config`. SSH Sync stores no keys.
-- **Passwords** are encrypted with Electron `safeStorage` (the macOS Keychain) and never shown again. ssh gets them through `SSH_ASKPASS` from a one-shot socket, so they never appear in process arguments, environment variables or files. Refused where the OS has no real keyring.
-- **One connection per sync**, closed at the end, even if your `~/.ssh/config` sets `ControlPersist`.
-- **Nothing left on the server.** Database dumps go to private (`mktemp`, 0600) files in the SSH user's home and are deleted right after the transfer; leftovers older than two hours are cleaned on the next connection. Push backups are kept on your computer (last 3 per environment).
-- **No telemetry.** SSH Sync talks to your servers and nothing else.
+- **Your keys and passwords stay safe.** SSH keys stay in your agent and `~/.ssh/config`. Passwords are encrypted in the macOS Keychain and reach ssh through a one-shot socket, never in process arguments, environment variables or files.
+- **Nothing left on the server.** Database dumps go to private temporary files and are deleted right after the transfer. Push backups stay on your computer (last 3 per environment).
+- **No shell strings, no telemetry.** Every command runs with argument arrays and every value sent to the server is validated and quoted. SSH Sync talks to your servers and nothing else.
 
 Found a vulnerability? See [SECURITY.md](SECURITY.md).
 
