@@ -25,7 +25,7 @@
   <a href="#faq">FAQ</a>
 </p>
 
-![Push preview: every file that would change, ticked or unticked one by one](docs/screenshots/04-push-preview.png)
+https://github.com/user-attachments/assets/ea0b8deb-49ef-43ab-aa7e-160ea08cd673
 
 ## Why
 
