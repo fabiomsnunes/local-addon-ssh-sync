@@ -36,7 +36,7 @@ export const EXCLUDE_PATTERNS = [
   // Backup copies of ANY file: editor/tool safety copies such as foo.php.bak,
   // foo.php.bak-20260828-225646, foo.php.bak-claude, foo.php.orig, foo.php~.
   // They are never part of a site, and a stale copy next to an mu-plugin is
-  // dead code shipped to production (seen on Bernsborg, 2026-09-16).
+  // dead code shipped to production.
   '*.bak',
   '*.bak.*',
   '*.bak-*',

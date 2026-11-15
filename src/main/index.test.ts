@@ -880,8 +880,8 @@ describe('EXCLUDE_PATTERNS', () => {
     // Editor/tool safety copies are never part of a site; a stale one next to
     // an mu-plugin is dead code shipped to production.
     for (const filename of [
-      'wp-content/mu-plugins/bernsborg-site.php.bak-20260828-225646',
-      'wp-content/mu-plugins/bernsborg-site.php.bak-claude',
+      'wp-content/mu-plugins/my-site.php.bak-20260828-225646',
+      'wp-content/mu-plugins/my-site.php.bak-claude',
       'wp-content/themes/acme/functions.php.bak',
       'wp-content/themes/acme/style.css.bak.2',
       'wp-content/plugins/acme/acme.php.orig',
