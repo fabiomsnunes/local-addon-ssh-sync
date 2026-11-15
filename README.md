@@ -44,7 +44,7 @@ SSH Sync brings that one-click flow to **any host**. No API keys, no account, no
 
 ### One place for every environment
 
-Production, staging, a test server: add as many as you need per site. Each has its own SSH connection, WordPress folder, URL, WP-CLI command and cache command. Pick a host from your `~/.ssh/config` or type it in; log in with your SSH key or a password kept in the macOS Keychain.
+Production, staging, a test server: add as many as you need per site. Each has its own SSH connection, WordPress folder, URL, WP-CLI command and cache command. Pick a host from your `~/.ssh/config` or type it in; log in with your SSH key or a password kept encrypted in your system keychain.
 
 ![The SSH Sync page of a site in Local, with a production and a staging environment](docs/screenshots/01-environments.png)
 
@@ -162,7 +162,7 @@ ssh-sync undo my-site staging --yes          # undo the last push
 
 ## Security
 
-- **Your keys and passwords stay safe.** SSH keys stay in your agent and `~/.ssh/config`. Passwords are encrypted in the macOS Keychain and reach ssh through a one-shot socket, never in process arguments, environment variables or files.
+- **Your keys and passwords stay safe.** SSH keys stay in your agent and `~/.ssh/config`. Passwords are encrypted with your system keychain (the Keychain on macOS) and reach ssh through a one-shot socket, never in process arguments, environment variables or files.
 - **Nothing left on the server.** Database dumps go to private temporary files and are deleted right after the transfer. Push backups stay on your computer (last 3 per environment).
 - **No shell strings, no telemetry.** Every command runs with argument arrays and every value sent to the server is validated and quoted. SSH Sync talks to your servers and nothing else.
 
@@ -174,7 +174,7 @@ Found a vulnerability? See [SECURITY.md](SECURITY.md).
 If you can open a terminal and `ssh` into the server, and the server has `rsync` and WP-CLI, yes. That covers most VPSs, cPanel and Plesk hosts with SSH enabled, and managed WordPress hosts with SSH access. **Test connection** checks all of it before the first sync.
 
 **My host only allows passwords, not keys.**
-Pick **Password** under Authentication. It's stored in the macOS Keychain and never passed on the command line.
+Pick **Password** under Authentication. It's stored encrypted in your system keychain and never passed on the command line.
 
 **Will a pull touch my live site?**
 It doesn't change it. A pull only reads from the server: it exports the database to a temporary file in your SSH user's home, downloads it and deletes it.
